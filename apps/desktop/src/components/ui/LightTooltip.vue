@@ -62,14 +62,14 @@ const tooltipTransformClass = computed(() => {
 const arrowClass = computed(() => {
   switch (props.side) {
     case "right":
-      return "absolute -left-1 top-1/2 -translate-y-1/2";
+      return "absolute -left-1.25 top-1/2 -translate-y-1/2 border-b border-l";
     case "left":
-      return "absolute -right-1 top-1/2 -translate-y-1/2";
+      return "absolute -right-1.25 top-1/2 -translate-y-1/2 border-t border-r";
     case "bottom":
-      return "absolute -top-1 left-1/2 -translate-x-1/2";
+      return "absolute -top-1.25 left-1/2 -translate-x-1/2 border-t border-l";
     case "top":
     default:
-      return "absolute -bottom-1 left-1/2 -translate-x-1/2";
+      return "absolute -bottom-1.25 left-1/2 -translate-x-1/2 border-b border-r";
   }
 });
 
@@ -241,7 +241,7 @@ watch(
     <div
       v-if="show"
       ref="tooltipRef"
-      class="fixed z-50 rounded-md bg-foreground text-xs text-background"
+      class="fixed z-50 rounded-md text-xs text-background"
       :class="[slots.content ? '' : ['inline-flex w-fit max-w-xs items-center gap-1.5 px-3 py-1.5', nowrap ? 'whitespace-nowrap' : ''], tooltipTransformClass]"
       :style="{ left: `${x}px`, top: `${y}px` }"
       role="tooltip"
@@ -249,7 +249,7 @@ watch(
       @mouseleave="scheduleClose"
     >
       <slot name="content">{{ text }}</slot>
-      <span :class="[arrowClass, 'size-2.5 rotate-45 rounded-[2px] bg-foreground']" aria-hidden="true" />
+      <span :class="[arrowClass, 'size-2.5 rotate-45 rounded-[2px] bg-popover border-border']" aria-hidden="true" />
     </div>
   </Teleport>
 </template>
