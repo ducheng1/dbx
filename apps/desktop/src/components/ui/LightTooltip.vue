@@ -11,6 +11,7 @@ const props = withDefaults(
     closeDelay?: number;
     openOnFocus?: boolean;
     nowrap?: boolean;
+    surface?: "foreground" | "popover";
   }>(),
   {
     disabled: false,
@@ -20,6 +21,7 @@ const props = withDefaults(
     closeDelay: 100,
     openOnFocus: true,
     nowrap: false,
+    surface: "foreground",
   },
 );
 
@@ -72,6 +74,10 @@ const arrowClass = computed(() => {
       return "absolute -bottom-1.25 left-1/2 -translate-x-1/2 border-b border-r";
   }
 });
+
+const tooltipSurfaceClass = computed(() => (props.surface === "popover" ? "bg-popover text-popover-foreground" : "bg-foreground text-background"));
+
+const arrowSurfaceClass = computed(() => (props.surface === "popover" ? "bg-popover border-border" : "bg-foreground border-foreground"));
 
 function clearTimer() {
   if (!timer) return;
@@ -241,15 +247,15 @@ watch(
     <div
       v-if="show"
       ref="tooltipRef"
-      class="fixed z-50 rounded-md text-xs text-background"
-      :class="[slots.content ? '' : ['inline-flex w-fit max-w-xs items-center gap-1.5 px-3 py-1.5', nowrap ? 'whitespace-nowrap' : ''], tooltipTransformClass]"
+      class="fixed z-50 rounded-md text-xs"
+      :class="[tooltipSurfaceClass, slots.content ? '' : ['inline-flex w-fit max-w-xs items-center gap-1.5 px-3 py-1.5', nowrap ? 'whitespace-nowrap' : ''], tooltipTransformClass]"
       :style="{ left: `${x}px`, top: `${y}px` }"
       role="tooltip"
       @mouseenter="clearCloseTimer"
       @mouseleave="scheduleClose"
     >
       <slot name="content">{{ text }}</slot>
-      <span :class="[arrowClass, 'size-2.5 rotate-45 rounded-[2px] bg-popover border-border']" aria-hidden="true" />
+      <span :class="[arrowClass, arrowSurfaceClass, 'size-2.5 rotate-45 rounded-[2px]']" aria-hidden="true" />
     </div>
   </Teleport>
 </template>
