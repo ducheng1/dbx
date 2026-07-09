@@ -90,6 +90,19 @@ fn get_opt_str(row: &mysql_async::Row, name: &str) -> Option<String> {
         .or_else(|| row_get::<Vec<u8>, _>(row, name).map(|b| String::from_utf8_lossy(&b).to_string()))
 }
 
+/// First non-empty string value among the named columns (e.g. Doris `CatalogName`
+/// vs StarRocks `Catalog`). Returns an empty string when none of the columns
+/// are present or all are empty.
+fn first_nonempty_str_by_name(row: &mysql_async::Row, names: &[&str]) -> String {
+    for name in names {
+        let value = get_str_by_name(row, name);
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    String::new()
+}
+
 fn get_opt_metadata_string(row: &mysql_async::Row, name: &str) -> Option<String> {
     get_opt_str(row, name)
         .or_else(|| row_get::<NaiveDateTime, _>(row, name).map(|value| value.to_string()))
@@ -1157,6 +1170,7 @@ fn is_jdbc_param(key: &str) -> bool {
             | "transformedbitisboolean"
             | "yearisdatetype"
             | "createdatabaseifnotexist"
+            | "allowmultiqueries"
             | "noaccesstoprocedurebodies"
             | "nullcatalogmeanscurrent"
             | "nullnamepatternmatchesall"
@@ -2053,8 +2067,8 @@ pub async fn list_completion_objects(pool: &MySqlPool, database: &str) -> Result
 
 fn columns_sql(database: &str, table: &str) -> String {
     format!(
-        "SELECT c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, c.EXTRA, \
-         c.COLUMN_COMMENT, c.COLUMN_KEY, c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.CHARACTER_MAXIMUM_LENGTH \
+        "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, c.EXTRA, \
+         c.COLUMN_COMMENT, c.COLUMN_KEY, c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.CHARACTER_MAXIMUM_LENGTH, \
          FROM information_schema.COLUMNS c \
          WHERE c.TABLE_SCHEMA = {} AND c.TABLE_NAME = {} \
          ORDER BY c.ORDINAL_POSITION",
@@ -2127,6 +2141,65 @@ fn fix_potential_double_encoding(s: &str) -> String {
     }
 }
 
+fn parse_mysql_enum_values(column_type: &str) -> Option<Vec<String>> {
+    let trimmed = column_type.trim();
+    if !trimmed.get(..5)?.eq_ignore_ascii_case("enum(") || !trimmed.ends_with(')') {
+        return None;
+    }
+
+    let inner = &trimmed[5..trimmed.len() - 1];
+    let mut chars = inner.chars().peekable();
+    let mut values = Vec::new();
+
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.next() {
+            Some('\'') => {}
+            None if values.is_empty() => return Some(values),
+            _ => return None,
+        }
+
+        let mut value = String::new();
+        loop {
+            match chars.next() {
+                Some('\'') => {
+                    if matches!(chars.peek(), Some('\'')) {
+                        chars.next();
+                        value.push('\'');
+                    } else {
+                        break;
+                    }
+                }
+                Some('\\') => match chars.next() {
+                    Some('0') => value.push('\0'),
+                    Some('b') => value.push('\u{0008}'),
+                    Some('n') => value.push('\n'),
+                    Some('r') => value.push('\r'),
+                    Some('t') => value.push('\t'),
+                    Some('Z') => value.push('\u{001A}'),
+                    Some(c @ ('\\' | '\'' | '"')) => value.push(c),
+                    Some(c) => value.push(c),
+                    None => return None,
+                },
+                Some(c) => value.push(c),
+                None => return None,
+            }
+        }
+        values.push(value);
+
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.next() {
+            Some(',') => continue,
+            None => return Some(values),
+            _ => return None,
+        }
+    }
+}
+
 pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let sql = columns_sql(database, table);
     let mut conn = get_conn_with_health_check(pool).await?;
@@ -2149,10 +2222,19 @@ pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Resul
                 return None;
             }
             let column_key = get_str_by_name(row, "COLUMN_KEY");
+            let data_type = get_str_by_name(row, "DATA_TYPE");
+            let column_type = get_str_by_name(row, "COLUMN_TYPE");
+            let enum_values = if data_type.eq_ignore_ascii_case("enum") {
+                // MySQL exposes enum literals only through COLUMN_TYPE. Parse the SQL literal
+                // syntax in Rust so empty values, quotes, and backslash escapes survive intact.
+                parse_mysql_enum_values(&column_type)
+            } else {
+                None
+            };
             Some(ColumnInfo {
                 is_primary_key: column_key.eq_ignore_ascii_case("PRI"),
                 name,
-                data_type: get_str_by_name(row, "COLUMN_TYPE"),
+                data_type: column_type,
                 is_nullable: get_str_by_name(row, "IS_NULLABLE") == "YES",
                 column_default: get_opt_str(row, "COLUMN_DEFAULT"),
                 extra: get_opt_str(row, "EXTRA"),
@@ -2162,6 +2244,7 @@ pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Resul
                 numeric_precision: get_opt_i32(row, "NUMERIC_PRECISION"),
                 numeric_scale: get_opt_i32(row, "NUMERIC_SCALE"),
                 character_maximum_length: get_opt_i32(row, "CHARACTER_MAXIMUM_LENGTH"),
+                enum_values,
             })
         })
         .collect();
@@ -2208,6 +2291,7 @@ pub async fn get_columns_show(pool: &MySqlPool, database: &str, table: &str) -> 
                 numeric_precision: None,
                 numeric_scale: None,
                 character_maximum_length: None,
+                enum_values: None,
             })
         })
         .collect())
@@ -3010,6 +3094,202 @@ pub async fn show_create_table_ddl(pool: &MySqlPool, database: &str, table: &str
         .ok_or_else(|| "Failed to read DDL".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Doris / StarRocks multi-catalog support.
+//
+// These engines expose external catalogs (iceberg, hive, jdbc, ...) alongside
+// the native `internal` catalog via `SHOW CATALOGS`. The functions below address
+// objects in a specific catalog using 3-part qualified names
+// (`<catalog>.<database>.<table>`), which the engines accept directly without
+// needing to `SWITCH` the session catalog.
+// ---------------------------------------------------------------------------
+
+/// Build a 2-part qualified identifier `` `<catalog>`.`<database>` ``.
+fn doris_catalog_database_ref(catalog: &str, database: &str) -> String {
+    format!("{}.{}", quote_identifier(catalog), quote_identifier(database))
+}
+
+/// Build a 3-part qualified identifier `` `<catalog>`.`<database>`.`<table>` ``.
+fn doris_catalog_table_ref(catalog: &str, database: &str, table: &str) -> String {
+    format!("{}.{}.{}", quote_identifier(catalog), quote_identifier(database), quote_identifier(table))
+}
+
+/// `SHOW CATALOGS` → list of catalogs visible to the current user.
+///
+/// Column layouts differ between engines: Doris exposes `CatalogName` (with
+/// `CatalogId`/`IsCurrent`/`CreateTime`/`LastUpdateTime`), while StarRocks
+/// exposes `Catalog` (only `Type`/`Comment`, no `IsCurrent`). The name is read
+/// from either column; missing trailing columns degrade gracefully to
+/// empty/None. The built-in catalog is named `internal` in Doris and
+/// `default_catalog` in StarRocks (both with `Type=internal`); detection is
+/// type-based (see `CatalogInfo::is_internal`), not name-based.
+pub async fn list_doris_catalogs(pool: &MySqlPool) -> Result<Vec<crate::db::CatalogInfo>, String> {
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let result = conn.query_iter("SHOW CATALOGS").await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    let catalogs: Vec<crate::db::CatalogInfo> = rows
+        .iter()
+        .filter_map(|row| {
+            // Doris column is `CatalogName`; StarRocks column is `Catalog`.
+            let name = first_nonempty_str_by_name(row, &["CatalogName", "Catalog"]).trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let catalog_type = get_str_by_name(row, "Type").trim().to_string();
+            let is_current = {
+                let value = get_str_by_name(row, "IsCurrent").trim().to_ascii_lowercase();
+                !value.is_empty() && value != "no" && value != "false" && value != "0"
+            };
+            let comment = get_opt_str(row, "Comment").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            Some(crate::db::CatalogInfo { name, catalog_type, is_current, comment })
+        })
+        .collect();
+    Ok(normalize_doris_catalogs(catalogs))
+}
+
+/// Sort with the built-in catalog first, then the rest alphabetically by name.
+/// The built-in catalog is identified by `CatalogInfo::is_internal` (type-based)
+/// rather than by name, so StarRocks `default_catalog` sorts first just like
+/// Doris `internal`. No synthetic catalog is injected: `SHOW CATALOGS` always
+/// lists the built-in catalog on both engines, and a single-catalog result is
+/// handled by the flat-sidebar fallback in the caller.
+fn normalize_doris_catalogs(mut catalogs: Vec<crate::db::CatalogInfo>) -> Vec<crate::db::CatalogInfo> {
+    catalogs.sort_by(|a, b| match (a.is_internal(), b.is_internal()) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+    catalogs
+}
+
+/// `SHOW DATABASES FROM <catalog>` → databases in the given catalog.
+pub async fn list_databases_show_from(pool: &MySqlPool, catalog: &str) -> Result<Vec<DatabaseInfo>, String> {
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let sql = format!("SHOW DATABASES FROM {}", quote_identifier(catalog));
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), false))
+}
+
+/// `SHOW TABLES FROM <catalog>.<database>` → tables in an external catalog.
+///
+/// External catalogs do not support `SHOW TABLE STATUS`, so comments/status are
+/// not fetched (the caller only needs names + types for browsing).
+pub async fn list_tables_show_from(pool: &MySqlPool, catalog: &str, database: &str) -> Result<Vec<TableInfo>, String> {
+    let sql = format!("SHOW TABLES FROM {}", doris_catalog_database_ref(catalog, database));
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    let mut tables: Vec<TableInfo> = rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str(row, 0).trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            // SHOW FULL TABLES exposes a type column; plain SHOW TABLES does not.
+            let table_type = get_str(row, 1);
+            Some(TableInfo {
+                name,
+                table_type: if table_type.trim().is_empty() { "TABLE".to_string() } else { table_type },
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            })
+        })
+        .collect();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tables)
+}
+
+/// `SHOW COLUMNS FROM <catalog>.<database>.<table>` → columns of an external
+/// catalog table. Falls back to `DESCRIBE` if `SHOW COLUMNS` is rejected.
+pub async fn get_columns_show_from(
+    pool: &MySqlPool,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<Vec<ColumnInfo>, String> {
+    let qualified = doris_catalog_table_ref(catalog, database, table);
+    let full_sql = format!("SHOW FULL COLUMNS FROM {qualified}");
+    let plain_sql = format!("SHOW COLUMNS FROM {qualified}");
+    let describe_sql = format!("DESCRIBE {qualified}");
+    let mut conn = get_conn_with_health_check(pool).await?;
+    let rows: Vec<mysql_async::Row> = match conn.query_iter(&full_sql).await {
+        Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
+        Err(_) => match conn.query_iter(&plain_sql).await {
+            Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
+            Err(_) => {
+                let result = conn.query_iter(&describe_sql).await.map_err(|e| e.to_string())?;
+                result.collect_and_drop().await.map_err(|e| e.to_string())?
+            }
+        },
+    };
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str_by_name(row, "Field").trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let key = get_str_by_name(row, "Key");
+            Some(ColumnInfo {
+                name,
+                data_type: get_str_by_name(row, "Type"),
+                is_nullable: get_str_by_name(row, "Null").eq_ignore_ascii_case("YES"),
+                column_default: get_opt_str(row, "Default"),
+                is_primary_key: key.eq_ignore_ascii_case("PRI"),
+                extra: get_opt_str(row, "Extra"),
+                comment: get_opt_str(row, "Comment")
+                    .map(|s| fix_potential_double_encoding(&s))
+                    .filter(|s| !s.is_empty()),
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: None,
+                enum_values: None,
+            })
+        })
+        .collect())
+}
+
+/// `SHOW CREATE TABLE <catalog>.<database>.<table>` → DDL for an external
+/// catalog table.
+pub async fn show_create_table_ddl_from(
+    pool: &MySqlPool,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<String, String> {
+    let sql = format!("SHOW CREATE TABLE {}", doris_catalog_table_ref(catalog, database, table));
+    let mut conn = get_conn_with_health_check(pool).await?;
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    let row = rows.first().ok_or("DDL not found")?;
+    row.get_opt::<String, usize>(1)
+        .and_then(|result| result.ok())
+        .or_else(|| {
+            row.get_opt::<Vec<u8>, usize>(1)
+                .and_then(|result| result.ok())
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+        })
+        .ok_or_else(|| "Failed to read DDL".to_string())
+}
+
+/// Best-effort index listing for an external catalog table. External catalogs
+/// generally do not expose MySQL-style index metadata via `information_schema`
+/// (that view is scoped to the internal catalog), so indexes are derived from
+/// `SHOW CREATE TABLE` parsing. Returns empty on failure (graceful degradation
+/// — indexes are informational for external tables).
+pub async fn list_doris_catalog_indexes(
+    pool: &MySqlPool,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<Vec<IndexInfo>, String> {
+    let ddl = show_create_table_ddl_from(pool, catalog, database, table).await?;
+    Ok(doris_indexes_from_create_table_ddl(&ddl))
+}
+
 fn merge_index_infos(target: &mut Vec<IndexInfo>, parsed: Vec<IndexInfo>) {
     let mut seen_names: HashSet<String> = target.iter().map(|index| index.name.to_ascii_lowercase()).collect();
     for index in parsed {
@@ -3624,7 +3904,25 @@ mod tests {
         assert!(!sql.contains("KEY_COLUMN_USAGE"));
         assert!(!sql.contains("CONSTRAINT_NAME = 'PRIMARY'"));
         assert!(sql.contains("c.COLUMN_KEY"));
+        assert!(sql.contains("c.DATA_TYPE"));
+        assert!(sql.contains("c.COLUMN_TYPE"));
         assert!(!sql.contains("COLLATE"));
+        assert!(!sql.contains("AS ENUM_VALUES"));
+    }
+
+    #[test]
+    fn parse_mysql_enum_values_preserves_mysql_literal_edges() {
+        assert_eq!(
+            parse_mysql_enum_values("enum('pending','active','archived')"),
+            Some(vec!["pending".to_string(), "active".to_string(), "archived".to_string()])
+        );
+        assert_eq!(parse_mysql_enum_values("ENUM('','a')"), Some(vec!["".to_string(), "a".to_string()]));
+        assert_eq!(parse_mysql_enum_values("enum('x'',''y','z')"), Some(vec!["x','y".to_string(), "z".to_string()]));
+        assert_eq!(
+            parse_mysql_enum_values(r#"enum('it''s','quote\"d','back\\slash')"#),
+            Some(vec!["it's".to_string(), "quote\"d".to_string(), "back\\slash".to_string()])
+        );
+        assert_eq!(parse_mysql_enum_values("varchar(255)"), None);
     }
 
     #[test]
@@ -4127,7 +4425,7 @@ UNIQUE KEY(`tenant_id`, `name``part`)
 
     #[test]
     fn mysql_async_url_keeps_valid_params_while_stripping_jdbc() {
-        let url = "mysql://host:3306/db?useUnicode=true&characterEncoding=utf8&require_ssl=true&charset=utf8mb4&autoReconnect=true";
+        let url = "mysql://host:3306/db?useUnicode=true&characterEncoding=utf8&require_ssl=true&charset=utf8mb4&autoReconnect=true&allowMultiQueries=true";
         assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db?require_ssl=true");
     }
 
@@ -4311,5 +4609,90 @@ UNIQUE KEY(`tenant_id`, `name``part`)
             mysql_setup_queries("mysql://host:3306/db?charset=utf8mb4", &[]),
             vec!["USE `db`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
+    }
+
+    fn doris_catalog_info(name: &str, catalog_type: &str, is_current: bool) -> crate::db::CatalogInfo {
+        crate::db::CatalogInfo {
+            name: name.to_string(),
+            catalog_type: catalog_type.to_string(),
+            is_current,
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn doris_catalog_database_ref_backtick_qualifies_two_parts() {
+        assert_eq!(doris_catalog_database_ref("iceberg_catalog", "sales"), "`iceberg_catalog`.`sales`");
+    }
+
+    #[test]
+    fn doris_catalog_table_ref_backtick_qualifies_three_parts() {
+        assert_eq!(doris_catalog_table_ref("iceberg_catalog", "sales", "orders"), "`iceberg_catalog`.`sales`.`orders`");
+    }
+
+    #[test]
+    fn doris_catalog_refs_escape_embedded_backticks() {
+        assert_eq!(doris_catalog_database_ref("a`b", "c`d"), "`a``b`.`c``d`");
+        assert_eq!(doris_catalog_table_ref("a`b", "c`d", "e`f"), "`a``b`.`c``d`.`e``f`");
+    }
+
+    #[test]
+    fn normalize_doris_catalogs_does_not_inject_missing_internal() {
+        // SHOW CATALOGS always lists the built-in catalog on both engines, so a
+        // missing internal catalog is not synthesized — the caller's flat-sidebar
+        // fallback handles a single/empty result instead.
+        let catalogs = vec![
+            doris_catalog_info("iceberg_catalog", "iceberg", true),
+            doris_catalog_info("hive_catalog", "hive", false),
+        ];
+        let normalized = normalize_doris_catalogs(catalogs);
+        let names: Vec<&str> = normalized.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["hive_catalog", "iceberg_catalog"]);
+        assert!(!normalized.iter().any(|c| c.is_internal()));
+    }
+
+    #[test]
+    fn normalize_doris_catalogs_keeps_existing_internal_first() {
+        let catalogs = vec![
+            doris_catalog_info("iceberg_catalog", "iceberg", false),
+            doris_catalog_info("internal", "internal", true),
+            doris_catalog_info("hive_catalog", "hive", false),
+        ];
+        let normalized = normalize_doris_catalogs(catalogs);
+        let names: Vec<&str> = normalized.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["internal", "hive_catalog", "iceberg_catalog"]);
+    }
+
+    #[test]
+    fn normalize_doris_catalogs_sorts_starrocks_default_catalog_first() {
+        // StarRocks names its built-in catalog `default_catalog` (Type=Internal);
+        // detection is type-based, so it sorts first just like Doris `internal`.
+        let catalogs = vec![
+            doris_catalog_info("hive_catalog", "hive", false),
+            doris_catalog_info("default_catalog", "Internal", true),
+        ];
+        let normalized = normalize_doris_catalogs(catalogs);
+        let names: Vec<&str> = normalized.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["default_catalog", "hive_catalog"]);
+        assert!(normalized[0].is_internal());
+        assert!(!normalized[1].is_internal());
+    }
+
+    #[test]
+    fn normalize_doris_catalogs_detects_internal_by_type_not_name() {
+        // A catalog literally named `internal` but with an external type is NOT
+        // the built-in catalog and must not sort first.
+        let catalogs =
+            vec![doris_catalog_info("internal", "iceberg", false), doris_catalog_info("hive_catalog", "hive", false)];
+        let normalized = normalize_doris_catalogs(catalogs);
+        let names: Vec<&str> = normalized.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["hive_catalog", "internal"]);
+        assert!(!normalized.iter().any(|c| c.is_internal()));
+    }
+
+    #[test]
+    fn normalize_doris_catalogs_handles_empty_input() {
+        let normalized = normalize_doris_catalogs(Vec::new());
+        assert!(normalized.is_empty());
     }
 }

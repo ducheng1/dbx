@@ -116,7 +116,6 @@ import { renderWktOnCanvas, isHexGeometry } from "@/lib/dataGrid/geometryPreview
 import { buildDataGridCellDetail, buildDataGridColumnDetail, buildDataGridRowDetail, dataGridColumnDetailJson, dataGridColumnDetailTsv, dataGridRowDetailJson, dataGridRowDetailTsv, filterDataGridDetailFields, type DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 import { applyColumnFormatter, buildColumnFormatterKey, normalizeColumnFormatter, resolveColumnFormatter, type ColumnFormatterConfig, type DateTimeFormatterUnit, DateTimePatterns } from "@/lib/dataGrid/columnFormatter";
 import { temporalCellEditorKind, type TemporalCellEditorKind } from "@/lib/dataGrid/dataGridTemporalEditor";
-import { isEnumColumn, enumValuesForColumn } from "@/lib/dataGrid/dataGridEnumEditor";
 import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isModRShortcut, isSaveShortcut, isToggleTransposeShortcut } from "@/lib/editor/keyboardShortcuts";
 import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
 import { canGoNextDataGridPage } from "@/lib/dataGrid/dataGridPagination";
@@ -129,6 +128,7 @@ import { appendColumnValueFilterCondition, buildColumnValueFilterCondition, buil
 import { clampSearchSplitWidth } from "@/lib/dataGrid/dataGridSearchSplit";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE, normalizeResultPageSize, resultPageSizeMenuOptions } from "@/lib/dataGrid/paginationPageSize";
 import { allNullColumnIndexes, filterColumnVisibilityOptions, hiddenColumnIndexesWithAllNullColumns, invertedHiddenColumnIndexes, nextHiddenColumnIndexes, removeAutoHiddenColumnIndexes, visibleColumnIndexesForFilter } from "@/lib/dataGrid/dataGridColumnVisibility";
+import { buildDataGridColumnLookupItems, filterDataGridColumnLookupItems } from "@/lib/dataGrid/dataGridColumnLookup";
 import { columnOrderKeysForIndexes, isDefaultColumnOrder, moveVisibleColumnIndex, orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
 import { dataGridColumnLayoutScopeKey, loadDataGridColumnOrder, removeDataGridColumnOrder, saveDataGridColumnOrder } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 import { parseClipboardTable, summarizeSelection } from "@/lib/dataGrid/gridSelection";
@@ -209,6 +209,7 @@ const props = defineProps<{
   sortDirection?: DataGridSortDirection;
   sortMode?: DataGridSortMode;
   tableMeta?: {
+    catalog?: string;
     schema?: string;
     tableName: string;
     tableType?: string;
@@ -1323,6 +1324,7 @@ async function loadServerFilterValues(columnIndex: number, searchValue: string) 
     const columnInfo = tableMeta.columns.find((column) => column.name === columnName);
     const sql = await buildDataGridColumnDistinctValuesSql({
       databaseType: resolvedDatabaseType.value,
+      catalog: tableMeta.catalog,
       schema: tableMeta.schema,
       tableName: tableMeta.tableName,
       columnName,
@@ -2498,16 +2500,15 @@ const displayableColumnIndexes = computed(() =>
     .map(({ index }) => index),
 );
 const goToColumnItems = computed(() =>
-  displayableColumnIndexes.value.map((index) => ({
-    index,
-    name: props.result.columns[index] ?? `#${index + 1}`,
-    sourceName: props.sourceColumns?.[index],
-  })),
+  buildDataGridColumnLookupItems({
+    columns: props.result.columns,
+    sourceColumns: props.sourceColumns,
+    displayableIndexes: displayableColumnIndexes.value,
+    commentByColumn: columnCommentMap.value,
+  }),
 );
 const filteredGoToColumns = computed(() => {
-  const query = goToColumnSearch.value.trim().toLocaleLowerCase();
-  if (!query) return goToColumnItems.value;
-  return goToColumnItems.value.filter((column) => column.name.toLocaleLowerCase().includes(query) || column.sourceName?.toLocaleLowerCase().includes(query));
+  return filterDataGridColumnLookupItems(goToColumnItems.value, goToColumnSearch.value);
 });
 const orderedDisplayableColumnIndexes = computed(() =>
   orderedColumnIndexes({
@@ -2551,7 +2552,7 @@ const allNullColumnCount = computed(() => allNullColumnIndexesForResult.value.le
 const canToggleAllNullColumns = computed(() => nullColumnsHidden.value || (allNullColumnCount.value > 0 && displayableColumnCount.value > 1));
 function filteredColumnVisibilityOptions(query: string) {
   const displayable = new Set(displayableColumnIndexes.value);
-  return filterColumnVisibilityOptions(props.result.columns, query).filter((option) => displayable.has(option.index));
+  return filterColumnVisibilityOptions(props.result.columns, query, { sourceColumns: props.sourceColumns, commentByColumn: columnCommentMap.value }).filter((option) => displayable.has(option.index));
 }
 function isColumnVisible(columnIndex: number): boolean {
   return !hiddenColumnIndexes.value.has(columnIndex);
@@ -3684,6 +3685,7 @@ async function buildCurrentCountTarget(): Promise<{ sql: string; schema?: string
   if (props.tableMeta) {
     const sql = await buildDataGridCountSql({
       databaseType: props.databaseType,
+      catalog: props.tableMeta.catalog,
       schema: props.tableMeta.schema,
       tableName: props.tableMeta.tableName,
       whereInput: currentWhereInput(),
@@ -3997,11 +3999,11 @@ function temporalEditorKindForColumn(columnIndex: number): TemporalCellEditorKin
 }
 
 function enumValuesForGridColumn(columnIndex: number): string[] {
-  return enumValuesForColumn(tableColumnForGridColumn(columnIndex));
+  return tableColumnForGridColumn(columnIndex)?.enum_values ?? [];
 }
 
 function isEnumGridColumn(columnIndex: number): boolean {
-  return isEnumColumn(tableColumnForGridColumn(columnIndex));
+  return (tableColumnForGridColumn(columnIndex)?.enum_values?.length ?? 0) > 0;
 }
 
 function isEnumGridColumnNullable(columnIndex: number): boolean {
@@ -5229,6 +5231,7 @@ async function applyOrderBySearch() {
     if (!tableMeta) return;
     const sql = await buildTableSelectSql({
       databaseType: resolvedDatabaseType.value,
+      catalog: tableMeta.catalog,
       schema: tableMeta.schema,
       tableName: tableMeta.tableName,
       tableType: tableMeta.tableType,
@@ -5260,6 +5263,7 @@ async function applyWhereFilter() {
     if (!tableMeta) return;
     const sql = await buildTableSelectSql({
       databaseType: resolvedDatabaseType.value,
+      catalog: tableMeta.catalog,
       schema: tableMeta.schema,
       tableName: tableMeta.tableName,
       tableType: tableMeta.tableType,
@@ -7685,7 +7689,7 @@ async function selectTableInfoTab(tab: TableInfoTab) {
 }
 
 watch(
-  () => [props.tableInfoTab, props.connectionId, props.database, props.tableMeta?.schema, props.tableMeta?.tableName] as const,
+  () => [props.tableInfoTab, props.connectionId, props.database, props.tableMeta?.catalog, props.tableMeta?.schema, props.tableMeta?.tableName] as const,
   ([tab]) => {
     if (tab) void selectTableInfoTab(tab);
   },
@@ -7697,7 +7701,7 @@ async function fetchDdl() {
   showTableInfo.value = true;
   ddlLoading.value = true;
   try {
-    ddlContent.value = await api.getTableDdl(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
+    ddlContent.value = await api.getTableDdl(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName, undefined, props.tableMeta.catalog);
   } catch (e: any) {
     ddlContent.value = `-- Error: ${e}`;
   } finally {
@@ -7710,7 +7714,7 @@ async function fetchIndexes() {
   indexesLoading.value = true;
   indexesError.value = "";
   try {
-    indexes.value = await api.listIndexes(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
+    indexes.value = await api.listIndexes(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName, props.tableMeta.catalog);
     indexesLoaded.value = true;
   } catch (e: any) {
     indexesError.value = String(e?.message || e);
@@ -7729,7 +7733,7 @@ async function fetchForeignKeys() {
   foreignKeysLoading.value = true;
   foreignKeysError.value = "";
   try {
-    foreignKeys.value = await api.listForeignKeys(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
+    foreignKeys.value = await api.listForeignKeys(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName, props.tableMeta.catalog);
     foreignKeysLoaded.value = true;
   } catch (e: any) {
     foreignKeysError.value = String(e?.message || e);
@@ -7743,7 +7747,7 @@ async function fetchTriggers() {
   triggersLoading.value = true;
   triggersError.value = "";
   try {
-    triggers.value = await api.listTriggers(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
+    triggers.value = await api.listTriggers(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName, props.tableMeta.catalog);
     triggersLoaded.value = true;
   } catch (e: any) {
     triggersError.value = String(e?.message || e);
@@ -7753,7 +7757,7 @@ async function fetchTriggers() {
 }
 
 watch(
-  () => [props.connectionId, props.database, props.tableMeta?.schema, props.tableMeta?.tableName],
+  () => [props.connectionId, props.database, props.tableMeta?.catalog, props.tableMeta?.schema, props.tableMeta?.tableName],
   () => {
     ddlContent.value = "";
     indexes.value = [];
@@ -8863,9 +8867,10 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       </button>
                     </div>
                     <div class="max-h-56 overflow-auto rounded border">
-                      <button v-for="column in filteredGoToColumns" :key="column.index" type="button" class="flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground" @click="scrollToColumn(column.index)">
+                      <button v-for="column in filteredGoToColumns" :key="column.index" type="button" class="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5 px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground" @click="scrollToColumn(column.index)">
                         <span class="min-w-0 truncate">{{ column.name }}</span>
-                        <span class="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">#{{ column.index + 1 }}</span>
+                        <span class="shrink-0 font-mono text-[10px] text-muted-foreground">#{{ column.index + 1 }}</span>
+                        <span v-if="column.comment" class="col-span-2 min-w-0 truncate text-[11px] leading-4 text-muted-foreground" :title="column.comment">{{ column.comment }}</span>
                       </button>
                       <div v-if="!filteredGoToColumns.length" class="px-2 py-3 text-center text-xs text-muted-foreground">{{ t("grid.noColumnsFound") }}</div>
                     </div>

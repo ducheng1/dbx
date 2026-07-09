@@ -778,6 +778,31 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openDamengJobAdmin(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "dameng-jobs" && tab.connectionId === connectionId);
+    if (existing) {
+      activeTabId.value = existing.id;
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: t("damengJobAdmin.title"),
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "dameng-jobs",
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openMongoBucket(connectionId: string, database: string, bucketName: string) {
     const title = `${database}.${bucketName}`;
     const existing = tabs.value.find((tab) => tab.mode === "mongo-bucket" && tab.connectionId === connectionId && tab.database === database && tab.mongoBucket?.bucketName === bucketName);
@@ -2855,6 +2880,7 @@ export const useQueryStore = defineStore("query", () => {
             schema: tableMeta.schema,
             tableName: tableMeta.tableName,
             tableType: tableMeta.tableType,
+            catalog: tableMeta.catalog,
             columns: tableMeta.columns.map((column) => column.name),
             primaryKeys,
             whereInput: tab.whereInput,
@@ -3059,6 +3085,7 @@ export const useQueryStore = defineStore("query", () => {
     openMongoGridFs,
     openMongoBucket,
     openUserAdmin,
+    openDamengJobAdmin,
     openMqAdmin,
     openNacosAdmin,
     openTableStructure,
