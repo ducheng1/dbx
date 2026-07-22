@@ -121,6 +121,11 @@ pub fn build_routine_rename_object_source_statements(
 
 pub fn build_executable_object_source_statements(input: EditableObjectSourceSqlInput) -> Result<Vec<String>, String> {
     let source = input.source.trim();
+    let source = if is_opengauss_like(input.database_type) && input.object_type == ObjectSourceKind::Procedure {
+        strip_standalone_trailing_slash(source)
+    } else {
+        source
+    };
     if input.database_type == DatabaseType::SqlServer {
         if input.object_type == ObjectSourceKind::View {
             return Ok(vec![build_sqlserver_alter_view_sql(input.schema.as_deref(), &input.name, source)]);
@@ -129,15 +134,11 @@ pub fn build_executable_object_source_statements(input: EditableObjectSourceSqlI
         return Ok(vec![replace_sqlserver_create_with_alter(source)]);
     }
 
-    if matches!(
-        input.database_type,
-        DatabaseType::Postgres
-            | DatabaseType::Gaussdb
-            | DatabaseType::Kwdb
-            | DatabaseType::OpenGauss
-            | DatabaseType::Questdb
-    ) && input.object_type == ObjectSourceKind::View
-    {
+    if input.database_type == DatabaseType::DuckDb && input.object_type == ObjectSourceKind::View {
+        return Ok(vec![executable_duckdb_view_ddl(input.schema.as_deref(), &input.name, source)]);
+    }
+
+    if is_postgres_like(input.database_type) && input.object_type == ObjectSourceKind::View {
         if let Some(sql) = executable_postgres_view_ddl(source) {
             return Ok(vec![sql]);
         }
@@ -160,6 +161,12 @@ pub fn build_executable_object_source_statements(input: EditableObjectSourceSqlI
         return Ok(executable_informix_view_statements(input.schema.as_deref(), &input.name, source));
     }
 
+    if is_mysql_like(input.database_type)
+        && matches!(input.object_type, ObjectSourceKind::Function | ObjectSourceKind::Procedure)
+    {
+        return Ok(executable_mysql_routine_statements(&input, source));
+    }
+
     let create_statement = ensure_semicolon(source);
     let cleanup = build_routine_rename_cleanup(&input, source);
     Ok(if let Some(cleanup) = cleanup { vec![create_statement, cleanup] } else { vec![create_statement] })
@@ -180,14 +187,8 @@ pub fn build_executable_object_source_sql(input: EditableObjectSourceSqlInput) -
 /// statements.
 pub fn build_editable_object_source(input: EditableObjectSourceSqlInput) -> String {
     let source = input.source.clone();
-    if matches!(
-        input.database_type,
-        DatabaseType::Postgres
-            | DatabaseType::Gaussdb
-            | DatabaseType::Kwdb
-            | DatabaseType::OpenGauss
-            | DatabaseType::Questdb
-    ) && input.object_type == ObjectSourceKind::View
+    if is_postgres_like(input.database_type)
+        && input.object_type == ObjectSourceKind::View
         && source_starts_with_create_or_alter(&source)
     {
         // Some providers return full view DDL instead of a bare SELECT body.
@@ -195,6 +196,11 @@ pub fn build_editable_object_source(input: EditableObjectSourceSqlInput) -> Stri
     }
     if input.database_type == DatabaseType::Informix && input.object_type == ObjectSourceKind::View {
         return editable_informix_view_ddl(input.schema.as_deref(), &input.name, &source);
+    }
+    if is_mysql_like(input.database_type)
+        && matches!(input.object_type, ObjectSourceKind::Function | ObjectSourceKind::Procedure)
+    {
+        return ensure_semicolon(source.trim());
     }
     match build_executable_object_source_statements(input) {
         Ok(statements) => statements.into_iter().next().unwrap_or_default(),
@@ -233,6 +239,11 @@ pub fn build_export_object_source_sql(
     source: &str,
 ) -> String {
     let source = source.trim();
+    let source = if is_opengauss_like(database_type) && object_type == ObjectSourceKind::Procedure {
+        strip_standalone_trailing_slash(source)
+    } else {
+        source
+    };
     if source.is_empty() {
         return String::new();
     }
@@ -295,6 +306,10 @@ fn is_postgres_like(database_type: DatabaseType) -> bool {
     )
 }
 
+fn is_opengauss_like(database_type: DatabaseType) -> bool {
+    matches!(database_type, DatabaseType::Gaussdb | DatabaseType::OpenGauss)
+}
+
 fn is_mysql_like(database_type: DatabaseType) -> bool {
     matches!(database_type, DatabaseType::Mysql | DatabaseType::Goldendb)
 }
@@ -309,9 +324,12 @@ fn object_type_keyword(object_type: &ObjectSourceKind) -> &'static str {
         ObjectSourceKind::MaterializedView => "MATERIALIZED_VIEW",
         ObjectSourceKind::Procedure => "PROCEDURE",
         ObjectSourceKind::Function => "FUNCTION",
+        ObjectSourceKind::Trigger => "TRIGGER",
         ObjectSourceKind::Sequence => "SEQUENCE",
         ObjectSourceKind::Package => "PACKAGE",
         ObjectSourceKind::PackageBody => "PACKAGE BODY",
+        ObjectSourceKind::Type => "TYPE",
+        ObjectSourceKind::TypeBody => "TYPE BODY",
     }
 }
 
@@ -329,6 +347,18 @@ fn ensure_semicolon(sql: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed};")
+    }
+}
+
+fn strip_standalone_trailing_slash(sql: &str) -> &str {
+    let trimmed = sql.trim();
+    let Some(without_slash) = trimmed.strip_suffix('/') else {
+        return trimmed;
+    };
+    if without_slash.ends_with('\n') || without_slash.ends_with('\r') {
+        without_slash.trim_end()
+    } else {
+        trimmed
     }
 }
 
@@ -350,26 +380,48 @@ fn mysql_routine_script_delimiter(source: &str) -> &'static str {
 }
 
 fn source_starts_with_create_or_alter(source: &str) -> bool {
-    Regex::new(r"(?i)^\s*(?:CREATE|ALTER)\s+").unwrap().is_match(source)
+    let executable = &source[leading_sql_statement_start(source)..];
+    Regex::new(r"(?i)^(?:CREATE|ALTER)\s+").unwrap().is_match(executable)
 }
 
 fn source_starts_with_alter(source: &str) -> bool {
-    Regex::new(r"(?i)^\s*ALTER\s+").unwrap().is_match(source)
+    let executable = &source[leading_sql_statement_start(source)..];
+    Regex::new(r"(?i)^ALTER\s+").unwrap().is_match(executable)
 }
 
 fn executable_postgres_view_ddl(source: &str) -> Option<String> {
     let trimmed = source.trim();
-    if Regex::new(r"(?i)^CREATE\s+OR\s+REPLACE\s+").unwrap().is_match(trimmed) {
+    let statement_start = leading_sql_statement_start(trimmed);
+    let executable = &trimmed[statement_start..];
+    if Regex::new(r"(?i)^CREATE\s+OR\s+REPLACE\s+").unwrap().is_match(executable) {
         return Some(ensure_semicolon(trimmed));
     }
 
-    let create_view = Regex::new(r"(?i)^CREATE\s+((?:(?:TEMP|TEMPORARY)\s+)?(?:RECURSIVE\s+)?VIEW\s+)").unwrap();
-    if create_view.is_match(trimmed) {
-        let replaced = create_view.replace(trimmed, "CREATE OR REPLACE $1");
-        return Some(ensure_semicolon(replaced.as_ref()));
+    // Kingbase extends PostgreSQL's prefix with FORCE after the optional RECURSIVE modifier.
+    let create_view =
+        Regex::new(r"(?i)^CREATE\s+((?:(?:TEMP|TEMPORARY)\s+)?(?:RECURSIVE\s+)?(?:FORCE\s+)?VIEW\s+)").unwrap();
+    if create_view.is_match(executable) {
+        let replaced = create_view.replace(executable, "CREATE OR REPLACE $1");
+        return Some(ensure_semicolon(&format!("{}{}", &trimmed[..statement_start], replaced)));
     }
 
     None
+}
+
+fn leading_sql_statement_start(source: &str) -> usize {
+    let mut index = 0;
+    loop {
+        index = skip_sql_whitespace(source, index);
+        if let Some(end) = sql_line_comment_end(source, index) {
+            index = end;
+            continue;
+        }
+        if let Some(end) = sql_block_comment_end(source, index) {
+            index = end;
+            continue;
+        }
+        return index;
+    }
 }
 
 fn executable_oracle_view_ddl(schema: Option<&str>, name: &str, source: &str) -> String {
@@ -427,7 +479,7 @@ fn informix_view_definition(schema: Option<&str>, name: &str, source: &str) -> (
         let view_name = captures.get(1).unwrap();
         let target_name = strip_informix_owner_qualifiers(view_name.as_str(), schema);
         let body = strip_informix_owner_qualifiers(&trimmed[view_name.end()..], schema);
-        return (target_name.trim().to_string(), body);
+        (target_name.trim().to_string(), body)
     } else {
         let body = strip_informix_owner_qualifiers(trimmed, schema);
         (informix_identifier(name), format!(" AS\n{body}"))
@@ -458,6 +510,35 @@ fn create_informix_view(name: &str, create_tail: &str) -> String {
 
 fn drop_informix_view_if_exists(name: &str) -> String {
     format!("DROP VIEW IF EXISTS {};", name.trim())
+}
+
+fn executable_mysql_routine_statements(input: &EditableObjectSourceSqlInput, source: &str) -> Vec<String> {
+    if !mysql_source_starts_with_create_routine(source) {
+        return vec![ensure_semicolon(source)];
+    }
+
+    let declaration = mysql_routine_declaration(source).filter(|declaration| declaration.kind == input.object_type);
+    let create_name = declaration.as_ref().map(|declaration| declaration.name.as_str()).unwrap_or(&input.name);
+    let mut statements = Vec::with_capacity(3);
+
+    // MySQL has no cross-version CREATE OR REPLACE for stored routines; DBeaver also
+    // replaces them by dropping the target routine before executing the CREATE body.
+    statements.push(mysql_drop_routine_if_exists(input.object_type.clone(), input.schema.as_deref(), create_name));
+    statements.push(ensure_semicolon(source));
+
+    if declaration.as_ref().is_some_and(|declaration| routine_name_changed(&declaration.name, &input.name)) {
+        statements.push(mysql_drop_routine_if_exists(input.object_type.clone(), input.schema.as_deref(), &input.name));
+    }
+
+    statements
+}
+
+fn mysql_drop_routine_if_exists(object_type: ObjectSourceKind, schema: Option<&str>, name: &str) -> String {
+    format!("DROP {} IF EXISTS {};", object_type_keyword(&object_type), mysql_qualified_name(schema, name))
+}
+
+fn mysql_source_starts_with_create_routine(source: &str) -> bool {
+    Regex::new(r"(?is)^\s*CREATE\s+(?:DEFINER\s*=.+?\s+)?(?:FUNCTION|PROCEDURE)\b").unwrap().is_match(source)
 }
 
 fn informix_validation_view_name(target_name: &str) -> String {
@@ -532,7 +613,7 @@ fn informix_owner_qualifier_replacement<'a>(source: &'a str, start: usize, schem
         return None;
     }
     let ident_start = skip_sql_whitespace(source, dot + 1);
-    read_informix_identifier_text(source, ident_start).map(|(ident_end, ident_text)| (ident_end, ident_text))
+    read_informix_identifier_text(source, ident_start)
 }
 
 fn sql_single_quoted_literal_end(source: &str, start: usize) -> Option<usize> {
@@ -566,8 +647,27 @@ fn sql_block_comment_end(source: &str, start: usize) -> Option<usize> {
     if !source[start..].starts_with("/*") {
         return None;
     }
-    let rest = &source[start + 2..];
-    Some(start + 2 + rest.find("*/").map(|index| index + 2).unwrap_or(rest.len()))
+
+    // PostgreSQL and Kingbase default to nested SQL block comments, so match the outer terminator.
+    let mut depth = 1;
+    let mut index = start + 2;
+    while index < source.len() {
+        if source[index..].starts_with("/*") {
+            depth += 1;
+            index += 2;
+        } else if source[index..].starts_with("*/") {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return Some(index);
+            }
+        } else {
+            index += source[index..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    // Preserve the existing safe behavior: an unclosed leading comment consumes the remaining source.
+    Some(source.len())
 }
 
 fn read_quoted_sql_identifier(source: &str, start: usize) -> Option<(usize, String)> {
@@ -732,7 +832,7 @@ fn replace_sql_routine_declaration_name(source: &str, schema: Option<&str>, new_
 
 fn mysql_routine_declaration(source: &str) -> Option<RoutineDeclaration> {
     let re = Regex::new(
-        r"(?is)^\s*CREATE\s+(?:DEFINER\s*=\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s+)?(FUNCTION|PROCEDURE)\s+((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
+        r"(?is)^\s*CREATE\s+(?:DEFINER\s*=\s*(?:(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)|CURRENT_USER(?:\(\))?)\s+)?(FUNCTION|PROCEDURE)\s+(?:IF\s+NOT\s+EXISTS\s+)?((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
     )
     .unwrap();
     let captures = re.captures(source)?;
@@ -744,7 +844,7 @@ fn mysql_routine_declaration(source: &str) -> Option<RoutineDeclaration> {
 
 fn replace_mysql_routine_declaration_name(source: &str, new_name: &str) -> Option<String> {
     let re = Regex::new(
-        r"(?is)^(\s*CREATE\s+(?:DEFINER\s*=\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s+)?(?:FUNCTION|PROCEDURE)\s+)((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
+        r"(?is)^(\s*CREATE\s+(?:DEFINER\s*=\s*(?:(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)|CURRENT_USER(?:\(\))?)\s+)?(?:FUNCTION|PROCEDURE)\s+(?:IF\s+NOT\s+EXISTS\s+)?)((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
     )
     .unwrap();
     let captures = re.captures(source)?;
@@ -770,6 +870,16 @@ fn build_sqlserver_alter_view_sql(schema: Option<&str>, name: &str, source: &str
     format!("ALTER VIEW {} AS\n{}", sqlserver_qualified_name(schema, name), ensure_semicolon(source))
 }
 
+fn executable_duckdb_view_ddl(schema: Option<&str>, name: &str, source: &str) -> String {
+    let existing_view_statement =
+        Regex::new(r"(?i)^CREATE\s+(?:OR\s+REPLACE\s+)?VIEW(?:\s+IF\s+NOT\s+EXISTS)?\s+").unwrap();
+    if existing_view_statement.is_match(source) {
+        return ensure_semicolon(&existing_view_statement.replace(source, "CREATE OR REPLACE VIEW "));
+    }
+
+    format!("CREATE OR REPLACE VIEW {} AS\n{}", postgres_qualified_name(schema, name), ensure_semicolon(source))
+}
+
 fn parse_object_source_kind(value: &str) -> Option<ObjectSourceKind> {
     if value.eq_ignore_ascii_case("VIEW") {
         Some(ObjectSourceKind::View)
@@ -779,12 +889,18 @@ fn parse_object_source_kind(value: &str) -> Option<ObjectSourceKind> {
         Some(ObjectSourceKind::Procedure)
     } else if value.eq_ignore_ascii_case("FUNCTION") {
         Some(ObjectSourceKind::Function)
+    } else if value.eq_ignore_ascii_case("TRIGGER") {
+        Some(ObjectSourceKind::Trigger)
     } else if value.eq_ignore_ascii_case("SEQUENCE") {
         Some(ObjectSourceKind::Sequence)
     } else if value.eq_ignore_ascii_case("PACKAGE") {
         Some(ObjectSourceKind::Package)
     } else if value.eq_ignore_ascii_case("PACKAGE BODY") || value.eq_ignore_ascii_case("PACKAGE_BODY") {
         Some(ObjectSourceKind::PackageBody)
+    } else if value.eq_ignore_ascii_case("TYPE") {
+        Some(ObjectSourceKind::Type)
+    } else if value.eq_ignore_ascii_case("TYPE BODY") || value.eq_ignore_ascii_case("TYPE_BODY") {
+        Some(ObjectSourceKind::TypeBody)
     } else {
         None
     }
@@ -929,6 +1045,36 @@ mod tests {
     }
 
     #[test]
+    fn duckdb_view_create_source_saves_as_create_or_replace_view() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::DuckDb,
+            object_type: ObjectSourceKind::View,
+            schema: Some("main".to_string()),
+            name: "active_orders".to_string(),
+            source: "CREATE VIEW active_orders AS SELECT id FROM orders WHERE active".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "CREATE OR REPLACE VIEW active_orders AS SELECT id FROM orders WHERE active;");
+    }
+
+    #[test]
+    fn duckdb_view_body_saves_as_qualified_create_or_replace_view() {
+        let sql = build_editable_object_source(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::DuckDb,
+            object_type: ObjectSourceKind::View,
+            schema: Some("reporting".to_string()),
+            name: "active orders".to_string(),
+            source: "SELECT id FROM orders WHERE active".to_string(),
+        });
+
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW \"reporting\".\"active orders\" AS\nSELECT id FROM orders WHERE active;"
+        );
+    }
+
+    #[test]
     fn postgres_view_body_opens_as_create_or_replace_view() {
         let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
             database_type: DatabaseType::Postgres,
@@ -988,6 +1134,180 @@ mod tests {
         .unwrap();
 
         assert_eq!(sql, format!("{source};"));
+    }
+
+    #[test]
+    fn kingbase_view_body_opens_as_create_or_replace_view() {
+        let sql = build_editable_object_source(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("dbx_issue3895_repro".to_string()),
+            name: "edited_view".to_string(),
+            source: "SELECT id, label FROM source_rows WHERE id >= 1".to_string(),
+        });
+
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW \"dbx_issue3895_repro\".\"edited_view\" AS\nSELECT id, label FROM source_rows WHERE id >= 1;"
+        );
+    }
+
+    #[test]
+    fn kingbase_view_create_source_saves_as_create_or_replace_view() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("dbx_issue3895_repro".to_string()),
+            name: "edited_view".to_string(),
+            source: "CREATE VIEW dbx_issue3895_repro.edited_view AS SELECT id, label FROM source_rows".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "CREATE OR REPLACE VIEW dbx_issue3895_repro.edited_view AS SELECT id, label FROM source_rows;");
+    }
+
+    #[test]
+    fn kingbase_view_create_force_source_saves_as_create_or_replace_force_view() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: "CREATE FORCE VIEW app.edited_view AS SELECT id FROM source_rows".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "CREATE OR REPLACE FORCE VIEW app.edited_view AS SELECT id FROM source_rows;");
+    }
+
+    #[test]
+    fn kingbase_view_create_recursive_force_source_preserves_modifier_order() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: "CREATE RECURSIVE FORCE VIEW app.edited_view AS SELECT id FROM source_rows".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "CREATE OR REPLACE RECURSIVE FORCE VIEW app.edited_view AS SELECT id FROM source_rows;");
+    }
+
+    #[test]
+    fn kingbase_view_create_temporary_recursive_force_source_preserves_legal_modifiers() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: "CREATE TEMPORARY RECURSIVE FORCE VIEW app.edited_view AS SELECT id FROM source_rows".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE TEMPORARY RECURSIVE FORCE VIEW app.edited_view AS SELECT id FROM source_rows;"
+        );
+    }
+
+    #[test]
+    fn kingbase_view_create_or_replace_force_source_saves_without_rewrapping() {
+        let source = "CREATE OR REPLACE FORCE VIEW app.edited_view AS SELECT id FROM source_rows";
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: source.to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, format!("{source};"));
+    }
+
+    #[test]
+    fn kingbase_view_create_source_preserves_leading_line_comment() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: "-- keep this note\nCREATE VIEW app.edited_view AS SELECT id FROM source_rows".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "-- keep this note\nCREATE OR REPLACE VIEW app.edited_view AS SELECT id FROM source_rows;");
+    }
+
+    #[test]
+    fn kingbase_view_create_source_preserves_leading_block_comment() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: "/* CREATE VIEW in this comment is ignored */\nCREATE VIEW app.edited_view AS SELECT id FROM source_rows"
+                .to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "/* CREATE VIEW in this comment is ignored */\nCREATE OR REPLACE VIEW app.edited_view AS SELECT id FROM source_rows;"
+        );
+    }
+
+    #[test]
+    fn kingbase_view_create_source_preserves_leading_nested_block_comment() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: "/* outer /* nested */ comment */\nCREATE FORCE VIEW app.edited_view AS SELECT id FROM source_rows"
+                .to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "/* outer /* nested */ comment */\nCREATE OR REPLACE FORCE VIEW app.edited_view AS SELECT id FROM source_rows;"
+        );
+    }
+
+    #[test]
+    fn kingbase_view_create_source_preserves_leading_multi_level_block_comment() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source:
+                "/* level 1 /* level 2 /* level 3 */ level 2 */ level 1 */\nCREATE VIEW app.edited_view AS SELECT id FROM source_rows"
+                    .to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "/* level 1 /* level 2 /* level 3 */ level 2 */ level 1 */\nCREATE OR REPLACE VIEW app.edited_view AS SELECT id FROM source_rows;"
+        );
+    }
+
+    #[test]
+    fn kingbase_view_unclosed_leading_block_comment_keeps_safe_body_fallback() {
+        let source = "/* unclosed comment\nCREATE FORCE VIEW app.edited_view AS SELECT id FROM source_rows";
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Kingbase,
+            object_type: ObjectSourceKind::View,
+            schema: Some("app".to_string()),
+            name: "edited_view".to_string(),
+            source: source.to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, format!("CREATE OR REPLACE VIEW \"app\".\"edited_view\" AS\n{source};"));
     }
 
     #[test]
@@ -1212,6 +1532,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_programmable_metadata_object_kinds() {
+        assert_eq!(parse_object_source_kind("TRIGGER"), Some(ObjectSourceKind::Trigger));
+        assert_eq!(parse_object_source_kind("TYPE"), Some(ObjectSourceKind::Type));
+        assert_eq!(parse_object_source_kind("TYPE_BODY"), Some(ObjectSourceKind::TypeBody));
+        assert_eq!(parse_object_source_kind("PACKAGE BODY"), Some(ObjectSourceKind::PackageBody));
+    }
+
+    #[test]
     fn postgres_procedure_rename_adds_drop_cleanup() {
         let statements = build_executable_object_source_statements(input(
             DatabaseType::Postgres,
@@ -1243,10 +1571,92 @@ mod tests {
         assert_eq!(
             statements,
             vec![
+                "DROP PROCEDURE IF EXISTS `app`.`refresh_cache_v2`;",
                 "CREATE DEFINER=`root`@`%` PROCEDURE `refresh_cache_v2`(IN mode_name varchar(20)) BEGIN SELECT 1; END;",
                 "DROP PROCEDURE IF EXISTS `app`.`refresh_cache`;",
             ]
         );
+    }
+
+    #[test]
+    fn mysql_procedure_save_replaces_existing_routine() {
+        let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Procedure,
+            schema: Some("app".to_string()),
+            name: "refresh_cache".to_string(),
+            source: "CREATE DEFINER=`root`@`%` PROCEDURE `refresh_cache`() BEGIN SELECT 1; END".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "DROP PROCEDURE IF EXISTS `app`.`refresh_cache`;",
+                "CREATE DEFINER=`root`@`%` PROCEDURE `refresh_cache`() BEGIN SELECT 1; END;",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_function_save_replaces_existing_routine() {
+        let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Function,
+            schema: Some("app".to_string()),
+            name: "active_count".to_string(),
+            source: "CREATE DEFINER=CURRENT_USER FUNCTION `active_count`() RETURNS INT RETURN 1".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "DROP FUNCTION IF EXISTS `app`.`active_count`;",
+                "CREATE DEFINER=CURRENT_USER FUNCTION `active_count`() RETURNS INT RETURN 1;",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_alter_routine_source_saves_without_dropping() {
+        let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Procedure,
+            schema: Some("app".to_string()),
+            name: "refresh_cache".to_string(),
+            source: "ALTER PROCEDURE `refresh_cache` COMMENT 'refreshes cache'".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["ALTER PROCEDURE `refresh_cache` COMMENT 'refreshes cache';"]);
+    }
+
+    #[test]
+    fn mysql_routine_source_opened_for_editing_keeps_create_statement() {
+        let sql = build_editable_object_source(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Procedure,
+            schema: Some("app".to_string()),
+            name: "refresh_cache".to_string(),
+            source: "CREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END".to_string(),
+        });
+
+        assert_eq!(sql, "CREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END;");
+    }
+
+    #[test]
+    fn opengauss_procedure_source_omits_gsql_trailing_slash() {
+        let source = "CREATE OR REPLACE PROCEDURE public.refresh_cache()\nAS DECLARE BEGIN\n  NULL;\nEND;\n/";
+        let expected = "CREATE OR REPLACE PROCEDURE public.refresh_cache()\nAS DECLARE BEGIN\n  NULL;\nEND;";
+
+        for database_type in [DatabaseType::Gaussdb, DatabaseType::OpenGauss] {
+            let editable = build_editable_object_source(input(database_type, ObjectSourceKind::Procedure, source));
+            assert_eq!(editable, expected);
+
+            let exported = build_export_object_source_sql(database_type, ObjectSourceKind::Procedure, source);
+            assert_eq!(exported, expected);
+        }
     }
 
     #[test]

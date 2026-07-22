@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { qualifiedTableName, quoteTableIdentifier } from "@/lib/table/tableSelectSql";
+import { qualifiedTableName, quoteTableDataIdentifier, quoteTableIdentifier } from "@/lib/table/tableSelectSql";
 
 describe("qualifiedTableName — Doris/StarRocks multi-catalog", () => {
   it("prefixes external catalog for Doris (no schema)", () => {
@@ -28,6 +28,12 @@ describe("qualifiedTableName — Doris/StarRocks multi-catalog", () => {
   });
 });
 
+describe("qualifiedTableName — SQLite attached databases", () => {
+  it("qualifies tables with the attached database alias", () => {
+    expect(qualifiedTableName({ databaseType: "sqlite", schema: "analytics", tableName: "events" })).toBe('"analytics"."events"');
+  });
+});
+
 describe("quoteTableIdentifier", () => {
   it("backtick-quotes mysql identifiers", () => {
     expect(quoteTableIdentifier("mysql", "orders")).toBe("`orders`");
@@ -35,5 +41,18 @@ describe("quoteTableIdentifier", () => {
 
   it("bracket-quotes sqlserver identifiers", () => {
     expect(quoteTableIdentifier("sqlserver", "orders")).toBe("[orders]");
+  });
+
+  it("uses the connection-reported quote for Kingbase table-data identifiers", () => {
+    expect(quoteTableDataIdentifier("kingbase", "order", "`")).toBe("`order`");
+    expect(quoteTableDataIdentifier("kingbase", "MixedCase", '"')).toBe('"MixedCase"');
+    expect(quoteTableDataIdentifier("kingbase", "order detail", "`")).toBe("`order detail`");
+  });
+
+  it("escapes Kingbase identifiers without maintaining a reserved-word list", () => {
+    expect(quoteTableDataIdentifier("kingbase", "ANALYZE", "`")).toBe("`ANALYZE`");
+    expect(quoteTableDataIdentifier("kingbase", "AUTHORIZATION", '"')).toBe('"AUTHORIZATION"');
+    expect(quoteTableDataIdentifier("kingbase", "COLLATE", "`")).toBe("`COLLATE`");
+    expect(quoteTableDataIdentifier("kingbase", "a`b", "`")).toBe("`a``b`");
   });
 });

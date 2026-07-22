@@ -6,7 +6,11 @@ use crate::commands::connection::{ensure_connection_writable, AppState};
 use dbx_core::db::mongo_driver::MongoDocumentResult;
 use dbx_core::document_ops::CollectionInfo;
 
-async fn run_cancellable<T, F>(state: &Arc<AppState>, execution_id: Option<String>, future: F) -> Result<T, String>
+pub(crate) async fn run_cancellable<T, F>(
+    state: &Arc<AppState>,
+    execution_id: Option<String>,
+    future: F,
+) -> Result<T, String>
 where
     F: Future<Output = Result<T, String>>,
 {
@@ -81,9 +85,18 @@ pub async fn document_insert_document(
     database: String,
     collection: String,
     doc_json: String,
+    routing: Option<String>,
 ) -> Result<String, String> {
     ensure_connection_writable(&state, &connection_id, "Insert").await?;
-    dbx_core::document_ops::insert_document_core(&state, &connection_id, &database, &collection, &doc_json).await
+    dbx_core::document_ops::insert_document_core(
+        &state,
+        &connection_id,
+        &database,
+        &collection,
+        &doc_json,
+        routing.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]

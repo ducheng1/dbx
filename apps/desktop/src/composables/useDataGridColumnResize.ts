@@ -1,5 +1,7 @@
-import { ref, computed, watch, type ComputedRef } from "vue";
-import { calculateDataGridColumnWidth, DATA_GRID_AUTO_FIT_VALUE_TEXT_LIMIT, DATA_GRID_COL_AUTO_FIT_MAX_WIDTH, DATA_GRID_COL_MIN_WIDTH, DATA_GRID_SAMPLE_ROWS } from "@/lib/dataGrid/dataGridColumnWidth";
+import { ref, computed, watch, type ComputedRef, type Ref } from "vue";
+import { calculateDataGridColumnWidth, DATA_GRID_AUTO_FIT_VALUE_TEXT_LIMIT, DATA_GRID_COL_AUTO_FIT_MAX_WIDTH, DATA_GRID_COL_MIN_WIDTH, COLUMN_WIDTH_DENSITY_PRESETS } from "@/lib/dataGrid/dataGridColumnWidth";
+import { createDataGridColumnMeasurementSignature, loadDataGridColumnWidthState, removeDataGridColumnWidthState, saveDataGridColumnWidthState } from "@/lib/dataGrid/dataGridColumnWidthState";
+import type { ColumnWidthDensity } from "@/stores/settingsStore";
 
 type CellValue = string | number | boolean | null;
 
@@ -13,19 +15,38 @@ export interface UseDataGridColumnResizeOptions {
   columns: ComputedRef<string[]>;
   sourceRows: ComputedRef<CellValue[][]>;
   columnIndexes: ComputedRef<number[]>;
+  density: Ref<ColumnWidthDensity>;
+  compactColumnHeaderActions: ComputedRef<boolean>;
+  cacheKey?: ComputedRef<string | undefined>;
+  columnStructureSignature: ComputedRef<string>;
+  measureHeaderText?: (text: string) => number | undefined;
+  headerMeasurementKey?: Ref<unknown>;
 }
 
 export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions) {
-  const { columns, sourceRows, columnIndexes } = options;
+  const { columns, sourceRows, columnIndexes, density, compactColumnHeaderActions, measureHeaderText } = options;
 
   const columnWidths = ref<number[]>([]);
   let isResizing = false;
   let previousColumnIndexes: number[] = [];
 
+  function columnWidthStateIdentity() {
+    return {
+      cacheKey: options.cacheKey?.value,
+      structureSignature: options.columnStructureSignature.value,
+      measurementSignature: createDataGridColumnMeasurementSignature(density.value, compactColumnHeaderActions.value, options.headerMeasurementKey?.value),
+    };
+  }
+
+  function persistColumnWidths() {
+    saveDataGridColumnWidthState(columnWidthStateIdentity(), previousColumnIndexes, columnWidths.value);
+  }
+
   function sampleColumnValues(visibleColIdx: number): CellValue[] {
     const actualColIdx = columnIndexes.value[visibleColIdx];
     const rows = sourceRows.value;
-    const end = Math.min(rows.length, DATA_GRID_SAMPLE_ROWS);
+    const preset = COLUMN_WIDTH_DENSITY_PRESETS[density.value];
+    const end = Math.min(rows.length, preset.sampleRows);
     const values: CellValue[] = [];
     for (let i = 0; i < end; i++) {
       values.push(rows[i][actualColIdx] ?? null);
@@ -33,20 +54,28 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
     return values;
   }
 
-  function initColumnWidths() {
+  function initColumnWidths(force = false) {
     const previousWidthsByColumnIndex = new Map<number, number>();
     previousColumnIndexes.forEach((columnIndex, visibleIndex) => {
       const width = columnWidths.value[visibleIndex];
       if (width !== undefined) previousWidthsByColumnIndex.set(columnIndex, width);
     });
     const nextColumnIndexes = [...columnIndexes.value];
-    if (columnWidths.value.length !== columns.value.length || previousColumnIndexes.join("\0") !== nextColumnIndexes.join("\0")) {
+    const cachedWidths = !force && previousColumnIndexes.length === 0 ? loadDataGridColumnWidthState(columnWidthStateIdentity(), nextColumnIndexes) : undefined;
+    if (force || columnWidths.value.length !== columns.value.length || previousColumnIndexes.join("\0") !== nextColumnIndexes.join("\0")) {
       columnWidths.value = columns.value.map((colName, colIdx) => {
-        const existingWidth = previousWidthsByColumnIndex.get(nextColumnIndexes[colIdx]);
-        if (existingWidth !== undefined) return existingWidth;
+        if (!force) {
+          const existingWidth = previousWidthsByColumnIndex.get(nextColumnIndexes[colIdx]);
+          if (existingWidth !== undefined) return existingWidth;
+          const cachedWidth = cachedWidths?.[colIdx];
+          if (cachedWidth !== undefined) return cachedWidth;
+        }
         return calculateDataGridColumnWidth({
           columnName: colName,
           sampleValues: sampleColumnValues(colIdx),
+          density: density.value,
+          compactColumnHeaderActions: compactColumnHeaderActions.value,
+          headerTextWidth: measureHeaderText?.(colName),
         });
       });
     }
@@ -87,6 +116,7 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
       cancelPendingFrame();
       pendingClientX = e.clientX;
       applyPendingWidth();
+      persistColumnWidths();
       requestAnimationFrame(() => {
         isResizing = false;
       });
@@ -103,7 +133,12 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
       sampleValues: sampleColumnValues(colIdx),
       maxWidth: DATA_GRID_COL_AUTO_FIT_MAX_WIDTH,
       valueTextLimit: DATA_GRID_AUTO_FIT_VALUE_TEXT_LIMIT,
+      density: density.value,
+      compactColumnHeaderActions: compactColumnHeaderActions.value,
+      includeValues: true,
+      headerTextWidth: measureHeaderText?.(colName),
     });
+    persistColumnWidths();
   }
 
   const renderedColumnWidths = computed(() => columnWidths.value.slice());
@@ -124,7 +159,20 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
     return isResizing;
   }
 
-  watch(() => columnIndexes.value.join("\0"), initColumnWidths);
+  watch(
+    () => columnIndexes.value.join("\0"),
+    () => initColumnWidths(),
+  );
+  watch([() => options.cacheKey?.value, options.columnStructureSignature], () => {
+    columnWidths.value = [];
+    previousColumnIndexes = [];
+    initColumnWidths();
+  });
+  watch([density, compactColumnHeaderActions, () => options.headerMeasurementKey?.value], () => {
+    // Widths measured with different density or font metrics are unsafe to reuse.
+    removeDataGridColumnWidthState(options.cacheKey?.value);
+    initColumnWidths(true);
+  });
 
   return {
     columnWidths,

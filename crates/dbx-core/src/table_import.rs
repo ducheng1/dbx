@@ -1,12 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
-use calamine::{open_workbook_auto, Data, Reader};
+use calamine::{open_workbook_auto, Data, ExcelDateTime, Reader as CalamineReader};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader as XmlReader;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::AppState;
+use crate::connection::{task_client_session_id, AppState};
 use crate::models::connection::DatabaseType;
 use crate::transfer::{
     execute_on_pool, generate_insert_typed, get_columns_for_transfer, qualified_table, quote_identifier,
@@ -17,11 +21,16 @@ pub const DEFAULT_BATCH_SIZE: usize = 500;
 pub const CREATE_TABLE_INFERENCE_ROWS: usize = 100;
 pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
 
+pub fn table_import_client_session_id(import_id: &str) -> String {
+    task_client_session_id("table-import", import_id)
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedImportFile {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub total_rows: usize,
+    pub effective_encoding: Option<TableImportTextEncoding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,11 +101,47 @@ pub enum TableImportJsonShape {
     Arrays,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TableImportTextEncoding {
+    Auto,
+    Utf8,
+    Gbk,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl TableImportTextEncoding {
+    fn encoding(self) -> Option<&'static encoding_rs::Encoding> {
+        match self {
+            TableImportTextEncoding::Auto => None,
+            TableImportTextEncoding::Utf8 => Some(encoding_rs::UTF_8),
+            TableImportTextEncoding::Gbk => Some(encoding_rs::GBK),
+            TableImportTextEncoding::Utf16Le => Some(encoding_rs::UTF_16LE),
+            TableImportTextEncoding::Utf16Be => Some(encoding_rs::UTF_16BE),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TableImportTextEncoding::Auto => "auto",
+            TableImportTextEncoding::Utf8 => "UTF-8",
+            TableImportTextEncoding::Gbk => "GBK / GB18030",
+            TableImportTextEncoding::Utf16Le => "UTF-16 LE",
+            TableImportTextEncoding::Utf16Be => "UTF-16 BE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableImportParseOptions {
     pub delimiter: Option<String>,
+    pub encoding: Option<TableImportTextEncoding>,
     pub has_header: Option<bool>,
+    pub title_row: Option<usize>,
+    pub data_start_row: Option<usize>,
+    pub last_data_row: Option<usize>,
     pub trim_values: Option<bool>,
     pub empty_string_as_null: Option<bool>,
     pub sheet_name: Option<String>,
@@ -108,7 +153,11 @@ impl Default for TableImportParseOptions {
     fn default() -> Self {
         Self {
             delimiter: None,
+            encoding: Some(TableImportTextEncoding::Auto),
             has_header: None,
+            title_row: None,
+            data_start_row: None,
+            last_data_row: None,
             trim_values: Some(false),
             empty_string_as_null: Some(true),
             sheet_name: None,
@@ -152,6 +201,8 @@ pub struct TableImportRequest {
     #[serde(default)]
     pub create_table: bool,
     pub batch_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_time_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +217,8 @@ pub struct TableImportPreview {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub total_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_encoding: Option<TableImportTextEncoding>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sheets: Vec<String>,
 }
@@ -266,9 +319,37 @@ pub fn normalize_header(value: &str, index: usize) -> String {
 #[derive(Debug, Clone, Copy)]
 pub struct DelimitedParseConfig {
     pub delimiter: u8,
-    pub has_header: bool,
     pub trim_values: bool,
     pub empty_string_as_null: bool,
+    pub row_range: ImportRowRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportRowRange {
+    pub title_row: Option<usize>,
+    pub data_start_row: usize,
+    pub last_data_row: Option<usize>,
+}
+
+pub fn effective_import_row_range(options: &TableImportParseOptions) -> Result<ImportRowRange, String> {
+    let title_row = match options.title_row {
+        Some(0) => None,
+        Some(row) => Some(row),
+        None if options.has_header.unwrap_or(true) => Some(1),
+        None => None,
+    };
+    let data_start_row = options.data_start_row.unwrap_or_else(|| title_row.map_or(1, |row| row + 1));
+    let last_data_row = options.last_data_row.filter(|row| *row > 0);
+    if data_start_row == 0 {
+        return Err("Data start row must be at least 1".to_string());
+    }
+    if title_row.is_some_and(|row| row >= data_start_row) {
+        return Err("Title row must be before the data start row".to_string());
+    }
+    if last_data_row.is_some_and(|last| last < data_start_row) {
+        return Err("Last data row must be 0 or not less than the data start row".to_string());
+    }
+    Ok(ImportRowRange { title_row, data_start_row, last_data_row })
 }
 
 pub fn effective_delimited_config(
@@ -293,9 +374,9 @@ pub fn effective_delimited_config(
 
     Ok(DelimitedParseConfig {
         delimiter,
-        has_header: options.has_header.unwrap_or(true),
         trim_values: options.trim_values.unwrap_or(false),
         empty_string_as_null: options.empty_string_as_null.unwrap_or(true),
+        row_range: effective_import_row_range(options)?,
     })
 }
 
@@ -311,8 +392,201 @@ pub fn csv_value_with_config(value: &str, config: DelimitedParseConfig) -> serde
 pub fn csv_value(value: &str) -> serde_json::Value {
     csv_value_with_config(
         value,
-        DelimitedParseConfig { delimiter: b',', has_header: true, trim_values: false, empty_string_as_null: true },
+        DelimitedParseConfig {
+            delimiter: b',',
+            trim_values: false,
+            empty_string_as_null: true,
+            row_range: ImportRowRange { title_row: Some(1), data_start_row: 2, last_data_row: None },
+        },
     )
+}
+
+const IMPORT_ENCODING_READ_CHUNK_BYTES: usize = 16 * 1024;
+
+struct StrictTranscodingReader<R> {
+    reader: R,
+    decoder: encoding_rs::Decoder,
+    encoding: TableImportTextEncoding,
+    pending_input: Vec<u8>,
+    pending_output: Vec<u8>,
+    output_offset: usize,
+    reached_eof: bool,
+    finished: bool,
+}
+
+impl<R: IoRead> StrictTranscodingReader<R> {
+    fn new(reader: R, encoding: TableImportTextEncoding) -> Result<Self, String> {
+        let decoder = encoding
+            .encoding()
+            .ok_or_else(|| "Automatic text encoding must be resolved before decoding".to_string())?
+            .new_decoder_without_bom_handling();
+        Ok(Self {
+            reader,
+            decoder,
+            encoding,
+            pending_input: Vec::with_capacity(IMPORT_ENCODING_READ_CHUNK_BYTES),
+            pending_output: Vec::new(),
+            output_offset: 0,
+            reached_eof: false,
+            finished: false,
+        })
+    }
+
+    fn invalid_data_error(&self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid byte sequence for {} encoding", self.encoding.label()),
+        )
+    }
+}
+
+impl<R: IoRead> IoRead for StrictTranscodingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if self.output_offset < self.pending_output.len() {
+                let available = &self.pending_output[self.output_offset..];
+                let copied = available.len().min(buffer.len());
+                buffer[..copied].copy_from_slice(&available[..copied]);
+                self.output_offset += copied;
+                if self.output_offset == self.pending_output.len() {
+                    self.pending_output.clear();
+                    self.output_offset = 0;
+                }
+                return Ok(copied);
+            }
+            if self.finished {
+                return Ok(0);
+            }
+
+            if self.pending_input.is_empty() && !self.reached_eof {
+                let mut input = [0u8; IMPORT_ENCODING_READ_CHUNK_BYTES];
+                let read = self.reader.read(&mut input)?;
+                if read == 0 {
+                    self.reached_eof = true;
+                } else {
+                    self.pending_input.extend_from_slice(&input[..read]);
+                }
+            }
+
+            let output_capacity = self
+                .decoder
+                .max_utf8_buffer_length_without_replacement(self.pending_input.len())
+                .unwrap_or(self.pending_input.len().saturating_mul(3).saturating_add(4))
+                .max(4);
+            let mut output = vec![0u8; output_capacity];
+            let (result, read, written) =
+                self.decoder.decode_to_utf8_without_replacement(&self.pending_input, &mut output, self.reached_eof);
+            self.pending_input.drain(..read);
+            output.truncate(written);
+            self.pending_output = output;
+
+            match result {
+                encoding_rs::DecoderResult::Malformed(_, _) => return Err(self.invalid_data_error()),
+                encoding_rs::DecoderResult::InputEmpty if self.reached_eof => self.finished = true,
+                encoding_rs::DecoderResult::InputEmpty | encoding_rs::DecoderResult::OutputFull => {}
+            }
+        }
+    }
+}
+
+fn bom_text_encoding(bytes: &[u8]) -> Option<(TableImportTextEncoding, usize)> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Some((TableImportTextEncoding::Utf8, 3))
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        Some((TableImportTextEncoding::Utf16Le, 2))
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        Some((TableImportTextEncoding::Utf16Be, 2))
+    } else {
+        None
+    }
+}
+
+fn matching_bom_len(bytes: &[u8], encoding: TableImportTextEncoding) -> usize {
+    bom_text_encoding(bytes).filter(|(bom_encoding, _)| *bom_encoding == encoding).map(|(_, len)| len).unwrap_or(0)
+}
+
+fn reader_is_valid_for_encoding<R: IoRead>(reader: R, encoding: TableImportTextEncoding) -> Result<bool, String> {
+    let mut reader = StrictTranscodingReader::new(reader, encoding)?;
+    match std::io::copy(&mut reader, &mut std::io::sink()) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn auto_detect_text_encoding_from_bytes(bytes: &[u8]) -> Result<(TableImportTextEncoding, usize), String> {
+    if let Some(detected) = bom_text_encoding(bytes) {
+        return Ok(detected);
+    }
+    for encoding in [TableImportTextEncoding::Utf8, TableImportTextEncoding::Gbk] {
+        if reader_is_valid_for_encoding(std::io::Cursor::new(bytes), encoding)? {
+            return Ok((encoding, 0));
+        }
+    }
+    Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string())
+}
+
+fn resolve_text_encoding_from_bytes(
+    bytes: &[u8],
+    requested: Option<TableImportTextEncoding>,
+) -> Result<(TableImportTextEncoding, usize), String> {
+    let requested = requested.unwrap_or(TableImportTextEncoding::Auto);
+    if requested == TableImportTextEncoding::Auto {
+        auto_detect_text_encoding_from_bytes(bytes)
+    } else {
+        Ok((requested, matching_bom_len(bytes, requested)))
+    }
+}
+
+fn auto_detect_text_encoding_from_file(path: &str) -> Result<(TableImportTextEncoding, usize), String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut prefix = [0u8; 3];
+    let prefix_len = file.read(&mut prefix).map_err(|error| error.to_string())?;
+    if let Some(detected) = bom_text_encoding(&prefix[..prefix_len]) {
+        return Ok(detected);
+    }
+
+    for encoding in [TableImportTextEncoding::Utf8, TableImportTextEncoding::Gbk] {
+        let file = File::open(path).map_err(|error| error.to_string())?;
+        if reader_is_valid_for_encoding(file, encoding)? {
+            return Ok((encoding, 0));
+        }
+    }
+    Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string())
+}
+
+fn resolve_text_encoding_from_file(
+    path: &str,
+    requested: Option<TableImportTextEncoding>,
+) -> Result<(TableImportTextEncoding, usize), String> {
+    let requested = requested.unwrap_or(TableImportTextEncoding::Auto);
+    if requested == TableImportTextEncoding::Auto {
+        return auto_detect_text_encoding_from_file(path);
+    }
+
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut prefix = [0u8; 3];
+    let prefix_len = file.read(&mut prefix).map_err(|error| error.to_string())?;
+    Ok((requested, matching_bom_len(&prefix[..prefix_len], requested)))
+}
+
+fn open_delimited_csv_reader(
+    path: &str,
+    source_format: TableImportSourceFormat,
+    options: &TableImportParseOptions,
+) -> Result<(csv::Reader<StrictTranscodingReader<File>>, DelimitedParseConfig, TableImportTextEncoding), String> {
+    let config = effective_delimited_config(source_format, options)?;
+    let (encoding, bom_len) = resolve_text_encoding_from_file(path, options.encoding)?;
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(bom_len as u64)).map_err(|error| error.to_string())?;
+    let transcoded = StrictTranscodingReader::new(file, encoding)?;
+    let reader =
+        csv::ReaderBuilder::new().delimiter(config.delimiter).has_headers(false).flexible(true).from_reader(transcoded);
+    Ok((reader, config, encoding))
 }
 
 pub fn parse_delimited_reader<R: std::io::Read>(
@@ -320,86 +594,18 @@ pub fn parse_delimited_reader<R: std::io::Read>(
     config: DelimitedParseConfig,
     preview_limit: usize,
 ) -> Result<ParsedImportFile, String> {
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(config.delimiter)
-        .has_headers(config.has_header)
-        .flexible(true)
-        .from_reader(reader);
+    parse_decoded_delimited_reader(reader, config, preview_limit, TableImportTextEncoding::Utf8)
+}
 
-    let mut rows = Vec::new();
-    let mut total_rows = 0;
-    let columns = if config.has_header {
-        reader
-            .headers()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .enumerate()
-            .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
-    let mut columns = columns;
-    if columns.is_empty() {
-        let mut records = reader.records();
-        let first_record = match records.next() {
-            Some(record) => record.map_err(|e| e.to_string())?,
-            None => return Err("Import file has no rows".to_string()),
-        };
-        columns = (0..first_record.len()).map(|index| format!("column_{}", index + 1)).collect();
-        if columns.is_empty() {
-            return Err("Import file has no columns".to_string());
-        }
-        total_rows += 1;
-        if preview_limit > 0 {
-            rows.push(
-                (0..columns.len())
-                    .map(|index| {
-                        first_record
-                            .get(index)
-                            .map(|value| csv_value_with_config(value, config))
-                            .unwrap_or(serde_json::Value::Null)
-                    })
-                    .collect(),
-            );
-        }
-        for record in records {
-            let record = record.map_err(|e| e.to_string())?;
-            total_rows += 1;
-            if rows.len() >= preview_limit {
-                continue;
-            }
-            let mut row = Vec::with_capacity(columns.len());
-            for index in 0..columns.len() {
-                row.push(
-                    record
-                        .get(index)
-                        .map(|value| csv_value_with_config(value, config))
-                        .unwrap_or(serde_json::Value::Null),
-                );
-            }
-            rows.push(row);
-        }
-        return Ok(ParsedImportFile { columns, rows, total_rows });
-    }
-
-    for record in reader.records() {
-        let record = record.map_err(|e| e.to_string())?;
-        total_rows += 1;
-        if rows.len() >= preview_limit {
-            continue;
-        }
-        let mut row = Vec::with_capacity(columns.len());
-        for index in 0..columns.len() {
-            row.push(
-                record.get(index).map(|value| csv_value_with_config(value, config)).unwrap_or(serde_json::Value::Null),
-            );
-        }
-        rows.push(row);
-    }
-
-    Ok(ParsedImportFile { columns, rows, total_rows })
+fn parse_decoded_delimited_reader<R: IoRead>(
+    reader: R,
+    config: DelimitedParseConfig,
+    preview_limit: usize,
+    effective_encoding: TableImportTextEncoding,
+) -> Result<ParsedImportFile, String> {
+    let reader =
+        csv::ReaderBuilder::new().delimiter(config.delimiter).has_headers(false).flexible(true).from_reader(reader);
+    parse_csv_reader(reader, config, preview_limit, effective_encoding)
 }
 
 pub fn parse_delimited_bytes_with_options(
@@ -408,11 +614,9 @@ pub fn parse_delimited_bytes_with_options(
     options: &TableImportParseOptions,
     preview_limit: usize,
 ) -> Result<ParsedImportFile, String> {
-    parse_delimited_reader(
-        bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes),
-        effective_delimited_config(source_format, options)?,
-        preview_limit,
-    )
+    let (encoding, bom_len) = resolve_text_encoding_from_bytes(bytes, options.encoding)?;
+    let reader = StrictTranscodingReader::new(std::io::Cursor::new(&bytes[bom_len..]), encoding)?;
+    parse_decoded_delimited_reader(reader, effective_delimited_config(source_format, options)?, preview_limit, encoding)
 }
 
 pub fn parse_delimited_file_with_options(
@@ -421,8 +625,52 @@ pub fn parse_delimited_file_with_options(
     options: &TableImportParseOptions,
     preview_limit: usize,
 ) -> Result<ParsedImportFile, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    parse_delimited_reader(file, effective_delimited_config(source_format, options)?, preview_limit)
+    let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, options)?;
+    parse_csv_reader(reader, config, preview_limit, encoding)
+}
+
+fn parse_csv_reader<R: IoRead>(
+    mut reader: csv::Reader<R>,
+    config: DelimitedParseConfig,
+    preview_limit: usize,
+    effective_encoding: TableImportTextEncoding,
+) -> Result<ParsedImportFile, String> {
+    let mut rows = Vec::new();
+    let mut total_rows = 0;
+    let mut columns = Vec::new();
+    for (index, record) in reader.records().enumerate() {
+        let record = record.map_err(|e| e.to_string())?;
+        let row_number = index + 1;
+        if config.row_range.title_row == Some(row_number) {
+            columns = record
+                .iter()
+                .enumerate()
+                .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index))
+                .collect();
+            continue;
+        }
+        if row_number < config.row_range.data_start_row {
+            continue;
+        }
+        if config.row_range.last_data_row.is_some_and(|last| row_number > last) {
+            break;
+        }
+        if columns.is_empty() {
+            columns = (0..record.len()).map(|index| format!("column_{}", index + 1)).collect();
+        }
+        total_rows += 1;
+        if rows.len() >= preview_limit {
+            continue;
+        }
+        rows.push(delimited_record_to_row(&record, columns.len(), config));
+    }
+    if columns.is_empty() {
+        return Err("Import file has no columns in the selected row range".to_string());
+    }
+    if total_rows == 0 {
+        return Err("Import file has no data rows in the selected row range".to_string());
+    }
+    Ok(ParsedImportFile { columns, rows, total_rows, effective_encoding: Some(effective_encoding) })
 }
 
 pub fn parse_csv_bytes(bytes: &[u8], preview_limit: usize) -> Result<ParsedImportFile, String> {
@@ -494,7 +742,7 @@ pub fn parse_json_bytes_with_options(
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        return Ok(ParsedImportFile { columns, rows, total_rows: items.len() });
+        return Ok(ParsedImportFile { columns, rows, total_rows: items.len(), effective_encoding: None });
     }
 
     if all_arrays {
@@ -513,7 +761,7 @@ pub fn parse_json_bytes_with_options(
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        return Ok(ParsedImportFile { columns, rows, total_rows: items.len() });
+        return Ok(ParsedImportFile { columns, rows, total_rows: items.len(), effective_encoding: None });
     }
 
     Err("JSON rows must all be objects or all be arrays; mixed row shapes are not supported".to_string())
@@ -523,7 +771,79 @@ pub fn parse_json_bytes(bytes: &[u8], preview_limit: usize) -> Result<ParsedImpo
     parse_json_bytes_with_options(bytes, &TableImportParseOptions::default(), preview_limit)
 }
 
-pub fn xlsx_cell_value(cell: &Data) -> serde_json::Value {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XlsxTemporalKind {
+    Date,
+    Time,
+    DateTime,
+    Duration,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct XlsxCellStyle {
+    temporal_kind: Option<XlsxTemporalKind>,
+    number_format: Option<Arc<str>>,
+}
+
+fn format_chrono_duration_hms(duration: chrono::Duration, wrap_to_day: bool) -> String {
+    let mut millis = duration.num_milliseconds();
+    let negative = millis < 0;
+    if negative {
+        millis = -millis;
+    }
+
+    const DAY_MILLIS: i64 = 24 * 60 * 60 * 1000;
+    if wrap_to_day {
+        millis %= DAY_MILLIS;
+    }
+
+    let hours = millis / (60 * 60 * 1000);
+    let minutes = (millis / (60 * 1000)) % 60;
+    let seconds = (millis / 1000) % 60;
+    let sub_millis = millis % 1000;
+    let sign = if negative { "-" } else { "" };
+    if sub_millis == 0 {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        let fraction = format!("{sub_millis:03}").trim_end_matches('0').to_string();
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}.{fraction}")
+    }
+}
+
+fn xlsx_datetime_label(value: &ExcelDateTime, temporal_kind: Option<XlsxTemporalKind>) -> String {
+    if matches!(temporal_kind, Some(XlsxTemporalKind::Duration)) || value.is_duration() {
+        return value
+            .as_duration()
+            .map(|duration| format_chrono_duration_hms(duration, false))
+            .unwrap_or_else(|| value.to_string());
+    }
+
+    if matches!(temporal_kind, Some(XlsxTemporalKind::Time)) {
+        return value
+            .as_duration()
+            .map(|duration| format_chrono_duration_hms(duration, true))
+            .unwrap_or_else(|| value.to_string());
+    }
+
+    let Some(datetime) = value.as_datetime() else {
+        return value.to_string();
+    };
+
+    match temporal_kind {
+        Some(XlsxTemporalKind::Date) => datetime.format("%Y-%m-%d").to_string(),
+        Some(XlsxTemporalKind::DateTime) => datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+        None => {
+            if (0.0..1.0).contains(&value.as_f64()) {
+                value.to_string()
+            } else {
+                datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string()
+            }
+        }
+        Some(XlsxTemporalKind::Time) | Some(XlsxTemporalKind::Duration) => unreachable!("handled above"),
+    }
+}
+
+fn xlsx_cell_value_with_temporal_kind(cell: &Data, temporal_kind: Option<XlsxTemporalKind>) -> serde_json::Value {
     match cell {
         Data::Empty => serde_json::Value::Null,
         Data::String(s) => csv_value(s),
@@ -532,25 +852,64 @@ pub fn xlsx_cell_value(cell: &Data) -> serde_json::Value {
         }
         Data::Int(n) => serde_json::Value::Number((*n).into()),
         Data::Bool(v) => serde_json::Value::Bool(*v),
-        Data::DateTime(v) => serde_json::Value::String(v.to_string()),
+        Data::DateTime(v) => serde_json::Value::String(xlsx_datetime_label(v, temporal_kind)),
         Data::DateTimeIso(v) => serde_json::Value::String(v.clone()),
         Data::DurationIso(v) => serde_json::Value::String(v.clone()),
         Data::Error(v) => serde_json::Value::String(v.to_string()),
     }
 }
 
-pub fn xlsx_cell_label(cell: &Data) -> String {
+fn xlsx_numeric_display_text(value: f64, style: Option<&XlsxCellStyle>) -> String {
+    style
+        .and_then(|style| style.number_format.as_deref())
+        .and_then(|format_code| {
+            let format = ssfmt::NumberFormat::parse(format_code).ok()?;
+            let mut options = ssfmt::FormatOptions::default();
+            let lcid = format.sections().iter().flat_map(|section| &section.parts).find_map(|part| match part {
+                ssfmt::ast::FormatPart::Locale(locale) => locale.lcid,
+                _ => None,
+            });
+            // ssfmt 0.1 only provides en-US locale data; preserve the German separators explicitly.
+            if lcid == Some(0x0407) {
+                options.locale.decimal_separator = ',';
+                options.locale.thousands_separator = '.';
+            }
+            Some(format.format(value, &options))
+        })
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn xlsx_cell_text_value(cell: &Data, style: Option<&XlsxCellStyle>) -> Option<String> {
+    if style.and_then(|style| style.temporal_kind).is_some() {
+        return None;
+    }
+    match cell {
+        Data::Float(value) if value.is_finite() => Some(xlsx_numeric_display_text(*value, style)),
+        Data::Int(value) => Some(xlsx_numeric_display_text(*value as f64, style)),
+        _ => None,
+    }
+}
+
+pub fn xlsx_cell_value(cell: &Data) -> serde_json::Value {
+    xlsx_cell_value_with_temporal_kind(cell, None)
+}
+
+fn xlsx_cell_label_with_temporal_kind(cell: &Data, temporal_kind: Option<XlsxTemporalKind>) -> String {
     match cell {
         Data::Empty => String::new(),
         Data::String(s) => s.clone(),
         Data::Float(n) => n.to_string(),
         Data::Int(n) => n.to_string(),
         Data::Bool(v) => v.to_string(),
-        Data::DateTime(v) => v.to_string(),
+        Data::DateTime(v) => xlsx_datetime_label(v, temporal_kind),
         Data::DateTimeIso(v) => v.clone(),
         Data::DurationIso(v) => v.clone(),
         Data::Error(v) => v.to_string(),
     }
+}
+
+pub fn xlsx_cell_label(cell: &Data) -> String {
+    xlsx_cell_label_with_temporal_kind(cell, None)
 }
 
 pub fn xlsx_sheet_names(path: &str) -> Result<Vec<String>, String> {
@@ -558,10 +917,321 @@ pub fn xlsx_sheet_names(path: &str) -> Result<Vec<String>, String> {
     Ok(workbook.sheet_names().to_vec())
 }
 
+fn xml_local_name_eq(name: &[u8], expected: &[u8]) -> bool {
+    name.rsplit(|byte| *byte == b':').next().is_some_and(|local| local.eq_ignore_ascii_case(expected))
+}
+
+fn xml_attr_value<R: BufRead>(reader: &XmlReader<R>, element: &BytesStart<'_>, key: &[u8]) -> Option<String> {
+    element.attributes().flatten().find_map(|attr| {
+        if xml_local_name_eq(attr.key.as_ref(), key) {
+            attr.decode_and_unescape_value(reader.decoder()).ok().map(|value| value.into_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn xlsx_builtin_temporal_kind(num_fmt_id: u16) -> Option<XlsxTemporalKind> {
+    match num_fmt_id {
+        14..=17 => Some(XlsxTemporalKind::Date),
+        18..=21 | 45 | 47 => Some(XlsxTemporalKind::Time),
+        22 => Some(XlsxTemporalKind::DateTime),
+        46 => Some(XlsxTemporalKind::Duration),
+        _ => None,
+    }
+}
+
+fn xlsx_temporal_kind_from_format_code(format_code: &str) -> Option<XlsxTemporalKind> {
+    let mut normalized = String::new();
+    let mut chars = format_code.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                for quoted in chars.by_ref() {
+                    if quoted == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                let _ = chars.next();
+            }
+            ';' => break,
+            '[' => {
+                let mut bracket = String::new();
+                for bracket_ch in chars.by_ref() {
+                    if bracket_ch == ']' {
+                        break;
+                    }
+                    bracket.push(bracket_ch);
+                }
+                let bracket = bracket.trim().to_ascii_lowercase();
+                if matches!(bracket.as_str(), "h" | "hh" | "m" | "mm" | "s" | "ss") {
+                    return Some(XlsxTemporalKind::Duration);
+                }
+            }
+            _ => normalized.push(ch.to_ascii_lowercase()),
+        }
+    }
+
+    let has_time = normalized.contains('h')
+        || normalized.contains('s')
+        || normalized.contains("am/pm")
+        || normalized.contains("a/p");
+    let has_month = normalized.contains('m');
+    let has_date = normalized.contains('y') || normalized.contains('d') || (has_month && !has_time);
+    match (has_date, has_time) {
+        (true, true) => Some(XlsxTemporalKind::DateTime),
+        (true, false) => Some(XlsxTemporalKind::Date),
+        (false, true) => Some(XlsxTemporalKind::Time),
+        (false, false) => None,
+    }
+}
+
+fn parse_xlsx_styles(styles_xml: &str) -> Vec<XlsxCellStyle> {
+    let mut reader = XmlReader::from_str(styles_xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut custom_formats = HashMap::<u16, String>::new();
+    let mut styles = Vec::new();
+    let mut in_cell_xfs = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if xml_local_name_eq(element.name().as_ref(), b"numFmt") =>
+            {
+                let id = xml_attr_value(&reader, &element, b"numFmtId").and_then(|value| value.parse::<u16>().ok());
+                let format_code = xml_attr_value(&reader, &element, b"formatCode");
+                if let (Some(id), Some(format_code)) = (id, format_code) {
+                    custom_formats.insert(id, format_code);
+                }
+            }
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"cellXfs") => {
+                in_cell_xfs = true;
+            }
+            Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"cellXfs") => {
+                in_cell_xfs = false;
+            }
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if in_cell_xfs && xml_local_name_eq(element.name().as_ref(), b"xf") =>
+            {
+                let num_fmt_id =
+                    xml_attr_value(&reader, &element, b"numFmtId").and_then(|value| value.parse::<u16>().ok());
+                let custom_format_code = num_fmt_id.and_then(|id| custom_formats.get(&id).map(String::as_str));
+                let temporal_kind = num_fmt_id.and_then(|id| {
+                    custom_formats
+                        .get(&id)
+                        .and_then(|code| xlsx_temporal_kind_from_format_code(code))
+                        .or_else(|| xlsx_builtin_temporal_kind(id))
+                });
+                styles.push(XlsxCellStyle {
+                    temporal_kind,
+                    number_format: if temporal_kind.is_none() {
+                        custom_format_code
+                            .or_else(|| num_fmt_id.and_then(|id| ssfmt::format_code_from_id(id as u32)))
+                            .map(Arc::<str>::from)
+                    } else {
+                        None
+                    },
+                });
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    styles
+}
+
+fn xlsx_workbook_sheet_refs(workbook_xml: &str) -> Vec<(String, Option<String>)> {
+    let mut reader = XmlReader::from_str(workbook_xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut sheets = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if xml_local_name_eq(element.name().as_ref(), b"sheet") =>
+            {
+                if let Some(name) = xml_attr_value(&reader, &element, b"name") {
+                    sheets.push((name, xml_attr_value(&reader, &element, b"id")));
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    sheets
+}
+
+fn xlsx_workbook_relationship_targets(rels_xml: &str) -> HashMap<String, String> {
+    let mut reader = XmlReader::from_str(rels_xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut targets = HashMap::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if xml_local_name_eq(element.name().as_ref(), b"Relationship") =>
+            {
+                if let (Some(id), Some(target)) =
+                    (xml_attr_value(&reader, &element, b"Id"), xml_attr_value(&reader, &element, b"Target"))
+                {
+                    targets.insert(id, target);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    targets
+}
+
+fn xlsx_relationship_target_path(base_dir: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        return target.trim_start_matches('/').to_string();
+    }
+
+    let mut parts = base_dir.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+fn xlsx_sheet_path_for_name(workbook_xml: &str, rels_xml: &str, sheet_name: &str) -> Option<String> {
+    let sheets = xlsx_workbook_sheet_refs(workbook_xml);
+    let (index, (_, rel_id)) = sheets.iter().enumerate().find(|(_, (name, _))| name == sheet_name)?;
+    let rel_targets = xlsx_workbook_relationship_targets(rels_xml);
+    rel_id
+        .as_ref()
+        .and_then(|id| rel_targets.get(id))
+        .map(|target| xlsx_relationship_target_path("xl", target))
+        .or_else(|| Some(format!("xl/worksheets/sheet{}.xml", index + 1)))
+}
+
+fn xlsx_cell_ref_position(reference: &str) -> Option<(usize, usize)> {
+    let mut column = 0usize;
+    let mut row = 0usize;
+    let mut saw_column = false;
+    let mut saw_row = false;
+    for ch in reference.chars() {
+        if ch == '$' {
+            continue;
+        }
+        if ch.is_ascii_alphabetic() && !saw_row {
+            saw_column = true;
+            column = column * 26 + (ch.to_ascii_uppercase() as u8 - b'A' + 1) as usize;
+        } else if ch.is_ascii_digit() {
+            saw_row = true;
+            row = row * 10 + ch.to_digit(10)? as usize;
+        } else {
+            return None;
+        }
+    }
+    (saw_column && saw_row).then_some((row, column))
+}
+
+fn parse_xlsx_sheet_cell_styles<R: BufRead>(
+    source: R,
+    styles: &[XlsxCellStyle],
+    text_columns: &HashSet<usize>,
+) -> Result<HashMap<(usize, usize), XlsxCellStyle>, String> {
+    let mut reader = XmlReader::from_reader(source);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut cell_styles = HashMap::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if xml_local_name_eq(element.name().as_ref(), b"c") =>
+            {
+                let Some(style_id) =
+                    xml_attr_value(&reader, &element, b"s").and_then(|value| value.parse::<usize>().ok())
+                else {
+                    buf.clear();
+                    continue;
+                };
+                let Some(style) = styles.get(style_id) else {
+                    buf.clear();
+                    continue;
+                };
+                if let Some(position) =
+                    xml_attr_value(&reader, &element, b"r").and_then(|reference| xlsx_cell_ref_position(&reference))
+                {
+                    if style.temporal_kind.is_some() || text_columns.contains(&position.1) {
+                        cell_styles.insert(position, style.clone());
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(error.to_string()),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(cell_styles)
+}
+
+fn read_xlsx_zip_text(zip: &mut zip::ZipArchive<File>, path: &str) -> Result<String, String> {
+    let mut file = zip.by_name(path).map_err(|err| err.to_string())?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).map_err(|err| err.to_string())?;
+    Ok(content)
+}
+
+fn xlsx_cell_styles(
+    path: &str,
+    sheet_name: &str,
+    text_columns: &HashSet<usize>,
+) -> Result<HashMap<(usize, usize), XlsxCellStyle>, String> {
+    let file = File::open(path).map_err(|err| err.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|err| err.to_string())?;
+    let styles_xml = read_xlsx_zip_text(&mut zip, "xl/styles.xml").unwrap_or_default();
+    let styles = parse_xlsx_styles(&styles_xml);
+    if styles.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let workbook_xml = read_xlsx_zip_text(&mut zip, "xl/workbook.xml")?;
+    let rels_xml = read_xlsx_zip_text(&mut zip, "xl/_rels/workbook.xml.rels").unwrap_or_default();
+    let Some(sheet_path) = xlsx_sheet_path_for_name(&workbook_xml, &rels_xml, sheet_name) else {
+        return Ok(HashMap::new());
+    };
+    let sheet = zip.by_name(&sheet_path).map_err(|error| error.to_string())?;
+    parse_xlsx_sheet_cell_styles(BufReader::new(sheet), &styles, text_columns)
+}
+
+fn is_legacy_xls_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xls"))
+}
+
 pub fn parse_xlsx_file_with_options(
     path: &str,
     options: &TableImportParseOptions,
     preview_limit: usize,
+) -> Result<ParsedImportFile, String> {
+    parse_xlsx_file_with_options_and_text_columns(path, options, preview_limit, &HashSet::new())
+}
+
+fn parse_xlsx_file_with_options_and_text_columns(
+    path: &str,
+    options: &TableImportParseOptions,
+    preview_limit: usize,
+    text_source_columns: &HashSet<String>,
 ) -> Result<ParsedImportFile, String> {
     let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
     let sheet_names = workbook.sheet_names().to_vec();
@@ -576,59 +1246,105 @@ pub fn parse_xlsx_file_with_options(
         sheet_names.first().cloned().ok_or_else(|| "Workbook has no sheets".to_string())?
     };
     let range = workbook.worksheet_range(&sheet_name).map_err(|e| e.to_string())?;
-    let mut rows_iter = range.rows();
-    let has_header = options.has_header.unwrap_or(true);
-    let columns = if has_header {
-        let header = rows_iter.next().ok_or_else(|| "Import file has no rows".to_string())?;
-        header
-            .iter()
-            .enumerate()
-            .map(|(index, cell)| normalize_header(&xlsx_cell_label(cell), index))
-            .collect::<Vec<_>>()
-    } else {
-        let first_row = rows_iter.next().ok_or_else(|| "Import file has no rows".to_string())?;
-        let columns = (0..first_row.len()).map(|index| format!("column_{}", index + 1)).collect::<Vec<_>>();
-        let mut rows = Vec::new();
-        if preview_limit > 0 {
-            rows.push(
-                (0..columns.len())
-                    .map(|index| first_row.get(index).map(xlsx_cell_value).unwrap_or(serde_json::Value::Null))
-                    .collect::<Vec<_>>(),
-            );
+    let (range_start_row, range_start_column) =
+        range.start().map(|(row, column)| (row as usize, column as usize)).unwrap_or_default();
+    let row_range = effective_import_row_range(options)?;
+    let mut style_selection_columns = Vec::new();
+    for (index, source_row) in range.rows().enumerate() {
+        let row_number = index + 1;
+        if row_range.title_row == Some(row_number) {
+            style_selection_columns = source_row
+                .iter()
+                .enumerate()
+                .map(|(index, cell)| normalize_header(&xlsx_cell_label(cell), index))
+                .collect();
+            break;
         }
-        let mut total_rows = 1;
-        for source_row in rows_iter {
-            total_rows += 1;
-            if rows.len() >= preview_limit {
-                continue;
-            }
-            let mut row = Vec::with_capacity(columns.len());
-            for index in 0..columns.len() {
-                row.push(source_row.get(index).map(xlsx_cell_value).unwrap_or(serde_json::Value::Null));
-            }
-            rows.push(row);
+        let row_is_within_range = match row_range.last_data_row {
+            Some(last) => row_number <= last,
+            None => true,
+        };
+        if row_number >= row_range.data_start_row && row_is_within_range {
+            style_selection_columns = (0..source_row.len()).map(|index| format!("column_{}", index + 1)).collect();
+            break;
         }
-        return Ok(ParsedImportFile { columns, rows, total_rows });
-    };
-    if columns.is_empty() {
-        return Err("Import file has no columns".to_string());
     }
-
+    let text_worksheet_columns = style_selection_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| text_source_columns.contains(column).then_some(range_start_column + index + 1))
+        .collect::<HashSet<_>>();
+    let legacy_xls = is_legacy_xls_path(path);
+    let cell_styles =
+        if legacy_xls { HashMap::new() } else { xlsx_cell_styles(path, &sheet_name, &text_worksheet_columns)? };
+    let mut columns = Vec::new();
     let mut rows = Vec::new();
     let mut total_rows = 0;
-    for source_row in rows_iter {
+    for (index, source_row) in range.rows().enumerate() {
+        let row_number = index + 1;
+        if row_range.title_row == Some(row_number) {
+            columns = source_row
+                .iter()
+                .enumerate()
+                .map(|(index, cell)| {
+                    // Calamine rows are relative to the used range, while XLSX style coordinates are worksheet-absolute.
+                    let cell_position = (range_start_row + row_number, range_start_column + index + 1);
+                    normalize_header(
+                        &xlsx_cell_label_with_temporal_kind(
+                            cell,
+                            cell_styles.get(&cell_position).and_then(|style| style.temporal_kind),
+                        ),
+                        index,
+                    )
+                })
+                .collect();
+            continue;
+        }
+        if row_number < row_range.data_start_row {
+            continue;
+        }
+        if row_range.last_data_row.is_some_and(|last| row_number > last) {
+            break;
+        }
+        if columns.is_empty() {
+            columns = (0..source_row.len()).map(|index| format!("column_{}", index + 1)).collect();
+        }
         total_rows += 1;
         if rows.len() >= preview_limit {
             continue;
         }
         let mut row = Vec::with_capacity(columns.len());
-        for index in 0..columns.len() {
-            row.push(source_row.get(index).map(xlsx_cell_value).unwrap_or(serde_json::Value::Null));
+        for (index, column) in columns.iter().enumerate() {
+            let cell_position = (range_start_row + row_number, range_start_column + index + 1);
+            let style = cell_styles.get(&cell_position);
+            let value = source_row
+                .get(index)
+                .map(|cell| {
+                    if text_source_columns.contains(column) {
+                        if legacy_xls && matches!(cell, Data::Float(_) | Data::Int(_)) {
+                            return Err(format!(
+                                "Legacy .xls files cannot preserve numeric display formatting for text target column '{column}'. Save the workbook as .xlsx or map this source column to a numeric target."
+                            ));
+                        }
+                        if let Some(text) = xlsx_cell_text_value(cell, style) {
+                            return Ok(serde_json::Value::String(text));
+                        }
+                    }
+                    Ok(xlsx_cell_value_with_temporal_kind(cell, style.and_then(|style| style.temporal_kind)))
+                })
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null);
+            row.push(value);
         }
         rows.push(row);
     }
-
-    Ok(ParsedImportFile { columns, rows, total_rows })
+    if columns.is_empty() {
+        return Err("Import file has no columns in the selected row range".to_string());
+    }
+    if total_rows == 0 {
+        return Err("Import file has no data rows in the selected row range".to_string());
+    }
+    Ok(ParsedImportFile { columns, rows, total_rows, effective_encoding: None })
 }
 
 pub fn parse_xlsx_file(path: &str, preview_limit: usize) -> Result<ParsedImportFile, String> {
@@ -657,6 +1373,16 @@ pub async fn parse_import_file_with_options(
     options: &TableImportParseOptions,
     preview_limit: usize,
 ) -> Result<ParsedImportFile, String> {
+    parse_import_file_with_options_and_text_columns(path, source_format, options, preview_limit, HashSet::new()).await
+}
+
+async fn parse_import_file_with_options_and_text_columns(
+    path: &str,
+    source_format: Option<TableImportSourceFormat>,
+    options: &TableImportParseOptions,
+    preview_limit: usize,
+    text_source_columns: HashSet<String>,
+) -> Result<ParsedImportFile, String> {
     let format = effective_source_format(path, source_format)?;
     ensure_non_streaming_file_size(path, format)?;
     match format {
@@ -676,9 +1402,11 @@ pub async fn parse_import_file_with_options(
         TableImportSourceFormat::Excel => {
             let path = path.to_string();
             let options = options.clone();
-            tokio::task::spawn_blocking(move || parse_xlsx_file_with_options(&path, &options, preview_limit))
-                .await
-                .map_err(|e| e.to_string())?
+            tokio::task::spawn_blocking(move || {
+                parse_xlsx_file_with_options_and_text_columns(&path, &options, preview_limit, &text_source_columns)
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
     }
 }
@@ -737,8 +1465,42 @@ pub fn build_import_insert_batch_from_rows(
     schema: &str,
     db_type: &DatabaseType,
 ) -> Result<Option<ImportSqlBatch>, String> {
+    build_import_insert_batch_from_rows_with_format(
+        rows,
+        columns,
+        mappings,
+        target_column_types,
+        table,
+        schema,
+        db_type,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_import_insert_batch_from_rows_with_format(
+    rows: &[Vec<serde_json::Value>],
+    columns: &[String],
+    mappings: &[TableImportColumnMapping],
+    target_column_types: &[(String, String)],
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    date_time_format: Option<&str>,
+) -> Result<Option<ImportSqlBatch>, String> {
     if rows.is_empty() {
         return Ok(None);
+    }
+    if *db_type == DatabaseType::CloudflareD1 {
+        return crate::db::cloudflare_d1::build_streaming_import_insert_batch(
+            rows,
+            columns,
+            mappings,
+            target_column_types,
+            table,
+            schema,
+            rows.len(),
+        );
     }
     let mapped = mapping_indexes_for_columns(columns, mappings)?;
     let target_columns = mapped.iter().map(|(_, target)| target.clone()).collect::<Vec<_>>();
@@ -756,12 +1518,110 @@ pub fn build_import_insert_batch_from_rows(
         .map(|row| {
             mapped
                 .iter()
-                .map(|(source_index, _)| row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null))
+                .enumerate()
+                .map(|(target_index, (source_index, _))| {
+                    let value = row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null);
+                    normalize_import_value(
+                        &value,
+                        column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
+                        db_type,
+                        date_time_format,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     let sql = generate_insert_typed(&target_columns, &column_types, &mapped_rows, table, schema, db_type);
     Ok((!sql.trim().is_empty()).then_some(ImportSqlBatch { sql, row_count: rows.len() }))
+}
+
+fn supports_multi_row_insert_values(db_type: &DatabaseType) -> bool {
+    !matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Iris)
+}
+
+fn normalize_import_temporal_value(
+    value: &serde_json::Value,
+    data_type: Option<&str>,
+    db_type: &DatabaseType,
+    date_time_format: Option<&str>,
+) -> serde_json::Value {
+    let oracle_date_time = matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+        && data_type.is_some_and(|data_type| data_type.trim().eq_ignore_ascii_case("date"));
+    crate::temporal_format::normalize_temporal_import_value(
+        value,
+        if oracle_date_time { Some("datetime") } else { data_type },
+        date_time_format,
+    )
+}
+
+fn is_textual_import_target_type(data_type: &str) -> bool {
+    let mut lower = data_type.trim().trim_matches('"').to_ascii_lowercase();
+    loop {
+        let unwrapped = ["nullable", "lowcardinality"].iter().find_map(|wrapper| {
+            lower
+                .strip_prefix(&format!("{wrapper}("))
+                .and_then(|inner| inner.strip_suffix(')'))
+                .map(|inner| inner.trim().to_string())
+        });
+        match unwrapped {
+            Some(inner) => lower = inner,
+            None => break,
+        }
+    }
+    if lower == "long raw" || lower.starts_with("long raw(") {
+        return false;
+    }
+    let base = lower.split(['(', ':', ' ']).next().unwrap_or("").trim();
+    matches!(
+        base,
+        "char"
+            | "character"
+            | "varchar"
+            | "varchar2"
+            | "nvarchar"
+            | "nvarchar2"
+            | "nchar"
+            | "string"
+            | "fixedstring"
+            | "sysname"
+            | "long"
+            | "text"
+            | "tinytext"
+            | "mediumtext"
+            | "longtext"
+            | "ntext"
+            | "clob"
+            | "nclob"
+            | "enum"
+            | "set"
+    ) || lower.starts_with("character varying")
+}
+
+fn textual_source_columns_for_import(
+    mappings: &[TableImportColumnMapping],
+    target_column_types: &[(String, String)],
+) -> HashSet<String> {
+    mappings
+        .iter()
+        .filter(|mapping| {
+            target_column_types
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&mapping.target_column))
+                .map(|(_, data_type)| data_type.as_str())
+                .or(mapping.target_data_type.as_deref())
+                .is_some_and(is_textual_import_target_type)
+        })
+        .map(|mapping| mapping.source_column.clone())
+        .collect()
+}
+
+fn normalize_import_value(
+    value: &serde_json::Value,
+    data_type: Option<&str>,
+    db_type: &DatabaseType,
+    date_time_format: Option<&str>,
+) -> serde_json::Value {
+    normalize_import_temporal_value(value, data_type, db_type, date_time_format)
 }
 
 pub fn build_import_insert_batches(
@@ -772,6 +1632,29 @@ pub fn build_import_insert_batches(
     schema: &str,
     db_type: &DatabaseType,
     batch_size: usize,
+) -> Result<Vec<ImportSqlBatch>, String> {
+    build_import_insert_batches_with_format(
+        data,
+        mappings,
+        target_column_types,
+        table,
+        schema,
+        db_type,
+        batch_size,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_import_insert_batches_with_format(
+    data: &ParsedImportFile,
+    mappings: &[TableImportColumnMapping],
+    target_column_types: &[(String, String)],
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    batch_size: usize,
+    date_time_format: Option<&str>,
 ) -> Result<Vec<ImportSqlBatch>, String> {
     let mapped = mapping_indexes(data, mappings)?;
     let columns = mapped.iter().map(|(_, target)| target.clone()).collect::<Vec<_>>();
@@ -784,12 +1667,20 @@ pub fn build_import_insert_batches(
                 .map(|(_, data_type)| data_type.clone())
         })
         .collect::<Vec<_>>();
-    let batch_size = match db_type {
-        // Oracle-compatible drivers reject INSERT ... VALUES (...), (...), so
-        // keep import batches executable as single-row statements.
-        DatabaseType::Oracle | DatabaseType::OceanbaseOracle => 1,
-        _ => batch_size.max(1),
-    };
+    if *db_type == DatabaseType::CloudflareD1 {
+        return crate::db::cloudflare_d1::build_import_insert_batches(
+            &data.rows,
+            &data.columns,
+            mappings,
+            target_column_types,
+            table,
+            schema,
+            batch_size.clamp(1, 100),
+        );
+    }
+    // Drivers without multi-row VALUES support still benefit from the agent
+    // batching the generated single-row statements during execution.
+    let batch_size = if supports_multi_row_insert_values(db_type) { batch_size.max(1) } else { 1 };
     let mut batches = Vec::new();
 
     for chunk in data.rows.chunks(batch_size) {
@@ -798,7 +1689,16 @@ pub fn build_import_insert_batches(
             .map(|row| {
                 mapped
                     .iter()
-                    .map(|(source_index, _)| row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null))
+                    .enumerate()
+                    .map(|(target_index, (source_index, _))| {
+                        let value = row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null);
+                        normalize_import_value(
+                            &value,
+                            column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
+                            db_type,
+                            date_time_format,
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -814,7 +1714,7 @@ pub fn build_import_insert_batches(
 pub fn truncate_sql(table: &str, schema: &str, db_type: &DatabaseType) -> String {
     let full_table = qualified_table(table, schema, db_type);
     match db_type {
-        DatabaseType::Sqlite => format!("DELETE FROM {full_table}"),
+        DatabaseType::Sqlite | DatabaseType::CloudflareD1 => format!("DELETE FROM {full_table}"),
         _ => format!("TRUNCATE TABLE {full_table}"),
     }
 }
@@ -932,7 +1832,7 @@ fn text_data_type(db_type: &DatabaseType) -> &'static str {
 
 fn integer_data_type(db_type: &DatabaseType) -> &'static str {
     match db_type {
-        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "INTEGER",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => "INTEGER",
         DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "NUMBER(19)",
         DatabaseType::ClickHouse => "Int64",
         _ => "BIGINT",
@@ -949,7 +1849,7 @@ fn decimal_data_type(db_type: &DatabaseType) -> &'static str {
         | DatabaseType::Highgo
         | DatabaseType::Kwdb
         | DatabaseType::Vastbase => "DOUBLE PRECISION",
-        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "REAL",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => "REAL",
         DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "BINARY_DOUBLE",
         DatabaseType::ClickHouse => "Float64",
         _ => "DOUBLE",
@@ -965,7 +1865,7 @@ fn boolean_data_type(db_type: &DatabaseType) -> &'static str {
         | DatabaseType::Sundb
         | DatabaseType::Databend => "TINYINT(1)",
         DatabaseType::SqlServer => "BIT",
-        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "INTEGER",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => "INTEGER",
         DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "NUMBER(1)",
         DatabaseType::ClickHouse => "UInt8",
         _ => "BOOLEAN",
@@ -974,7 +1874,7 @@ fn boolean_data_type(db_type: &DatabaseType) -> &'static str {
 
 fn date_data_type(db_type: &DatabaseType) -> &'static str {
     match db_type {
-        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "TEXT",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => "TEXT",
         DatabaseType::ClickHouse => "Date",
         _ => "DATE",
     }
@@ -989,7 +1889,7 @@ fn timestamp_data_type(db_type: &DatabaseType) -> &'static str {
         | DatabaseType::Sundb
         | DatabaseType::Databend => "DATETIME",
         DatabaseType::SqlServer => "DATETIME2",
-        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "TEXT",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => "TEXT",
         DatabaseType::ClickHouse => "DateTime64",
         _ => "TIMESTAMP",
     }
@@ -1146,28 +2046,33 @@ fn delimited_columns_and_first_record<R: std::io::Read>(
     reader: &mut csv::Reader<R>,
     config: DelimitedParseConfig,
 ) -> Result<(Vec<String>, Option<csv::StringRecord>), String> {
-    if config.has_header {
-        let columns = reader
-            .headers()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .enumerate()
-            .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index))
-            .collect::<Vec<_>>();
+    let mut columns = Vec::new();
+    for (index, record) in reader.records().enumerate() {
+        let record = record.map_err(|e| e.to_string())?;
+        let row_number = index + 1;
+        if config.row_range.title_row == Some(row_number) {
+            columns = record
+                .iter()
+                .enumerate()
+                .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index))
+                .collect();
+            continue;
+        }
+        if row_number < config.row_range.data_start_row {
+            continue;
+        }
+        if config.row_range.last_data_row.is_some_and(|last| row_number > last) {
+            break;
+        }
+        if columns.is_empty() {
+            columns = (0..record.len()).map(|index| format!("column_{}", index + 1)).collect();
+        }
         if columns.is_empty() {
             return Err("Import file has no columns".to_string());
         }
-        return Ok((columns, None));
+        return Ok((columns, Some(record)));
     }
-
-    let mut records = reader.records();
-    let first_record =
-        records.next().transpose().map_err(|e| e.to_string())?.ok_or_else(|| "Import file has no rows".to_string())?;
-    let columns = (0..first_record.len()).map(|index| format!("column_{}", index + 1)).collect::<Vec<_>>();
-    if columns.is_empty() {
-        return Err("Import file has no columns".to_string());
-    }
-    Ok((columns, Some(first_record)))
+    Err("Import file has no data rows in the selected row range".to_string())
 }
 
 pub async fn preview_table_import_file_with_request(
@@ -1206,6 +2111,7 @@ pub async fn preview_table_import_file_with_request(
         columns: parsed.columns,
         rows: parsed.rows,
         total_rows: parsed.total_rows,
+        effective_encoding: parsed.effective_encoding,
         sheets,
     })
 }
@@ -1350,33 +2256,24 @@ where
             }
         }
 
-        let config = match effective_delimited_config(source_format, &request.parse_options) {
-            Ok(config) => config,
-            Err(error) => return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error)),
-        };
-        let file = match File::open(&request.file_path) {
-            Ok(file) => file,
-            Err(error) => {
-                return Err(emit_import_error(
-                    &mut progress_callback,
-                    request,
-                    0,
-                    total_rows,
-                    format!("Import source is no longer available: {error}"),
-                ));
-            }
-        };
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(config.delimiter)
-            .has_headers(config.has_header)
-            .flexible(true)
-            .from_reader(file);
+        let mut streaming_options = request.parse_options.clone();
+        if streaming_options.encoding.unwrap_or(TableImportTextEncoding::Auto) == TableImportTextEncoding::Auto {
+            streaming_options.encoding = parsed.effective_encoding;
+        }
+        let (mut reader, config, _) =
+            match open_delimited_csv_reader(&request.file_path, source_format, &streaming_options) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+                }
+            };
         let (columns, first_record) = match delimited_columns_and_first_record(&mut reader, config) {
             Ok(result) => result,
             Err(error) => return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error)),
         };
         let effective_batch_size = match db_type {
             DatabaseType::Oracle | DatabaseType::OceanbaseOracle => 1,
+            DatabaseType::CloudflareD1 => batch_size.clamp(1, 100),
             _ => batch_size.max(1),
         };
         let mut rows_imported = 0;
@@ -1386,7 +2283,10 @@ where
             pending_rows.push(delimited_record_to_row(&record, columns.len(), config));
         }
 
-        for record in reader.records() {
+        for (source_row_number, record) in (config.row_range.data_start_row.saturating_add(1)..).zip(reader.records()) {
+            if config.row_range.last_data_row.is_some_and(|last| source_row_number > last) {
+                break;
+            }
             if is_cancelled(&request.import_id).await {
                 progress_callback(TableImportProgress {
                     import_id: request.import_id.clone(),
@@ -1413,7 +2313,7 @@ where
             pending_rows.push(delimited_record_to_row(&record, columns.len(), config));
 
             if pending_rows.len() >= effective_batch_size {
-                let batch = match build_import_insert_batch_from_rows(
+                let batch = match build_import_insert_batch_from_rows_with_format(
                     &pending_rows,
                     &columns,
                     &request.mappings,
@@ -1421,6 +2321,7 @@ where
                     &request.table,
                     &request.schema,
                     db_type,
+                    request.date_time_format.as_deref(),
                 ) {
                     Ok(Some(batch)) => batch,
                     Ok(None) => {
@@ -1463,7 +2364,7 @@ where
                 });
                 return Err("Import cancelled".to_string());
             }
-            let batch = match build_import_insert_batch_from_rows(
+            let batch = match build_import_insert_batch_from_rows_with_format(
                 &pending_rows,
                 &columns,
                 &request.mappings,
@@ -1471,6 +2372,7 @@ where
                 &request.table,
                 &request.schema,
                 db_type,
+                request.date_time_format.as_deref(),
             ) {
                 Ok(Some(batch)) => batch,
                 Ok(None) => ImportSqlBatch { sql: String::new(), row_count: 0 },
@@ -1497,11 +2399,30 @@ where
         return Ok(TableImportSummary { import_id: request.import_id.clone(), rows_imported, total_rows });
     }
 
-    let parsed = match parse_import_file_with_options(
+    let mut target_column_types = get_columns_for_transfer(
+        state,
+        pool_key,
+        &request.connection_id,
+        &request.database,
+        &request.schema,
+        &request.table,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|column| (column.name, column.data_type))
+    .collect::<Vec<_>>();
+    if target_column_types.is_empty() {
+        target_column_types = created_column_types.clone().unwrap_or_default();
+    }
+    let text_source_columns = textual_source_columns_for_import(&request.mappings, &target_column_types);
+
+    let parsed = match parse_import_file_with_options_and_text_columns(
         &request.file_path,
         Some(source_format),
         &request.parse_options,
         usize::MAX,
+        text_source_columns,
     )
     .await
     {
@@ -1523,24 +2444,7 @@ where
         error: None,
     });
 
-    let mut target_column_types = get_columns_for_transfer(
-        state,
-        pool_key,
-        &request.connection_id,
-        &request.database,
-        &request.schema,
-        &request.table,
-    )
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|column| (column.name, column.data_type))
-    .collect::<Vec<_>>();
-    if target_column_types.is_empty() {
-        target_column_types = created_column_types.clone().unwrap_or_default();
-    }
-
-    let batches = match build_import_insert_batches(
+    let batches = match build_import_insert_batches_with_format(
         &parsed,
         &request.mappings,
         &target_column_types,
@@ -1548,6 +2452,7 @@ where
         &request.schema,
         db_type,
         batch_size,
+        request.date_time_format.as_deref(),
     ) {
         Ok(batches) => batches,
         Err(error) => {
@@ -1604,6 +2509,260 @@ mod tests {
     use super::*;
     use crate::models::connection::DatabaseType;
     use crate::xlsx_export::{build_xlsx_workbook_multi, XlsxWorksheetData};
+    use std::io::{Cursor, Write};
+
+    fn write_xlsx_test_entry<W: Write + std::io::Seek>(zip: &mut zip::ZipWriter<W>, path: &str, content: &str) {
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(path, options).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+    }
+
+    fn build_styled_test_xlsx<S: AsRef<str>>(date1904: bool, cells: &[(S, usize, f64)]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let workbook_pr = if date1904 { r#"<workbookPr date1904="1"/>"# } else { "" };
+        let mut rows = std::collections::BTreeMap::<usize, String>::new();
+        for (reference, style_id, value) in cells {
+            let reference = reference.as_ref();
+            let (row, _) = xlsx_cell_ref_position(reference).expect("valid XLSX cell reference");
+            rows.entry(row).or_default().push_str(&format!(r#"<c r="{reference}" s="{style_id}"><v>{value}</v></c>"#));
+        }
+        let rows_xml =
+            rows.into_iter().map(|(row, cells)| format!(r#"<row r="{row}">{cells}</row>"#)).collect::<String>();
+
+        write_xlsx_test_entry(
+            &mut zip,
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>"#,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "xl/workbook.xml",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  {workbook_pr}
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#
+            ),
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "xl/_rels/workbook.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "xl/styles.xml",
+            r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="12">
+    <numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>
+    <numFmt numFmtId="165" formatCode="yyyy-mm-dd hh:mm:ss"/>
+    <numFmt numFmtId="166" formatCode="hh:mm:ss"/>
+    <numFmt numFmtId="167" formatCode="[h]:mm:ss"/>
+    <numFmt numFmtId="168" formatCode="0.0"/>
+    <numFmt numFmtId="169" formatCode="0.00"/>
+    <numFmt numFmtId="170" formatCode="00000"/>
+    <numFmt numFmtId="171" formatCode="#,##0.00"/>
+    <numFmt numFmtId="172" formatCode="0.00E+00"/>
+    <numFmt numFmtId="173" formatCode="0.0%"/>
+    <numFmt numFmtId="174" formatCode="[$€-407]#,##0.00"/>
+    <numFmt numFmtId="175" formatCode="[$-409]#,##0.00"/>
+  </numFmts>
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="13">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="167" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="169" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="170" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="171" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="172" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="173" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="174" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="175" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+  </cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>"##,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "xl/worksheets/sheet1.xml",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>{rows_xml}</sheetData>
+</worksheet>"#
+            ),
+        );
+
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn retains_only_temporal_and_text_target_xlsx_styles() {
+        let styles = vec![
+            XlsxCellStyle { temporal_kind: None, number_format: Some(Arc::from("0.00")) },
+            XlsxCellStyle { temporal_kind: Some(XlsxTemporalKind::Date), number_format: None },
+        ];
+        let sheet = r#"<worksheet><sheetData><row r="1">
+            <c r="A1" s="0"><v>10</v></c>
+            <c r="B1" s="0"><v>20</v></c>
+            <c r="C1" s="1"><v>45996</v></c>
+        </row></sheetData></worksheet>"#;
+
+        let retained =
+            parse_xlsx_sheet_cell_styles(Cursor::new(sheet.as_bytes()), &styles, &HashSet::from([2])).unwrap();
+
+        assert_eq!(retained.len(), 2);
+        assert!(!retained.contains_key(&(1, 1)));
+        assert_eq!(retained.get(&(1, 2)).and_then(|style| style.number_format.as_deref()), Some("0.00"));
+        assert_eq!(retained.get(&(1, 3)).and_then(|style| style.temporal_kind), Some(XlsxTemporalKind::Date));
+    }
+
+    #[test]
+    fn legacy_xls_rejects_numeric_to_text_without_affecting_numeric_targets() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-formatted-{}.xls", uuid::Uuid::new_v4()));
+        std::fs::write(&path, include_bytes!("../tests/fixtures/issue3683-formatted-numbers.xls")).unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+
+        let numeric =
+            parse_xlsx_file_with_options_and_text_columns(&path.to_string_lossy(), &options, 10, &HashSet::new())
+                .unwrap();
+        let values = numeric.rows[0].iter().map(|value| value.as_f64()).collect::<Vec<_>>();
+        assert_eq!(values, vec![Some(10.0), Some(42.0), Some(0.125), Some(1234.5), Some(99.5)]);
+
+        for column in 1..=4 {
+            let source_column = format!("column_{column}");
+            let error = parse_xlsx_file_with_options_and_text_columns(
+                &path.to_string_lossy(),
+                &options,
+                10,
+                &HashSet::from([source_column.clone()]),
+            )
+            .unwrap_err();
+            assert!(error.contains("Legacy .xls"), "{error}");
+            assert!(error.contains(&source_column), "{error}");
+            assert!(error.contains("Save the workbook as .xlsx"), "{error}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_rss_kib(pid: u32) -> Option<u64> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:")?.split_ascii_whitespace().next()?.parse::<u64>().ok())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xlsx_style_rss_helper() {
+        let Ok(sheet_path) = std::env::var("DBX_XLSX_STYLE_RSS_PATH") else {
+            return;
+        };
+        let ready_path = std::env::var("DBX_XLSX_STYLE_RSS_READY").unwrap();
+        let go_path = std::env::var("DBX_XLSX_STYLE_RSS_GO").unwrap();
+        std::fs::write(&ready_path, b"ready").unwrap();
+        while !Path::new(&go_path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let styles = [XlsxCellStyle { temporal_kind: None, number_format: Some(Arc::from("0.00")) }];
+        let sheet = BufReader::new(File::open(sheet_path).unwrap());
+        let retained = parse_xlsx_sheet_cell_styles(sheet, &styles, &HashSet::new()).unwrap();
+        assert!(retained.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_xlsx_style_scan_keeps_peak_rss_bounded() {
+        const ROWS: usize = 120_000;
+        const COLUMNS: usize = 8;
+        const MAX_RSS_GROWTH_KIB: u64 = 48 * 1024;
+
+        let suffix = uuid::Uuid::new_v4();
+        let sheet_path = std::env::temp_dir().join(format!("dbx-xlsx-style-rss-{suffix}.xml"));
+        let ready_path = std::env::temp_dir().join(format!("dbx-xlsx-style-rss-{suffix}.ready"));
+        let go_path = std::env::temp_dir().join(format!("dbx-xlsx-style-rss-{suffix}.go"));
+        let mut sheet = std::io::BufWriter::new(File::create(&sheet_path).unwrap());
+        write!(sheet, "<worksheet><sheetData>").unwrap();
+        for row in 1..=ROWS {
+            write!(sheet, "<row r=\"{row}\">").unwrap();
+            for column in 0..COLUMNS {
+                let column_name = (b'A' + column as u8) as char;
+                write!(sheet, "<c r=\"{column_name}{row}\" s=\"0\"><v>{row}</v></c>").unwrap();
+            }
+            write!(sheet, "</row>").unwrap();
+        }
+        write!(sheet, "</sheetData></worksheet>").unwrap();
+        sheet.flush().unwrap();
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "table_import::tests::xlsx_style_rss_helper", "--nocapture"])
+            .env("DBX_XLSX_STYLE_RSS_PATH", &sheet_path)
+            .env("DBX_XLSX_STYLE_RSS_READY", &ready_path)
+            .env("DBX_XLSX_STYLE_RSS_GO", &go_path)
+            .spawn()
+            .unwrap();
+        for _ in 0..10_000 {
+            if ready_path.exists() {
+                break;
+            }
+            assert!(child.try_wait().unwrap().is_none(), "RSS helper exited before becoming ready");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(ready_path.exists(), "RSS helper did not become ready");
+        let baseline_rss = linux_process_rss_kib(child.id()).expect("helper RSS before scan");
+        std::fs::write(&go_path, b"go").unwrap();
+        let mut peak_rss = baseline_rss;
+        let status = loop {
+            if let Some(rss) = linux_process_rss_kib(child.id()) {
+                peak_rss = peak_rss.max(rss);
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+
+        let _ = std::fs::remove_file(&sheet_path);
+        let _ = std::fs::remove_file(&ready_path);
+        let _ = std::fs::remove_file(&go_path);
+        assert!(status.success());
+        assert!(
+            peak_rss.saturating_sub(baseline_rss) <= MAX_RSS_GROWTH_KIB,
+            "streaming style scan RSS grew by {} KiB (baseline {baseline_rss} KiB, peak {peak_rss} KiB)",
+            peak_rss.saturating_sub(baseline_rss)
+        );
+    }
 
     #[test]
     fn parses_csv_headers_and_preview_rows() {
@@ -1627,6 +2786,152 @@ mod tests {
                 serde_json::Value::String("false".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn auto_detects_and_parses_gbk_csv() {
+        let (bytes, _, had_errors) = encoding_rs::GBK.encode("id,name\n1,中文\n2,上海\n");
+        assert!(!had_errors);
+
+        let parsed = parse_delimited_bytes_with_options(
+            bytes.as_ref(),
+            TableImportSourceFormat::Csv,
+            &TableImportParseOptions::default(),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.effective_encoding, Some(TableImportTextEncoding::Gbk));
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("中文")]);
+        assert_eq!(parsed.rows[1], vec![serde_json::json!("2"), serde_json::json!("上海")]);
+    }
+
+    #[test]
+    fn explicit_utf8_rejects_gbk_csv_without_replacing_data() {
+        let (bytes, _, had_errors) = encoding_rs::GBK.encode("id,name\n1,中文\n");
+        assert!(!had_errors);
+        let options = TableImportParseOptions {
+            encoding: Some(TableImportTextEncoding::Utf8),
+            ..TableImportParseOptions::default()
+        };
+
+        let error =
+            parse_delimited_bytes_with_options(bytes.as_ref(), TableImportSourceFormat::Csv, &options, 10).unwrap_err();
+
+        assert!(error.contains("Invalid byte sequence for UTF-8 encoding"), "{error}");
+    }
+
+    #[test]
+    fn gbk_option_decodes_gb18030_four_byte_characters() {
+        let (bytes, _, had_errors) = encoding_rs::GB18030.encode("id,name\n1,😀\n");
+        assert!(!had_errors);
+
+        let parsed = parse_delimited_bytes_with_options(
+            bytes.as_ref(),
+            TableImportSourceFormat::Csv,
+            &TableImportParseOptions::default(),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.effective_encoding, Some(TableImportTextEncoding::Gbk));
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("😀")]);
+    }
+
+    #[test]
+    fn auto_detects_utf16le_bom_csv() {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "id,name\n1,中文\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let parsed = parse_delimited_bytes_with_options(
+            &bytes,
+            TableImportSourceFormat::Csv,
+            &TableImportParseOptions::default(),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.effective_encoding, Some(TableImportTextEncoding::Utf16Le));
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("中文")]);
+    }
+
+    #[test]
+    fn auto_detects_utf16be_bom_csv() {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in "id,name\n1,中文\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+
+        let parsed = parse_delimited_bytes_with_options(
+            &bytes,
+            TableImportSourceFormat::Csv,
+            &TableImportParseOptions::default(),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.effective_encoding, Some(TableImportTextEncoding::Utf16Be));
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("中文")]);
+    }
+
+    #[test]
+    fn explicit_utf16le_parses_csv_without_bom() {
+        let bytes = "id,name\n1,中文\n".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+        let options = TableImportParseOptions {
+            encoding: Some(TableImportTextEncoding::Utf16Le),
+            ..TableImportParseOptions::default()
+        };
+
+        let parsed = parse_delimited_bytes_with_options(&bytes, TableImportSourceFormat::Csv, &options, 10).unwrap();
+
+        assert_eq!(parsed.effective_encoding, Some(TableImportTextEncoding::Utf16Le));
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("中文")]);
+    }
+
+    #[test]
+    fn gbk_decoder_preserves_multibyte_character_across_read_chunks() {
+        let ascii_prefix = "a".repeat(IMPORT_ENCODING_READ_CHUNK_BYTES - "name\n".len() - 1);
+        let csv = format!("name\n{ascii_prefix}中\n");
+        let (bytes, _, had_errors) = encoding_rs::GBK.encode(&csv);
+        assert!(!had_errors);
+        let options = TableImportParseOptions {
+            encoding: Some(TableImportTextEncoding::Gbk),
+            ..TableImportParseOptions::default()
+        };
+
+        let parsed =
+            parse_delimited_bytes_with_options(bytes.as_ref(), TableImportSourceFormat::Csv, &options, 10).unwrap();
+
+        assert_eq!(parsed.rows[0][0], serde_json::json!(format!("{ascii_prefix}中")));
+    }
+
+    #[tokio::test]
+    async fn preview_reads_real_gbk_file_and_reports_detected_encoding() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-gbk-{}.csv", uuid::Uuid::new_v4()));
+        let (bytes, _, had_errors) = encoding_rs::GBK.encode("编号,城市\n1,北京\n2,上海\n");
+        assert!(!had_errors);
+        std::fs::write(&path, bytes.as_ref()).unwrap();
+
+        let preview = preview_table_import_file_with_request(TableImportPreviewRequest {
+            file_path: path.to_string_lossy().to_string(),
+            source_ref: None,
+            source_format: Some(TableImportSourceFormat::Csv),
+            parse_options: TableImportParseOptions::default(),
+            preview_limit: Some(10),
+        })
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(preview.effective_encoding, Some(TableImportTextEncoding::Gbk));
+        assert_eq!(preview.columns, vec!["编号", "城市"]);
+        assert_eq!(preview.total_rows, 2);
+        assert_eq!(preview.rows[0], vec![serde_json::json!("1"), serde_json::json!("北京")]);
     }
 
     #[test]
@@ -1662,6 +2967,40 @@ mod tests {
         assert_eq!(parsed.total_rows, 2);
         assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("Ada")]);
         assert_eq!(parsed.rows[1], vec![serde_json::json!("2"), serde_json::Value::Null]);
+    }
+
+    #[test]
+    fn parses_delimited_text_with_custom_title_and_data_rows() {
+        let options = TableImportParseOptions {
+            title_row: Some(2),
+            data_start_row: Some(4),
+            last_data_row: Some(5),
+            ..TableImportParseOptions::default()
+        };
+        let parsed = parse_delimited_bytes_with_options(
+            b"report,ignored\nid,name\nnotes,ignored\n1,Ada\n2,Grace\nsummary,2\n",
+            TableImportSourceFormat::Csv,
+            &options,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.total_rows, 2);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("Ada")]);
+        assert_eq!(parsed.rows[1], vec![serde_json::json!("2"), serde_json::json!("Grace")]);
+    }
+
+    #[test]
+    fn rejects_title_row_inside_data_range() {
+        let options = TableImportParseOptions {
+            title_row: Some(2),
+            data_start_row: Some(1),
+            last_data_row: Some(3),
+            ..TableImportParseOptions::default()
+        };
+
+        assert!(effective_import_row_range(&options).unwrap_err().contains("before the data start row"));
     }
 
     #[test]
@@ -1701,11 +3040,13 @@ mod tests {
             XlsxWorksheetData {
                 sheet_name: Some("First".to_string()),
                 columns: vec!["id".to_string()],
+                column_types: vec![],
                 rows: vec![vec![serde_json::json!(1)]],
             },
             XlsxWorksheetData {
                 sheet_name: Some("Second".to_string()),
                 columns: vec!["name".to_string()],
+                column_types: vec![],
                 rows: vec![vec![serde_json::json!("Ada")]],
             },
         ])
@@ -1719,6 +3060,353 @@ mod tests {
         assert_eq!(xlsx_sheet_names(&path.to_string_lossy()).unwrap(), vec!["First", "Second"]);
         assert_eq!(parsed.columns, vec!["name"]);
         assert_eq!(parsed.rows, vec![vec![serde_json::json!("Ada")]]);
+        assert_eq!(
+            mapping_indexes(
+                &parsed,
+                &[TableImportColumnMapping {
+                    source_column: "name".to_string(),
+                    target_column: "display_name".to_string(),
+                    target_data_type: None,
+                }],
+            )
+            .unwrap(),
+            vec![(0, "display_name".to_string())]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn formats_unclassified_excel_datetimes_conservatively() {
+        let date_cell = Data::DateTime(ExcelDateTime::new(45996.0, calamine::ExcelDateTimeType::DateTime, false));
+        let time_cell = Data::DateTime(ExcelDateTime::new(0.5, calamine::ExcelDateTimeType::DateTime, false));
+        let duration_cell = Data::DateTime(ExcelDateTime::new(2.5, calamine::ExcelDateTimeType::TimeDelta, false));
+
+        let date_value = xlsx_cell_value(&date_cell);
+        let time_value = xlsx_cell_value(&time_cell);
+
+        assert_eq!(date_value, serde_json::json!("2025-12-05 00:00:00"));
+        assert_eq!(time_value, serde_json::json!("0.5"));
+        assert_eq!(xlsx_cell_value(&duration_cell), serde_json::json!("60:00:00"));
+        assert_eq!(infer_value_type(&date_value), Some(ImportInferredType::Timestamp));
+        assert_eq!(infer_value_type(&time_value), Some(ImportInferredType::Decimal));
+    }
+
+    #[test]
+    fn keeps_excel_numeric_and_text_cell_types_distinct() {
+        let integer_valued_float = xlsx_cell_value(&Data::Float(10_401_029_008.0));
+        assert_eq!(integer_valued_float, serde_json::json!(10_401_029_008.0));
+        assert_eq!(infer_value_type(&integer_valued_float), Some(ImportInferredType::Decimal));
+        assert_eq!(xlsx_cell_value(&Data::Float(10_401_029_008.5)), serde_json::json!(10_401_029_008.5));
+        assert_eq!(xlsx_cell_value(&Data::Float(9_007_199_254_740_992.0)), serde_json::json!(9_007_199_254_740_992.0));
+        for text in ["10.0", "00123", "1e3", "10401029008.0"] {
+            assert_eq!(xlsx_cell_value(&Data::String(text.to_string())), serde_json::json!(text));
+        }
+    }
+
+    #[test]
+    fn renders_common_excel_numeric_display_formats() {
+        let display = |value, format_code: &str| {
+            xlsx_numeric_display_text(
+                value,
+                Some(&XlsxCellStyle { temporal_kind: None, number_format: Some(Arc::from(format_code)) }),
+            )
+        };
+
+        assert_eq!(display(42.0, "00000"), "00042");
+        assert_eq!(display(1234.5, "#,##0.00"), "1,234.50");
+        assert_eq!(display(1234.0, "0.00E+00"), "1.23E+03");
+        assert_eq!(display(0.125, "0.0%"), "12.5%");
+        assert_eq!(display(1234.5, "[$€-407]#,##0.00"), "€1.234,50");
+        assert_eq!(display(1234.5, "[$-407]#,##0.00"), "1.234,50");
+        assert_eq!(display(1234.5, "[$-409]#,##0.00"), "1,234.50");
+        assert_eq!(display(12.5, "["), "12.5");
+    }
+
+    #[test]
+    fn formats_only_excel_columns_mapped_to_text_targets() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-display-formats-{}.xlsx", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            build_styled_test_xlsx(
+                false,
+                &[
+                    ("A1", 7, 42.0),
+                    ("B1", 8, 1234.5),
+                    ("C1", 9, 1234.0),
+                    ("D1", 10, 0.125),
+                    ("E1", 11, 1234.5),
+                    ("F1", 12, 1234.5),
+                    ("G1", 6, 10.0),
+                ],
+            ),
+        )
+        .unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+        let text_source_columns = (1..=6).map(|index| format!("column_{index}")).collect::<HashSet<_>>();
+
+        let parsed =
+            parse_xlsx_file_with_options_and_text_columns(&path.to_string_lossy(), &options, 10, &text_source_columns)
+                .unwrap();
+
+        assert_eq!(
+            parsed.rows[0],
+            vec![
+                serde_json::json!("00042"),
+                serde_json::json!("1,234.50"),
+                serde_json::json!("1.23E+03"),
+                serde_json::json!("12.5%"),
+                serde_json::json!("€1.234,50"),
+                serde_json::json!("1,234.50"),
+                serde_json::json!(10.0),
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recognizes_supported_textual_import_target_types() {
+        for data_type in [
+            "FixedString(32)",
+            "Nullable(FixedString(32))",
+            "LowCardinality(String)",
+            "sysname",
+            "LONG",
+            "LONG VARCHAR",
+        ] {
+            assert!(is_textual_import_target_type(data_type), "{data_type}");
+        }
+        for data_type in ["LONG RAW", "BIGINT", "Nullable(Float64)"] {
+            assert!(!is_textual_import_target_type(data_type), "{data_type}");
+        }
+    }
+
+    #[test]
+    fn selects_excel_display_conversion_only_for_textual_mappings() {
+        let mappings = vec![
+            TableImportColumnMapping {
+                source_column: "code_source".to_string(),
+                target_column: "code".to_string(),
+                target_data_type: None,
+            },
+            TableImportColumnMapping {
+                source_column: "amount_source".to_string(),
+                target_column: "amount".to_string(),
+                target_data_type: None,
+            },
+        ];
+
+        let selected = textual_source_columns_for_import(
+            &mappings,
+            &[("code".to_string(), "varchar(32)".to_string()), ("amount".to_string(), "double".to_string())],
+        );
+
+        assert_eq!(selected, HashSet::from(["code_source".to_string()]));
+    }
+
+    #[test]
+    fn clickhouse_fixed_string_import_uses_excel_numeric_display_text() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-fixed-string-{}.xlsx", uuid::Uuid::new_v4()));
+        std::fs::write(&path, build_styled_test_xlsx(false, &[("A1", 5, 10.0)])).unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "column_1".to_string(),
+            target_column: "code".to_string(),
+            target_data_type: None,
+        }];
+        let target_column_types = [("code".to_string(), "FixedString(16)".to_string())];
+        let text_source_columns = textual_source_columns_for_import(&mappings, &target_column_types);
+
+        let data =
+            parse_xlsx_file_with_options_and_text_columns(&path.to_string_lossy(), &options, 10, &text_source_columns)
+                .unwrap();
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &target_column_types,
+            "issue_3683_fixed_string",
+            "",
+            &DatabaseType::ClickHouse,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(text_source_columns, HashSet::from(["column_1".to_string()]));
+        assert_eq!(data.rows, vec![vec![serde_json::json!("10.0")]]);
+        assert_eq!(batches[0].sql, "INSERT INTO `issue_3683_fixed_string` (`code`) VALUES\n('10.0')");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mysql_varchar_import_uses_excel_numeric_display_text() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-number-format-{}.xlsx", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            build_styled_test_xlsx(false, &[("A1", 0, 10_401_029_008.0), ("A2", 5, 10.0), ("A3", 6, 10.0)]),
+        )
+        .unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+        let numeric_data = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        let mut data = parse_xlsx_file_with_options_and_text_columns(
+            &path.to_string_lossy(),
+            &options,
+            10,
+            &HashSet::from(["column_1".to_string()]),
+        )
+        .unwrap();
+        data.rows.extend([
+            vec![serde_json::json!("10.0")],
+            vec![serde_json::json!("00123")],
+            vec![serde_json::json!("1e3")],
+            vec![serde_json::json!("10401029008.0")],
+        ]);
+        data.total_rows = data.rows.len();
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "column_1".to_string(),
+            target_column: "code".to_string(),
+            target_data_type: None,
+        }];
+
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[("code".to_string(), "varchar(32)".to_string())],
+            "issue_3683",
+            "",
+            &DatabaseType::Mysql,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(
+            batches[0].sql,
+            "INSERT INTO `issue_3683` (`code`) VALUES\n('10401029008'),\n('10.0'),\n('10.00'),\n('10.0'),\n('00123'),\n('1e3'),\n('10401029008.0')"
+        );
+        assert!(data.rows[..3].iter().all(|row| row[0].as_str().is_some()));
+        assert!(numeric_data.rows.iter().all(|row| row[0].as_f64().is_some()));
+
+        let numeric_batches = build_import_insert_batches(
+            &numeric_data,
+            &mappings,
+            &[("code".to_string(), "double".to_string())],
+            "issue_3683_numeric",
+            "",
+            &DatabaseType::Mysql,
+            500,
+        )
+        .unwrap();
+        assert!(numeric_batches[0].sql.contains("(10401029008.0),\n(10.0),\n(10.0)"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn excel_integer_sample_keeps_decimal_create_table_inference() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-inference-{}.xlsx", uuid::Uuid::new_v4()));
+        let cells = (1..=101)
+            .map(|row| (format!("A{row}"), 0, if row == 101 { 100.5 } else { row as f64 }))
+            .collect::<Vec<_>>();
+        std::fs::write(&path, build_styled_test_xlsx(false, &cells)).unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+        let data =
+            parse_xlsx_file_with_options(&path.to_string_lossy(), &options, CREATE_TABLE_INFERENCE_ROWS).unwrap();
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "column_1".to_string(),
+            target_column: "amount".to_string(),
+            target_data_type: None,
+        }];
+
+        let plan = build_import_create_table_plan(&data, &mappings, "measurements", "", &DatabaseType::Mysql).unwrap();
+
+        assert_eq!(data.total_rows, 101);
+        assert_eq!(data.rows.len(), CREATE_TABLE_INFERENCE_ROWS);
+        assert_eq!(plan.columns[0].data_type, "DOUBLE");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_excel_temporal_styles_before_type_inference() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-temporal-{}.xlsx", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            build_styled_test_xlsx(false, &[("A1", 1, 45996.0), ("B1", 2, 45996.0), ("C1", 3, 0.5), ("D1", 4, 1.5)]),
+        )
+        .unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+
+        let parsed = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+
+        assert_eq!(parsed.columns, vec!["column_1", "column_2", "column_3", "column_4"]);
+        assert_eq!(
+            parsed.rows,
+            vec![vec![
+                serde_json::json!("2025-12-05"),
+                serde_json::json!("2025-12-05 00:00:00"),
+                serde_json::json!("12:00:00"),
+                serde_json::json!("36:00:00"),
+            ]]
+        );
+        assert_eq!(infer_value_type(&parsed.rows[0][0]), Some(ImportInferredType::Date));
+        assert_eq!(infer_value_type(&parsed.rows[0][1]), Some(ImportInferredType::Timestamp));
+        assert_eq!(infer_value_type(&parsed.rows[0][2]), Some(ImportInferredType::Text));
+        assert_eq!(infer_value_type(&parsed.rows[0][3]), Some(ImportInferredType::Text));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_excel_temporal_styles_with_1904_date_system() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-temporal-1904-{}.xlsx", uuid::Uuid::new_v4()));
+        std::fs::write(&path, build_styled_test_xlsx(true, &[("A1", 1, 1.0)])).unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+
+        let parsed = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+
+        assert_eq!(parsed.rows, vec![vec![serde_json::json!("1904-01-02")]]);
+        assert_eq!(infer_value_type(&parsed.rows[0][0]), Some(ImportInferredType::Date));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_excel_temporal_styles_from_non_a1_used_range() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-temporal-offset-{}.xlsx", uuid::Uuid::new_v4()));
+        std::fs::write(&path, build_styled_test_xlsx(false, &[("C3", 1, 45996.0), ("D3", 2, 45996.0)])).unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+
+        let parsed = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+
+        assert_eq!(parsed.columns, vec!["column_1", "column_2"]);
+        assert_eq!(parsed.rows, vec![vec![serde_json::json!("2025-12-05"), serde_json::json!("2025-12-05 00:00:00")]]);
+        assert_eq!(infer_value_type(&parsed.rows[0][0]), Some(ImportInferredType::Date));
+        assert_eq!(infer_value_type(&parsed.rows[0][1]), Some(ImportInferredType::Timestamp));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_excel_with_custom_title_and_data_rows() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-rows-{}.xlsx", uuid::Uuid::new_v4()));
+        let workbook = build_xlsx_workbook_multi(&[XlsxWorksheetData {
+            sheet_name: Some("Rows".to_string()),
+            columns: vec!["report".to_string(), "ignored".to_string()],
+            column_types: vec![],
+            rows: vec![
+                vec![serde_json::json!("id"), serde_json::json!("name")],
+                vec![serde_json::json!(1), serde_json::json!("Ada")],
+                vec![serde_json::json!(2), serde_json::json!("Grace")],
+                vec![serde_json::json!("summary"), serde_json::json!(2)],
+            ],
+        }])
+        .unwrap();
+        std::fs::write(&path, workbook).unwrap();
+        let options = TableImportParseOptions {
+            title_row: Some(2),
+            data_start_row: Some(3),
+            last_data_row: Some(4),
+            ..TableImportParseOptions::default()
+        };
+        let parsed = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.total_rows, 2);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!(1.0), serde_json::json!("Ada")]);
+        assert_eq!(parsed.rows[1], vec![serde_json::json!(2.0), serde_json::json!("Grace")]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1752,6 +3440,7 @@ mod tests {
                 ],
             ],
             total_rows: 2,
+            effective_encoding: None,
         };
         let mappings = data
             .columns
@@ -1785,8 +3474,12 @@ mod tests {
 
     #[test]
     fn create_table_plan_requires_target_table_name() {
-        let data =
-            ParsedImportFile { columns: vec!["id".to_string()], rows: vec![vec![serde_json::json!(1)]], total_rows: 1 };
+        let data = ParsedImportFile {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![serde_json::json!(1)]],
+            total_rows: 1,
+            effective_encoding: None,
+        };
         let mappings = vec![TableImportColumnMapping {
             source_column: "id".to_string(),
             target_column: "id".to_string(),
@@ -1804,6 +3497,7 @@ mod tests {
             columns: vec!["notes".to_string()],
             rows: vec![vec![serde_json::json!("long text")]],
             total_rows: 1,
+            effective_encoding: None,
         };
         let mappings = vec![TableImportColumnMapping {
             source_column: "notes".to_string(),
@@ -1822,6 +3516,7 @@ mod tests {
             columns: vec!["code".to_string(), "amount".to_string()],
             rows: vec![vec![serde_json::json!("1001"), serde_json::json!("12.5")]],
             total_rows: 1,
+            effective_encoding: None,
         };
         let mappings = vec![
             TableImportColumnMapping {
@@ -1854,6 +3549,7 @@ mod tests {
             columns: vec!["name".to_string()],
             rows: vec![vec![serde_json::json!("Ada")]],
             total_rows: 1,
+            effective_encoding: None,
         };
         let mappings = vec![TableImportColumnMapping {
             source_column: "name".to_string(),
@@ -1888,6 +3584,7 @@ mod tests {
                 vec![serde_json::json!(3), serde_json::Value::Null, serde_json::json!("z")],
             ],
             total_rows: 3,
+            effective_encoding: None,
         };
 
         let batches =
@@ -1903,6 +3600,39 @@ mod tests {
                 row_count: 1,
             },
         ]);
+    }
+
+    #[test]
+    fn iris_import_uses_single_row_values_statements() {
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "id".to_string(),
+            target_column: "id".to_string(),
+            target_data_type: None,
+        }];
+        let data = ParsedImportFile {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
+            total_rows: 2,
+            effective_encoding: None,
+        };
+
+        let batches =
+            build_import_insert_batches(&data, &mappings, &[], "items", "SQLUSER", &DatabaseType::Iris, 100).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].sql, "INSERT INTO \"SQLUSER\".\"items\" (\"id\") VALUES\n(1)");
+        assert_eq!(batches[0].row_count, 1);
+        assert_eq!(batches[1].sql, "INSERT INTO \"SQLUSER\".\"items\" (\"id\") VALUES\n(2)");
+        assert_eq!(batches[1].row_count, 1);
+    }
+
+    #[test]
+    fn multi_row_insert_values_support_matches_database_dialects() {
+        assert!(!supports_multi_row_insert_values(&DatabaseType::Oracle));
+        assert!(!supports_multi_row_insert_values(&DatabaseType::OceanbaseOracle));
+        assert!(!supports_multi_row_insert_values(&DatabaseType::Iris));
+        assert!(supports_multi_row_insert_values(&DatabaseType::Postgres));
+        assert!(supports_multi_row_insert_values(&DatabaseType::Mysql));
     }
 
     #[test]
@@ -1997,6 +3727,7 @@ mod tests {
                 vec![serde_json::json!(3), serde_json::Value::Null],
             ],
             total_rows: 3,
+            effective_encoding: None,
         };
 
         let batches =
@@ -2042,6 +3773,7 @@ mod tests {
                 serde_json::json!("2026-05-12T00:00:00+00:00"),
             ]],
             total_rows: 1,
+            effective_encoding: None,
         };
 
         let batches = build_import_insert_batches(
@@ -2065,6 +3797,85 @@ mod tests {
     }
 
     #[test]
+    fn import_insert_batches_normalize_oracle_unpadded_slash_dates() {
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "created_at".to_string(),
+            target_column: "created_at".to_string(),
+            target_data_type: None,
+        }];
+        let data = ParsedImportFile {
+            columns: vec!["created_at".to_string()],
+            rows: vec![vec![serde_json::json!("2024/2/25 13:02:15")]],
+            total_rows: 1,
+            effective_encoding: None,
+        };
+
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[("created_at".to_string(), "DATE".to_string())],
+            "events",
+            "APP",
+            &DatabaseType::Oracle,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(
+            batches[0].sql,
+            "INSERT INTO \"APP\".\"events\" (\"created_at\") VALUES\n(TO_DATE('2024-02-25 13:02:15', 'YYYY-MM-DD HH24:MI:SS'))"
+        );
+    }
+
+    #[test]
+    fn import_insert_batch_normalizes_oracle_date_and_timestamp_columns() {
+        let mappings = vec![
+            TableImportColumnMapping {
+                source_column: "event_id".to_string(),
+                target_column: "EVENT_ID".to_string(),
+                target_data_type: None,
+            },
+            TableImportColumnMapping {
+                source_column: "created_at".to_string(),
+                target_column: "CREATED_AT".to_string(),
+                target_data_type: None,
+            },
+            TableImportColumnMapping {
+                source_column: "updated_at".to_string(),
+                target_column: "UPDATED_AT".to_string(),
+                target_data_type: None,
+            },
+        ];
+        let rows = vec![vec![
+            serde_json::json!(1),
+            serde_json::json!("2024/2/25 13:02:15"),
+            serde_json::json!("2024/2/25 14:03:16"),
+        ]];
+
+        let batch = build_import_insert_batch_from_rows_with_format(
+            &rows,
+            &["event_id".to_string(), "created_at".to_string(), "updated_at".to_string()],
+            &mappings,
+            &[
+                ("EVENT_ID".to_string(), "NUMBER".to_string()),
+                ("CREATED_AT".to_string(), "DATE".to_string()),
+                ("UPDATED_AT".to_string(), "TIMESTAMP(6)".to_string()),
+            ],
+            "EVENTS",
+            "APP",
+            &DatabaseType::Oracle,
+            Some("YYYY/M/D HH:mm:ss"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            batch.sql,
+            "INSERT INTO \"APP\".\"EVENTS\" (\"EVENT_ID\", \"CREATED_AT\", \"UPDATED_AT\") VALUES\n(1, TO_DATE('2024-02-25 13:02:15', 'YYYY-MM-DD HH24:MI:SS'), TO_TIMESTAMP('2024-02-25 14:03:16', 'YYYY-MM-DD HH24:MI:SS'))"
+        );
+    }
+
+    #[test]
     fn import_insert_batches_preserve_sqlserver_unicode_text() {
         let mappings = vec![TableImportColumnMapping {
             source_column: "name".to_string(),
@@ -2075,6 +3886,7 @@ mod tests {
             columns: vec!["name".to_string()],
             rows: vec![vec![serde_json::json!("Tiếng Việt")]],
             total_rows: 1,
+            effective_encoding: None,
         };
 
         let batches = build_import_insert_batches(

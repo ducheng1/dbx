@@ -211,6 +211,12 @@ export function sortDatabaseObjectsByName<T>(items: readonly T[], getName: (item
   return [...items].sort((left, right) => databaseObjectNameCollator.compare(getName(left), getName(right)));
 }
 
+// Shared with the object browser so both sides of the UI list objects in the
+// same natural visible-name order as the sidebar tree (issue #3604).
+export function compareDatabaseObjectNames(left: string, right: string): number {
+  return databaseObjectNameCollator.compare(left, right);
+}
+
 export function mergeTableInfosIntoObjects(objects: readonly ObjectInfo[], tables: readonly TableInfo[], schema?: string): ObjectInfo[] {
   const merged = [...objects];
   const seen = new Set(
@@ -292,7 +298,7 @@ function buildPartitionTree(entries: TableTreeEntry[], connectionId: string, dat
 
     const partitionGroup: TreeNode = {
       id: `${entry.node.id}:__partitions`,
-      label: "tree.partitions",
+      label: childTableGroupLabel(entry.node),
       type: "group-partitions",
       connectionId,
       database,
@@ -300,7 +306,7 @@ function buildPartitionTree(entries: TableTreeEntry[], connectionId: string, dat
       catalog: entry.node.catalog,
       tableName: entry.node.label,
       objectCount: partitionChildren.length,
-      isExpanded: false,
+      isExpanded: isSuperTable(entry.node),
       children: partitionChildren.map(materialize),
     };
     entry.node.children = [partitionGroup];
@@ -309,6 +315,14 @@ function buildPartitionTree(entries: TableTreeEntry[], connectionId: string, dat
   };
 
   return orderedEntries.filter((entry) => !childKeys.has(entry.key)).map(materialize);
+}
+
+function isSuperTable(parent: TreeNode): boolean {
+  return parent.tableType?.trim().toUpperCase() === "STABLE";
+}
+
+function childTableGroupLabel(parent: TreeNode): string {
+  return isSuperTable(parent) ? "tree.childTables" : "tree.partitions";
 }
 
 function partitionGroupChildren(node: TreeNode): TreeNode[] {
@@ -323,6 +337,46 @@ export function tablePartitionGroups(node: TreeNode): TreeNode[] {
 
 export function hasTablePartitionGroups(node: TreeNode): boolean {
   return partitionGroupChildren(node).length > 0;
+}
+
+export type TableTreeLoadMoreParent = {
+  schema?: string | null;
+  name: string;
+};
+
+function findTableTreeNode(nodes: readonly TreeNode[], parent: TableTreeLoadMoreParent): TreeNode | undefined {
+  for (const node of nodes) {
+    const sameSchema = !parent.schema || (node.schema || "").toLowerCase() === parent.schema.toLowerCase();
+    if (node.type === "table" && sameSchema && node.label.toLowerCase() === parent.name.toLowerCase()) return node;
+
+    const child = findTableTreeNode(node.children ?? [], parent);
+    if (child) return child;
+    const hiddenChild = findTableTreeNode(node.hiddenChildren?.filter((item) => !(node.children ?? []).includes(item)) ?? [], parent);
+    if (hiddenChild) return hiddenChild;
+  }
+  return undefined;
+}
+
+export function appendTableTreeLoadMoreNode(children: TreeNode[], loadMoreNode: TreeNode, parent?: TableTreeLoadMoreParent): TreeNode[] {
+  const parentNode = parent ? findTableTreeNode(children, parent) : undefined;
+  // Only TDengine pages are scoped to a STABLE's child-table group. PostgreSQL
+  // paginates the whole schema, so nesting its global cursor under whichever
+  // partition happens to end the page can hide all remaining schema objects.
+  const childGroup = parentNode && isSuperTable(parentNode) ? tablePartitionGroups(parentNode)[0] : undefined;
+  if (!childGroup) return [...children, loadMoreNode];
+
+  childGroup.children = [...(childGroup.children ?? []), loadMoreNode];
+  return children;
+}
+
+export function withoutTableTreeLoadMoreNodes(nodes: TreeNode[] | undefined): TreeNode[] {
+  return (nodes ?? [])
+    .filter((node) => node.type !== "load-more")
+    .map((node) => {
+      if (node.children) node.children = withoutTableTreeLoadMoreNodes(node.children);
+      if (node.hiddenChildren) node.hiddenChildren = withoutTableTreeLoadMoreNodes(node.hiddenChildren);
+      return node;
+    });
 }
 
 export function mergeTableTreePageChildren(currentChildren: TreeNode[], pageChildren: TreeNode[], connectionId: string, database: string): TreeNode[] {
@@ -351,14 +405,14 @@ export function mergeTableTreePageChildren(currentChildren: TreeNode[], pageChil
     if (existing) return existing;
     const group: TreeNode = {
       id: `${parent.id}:__partitions`,
-      label: "tree.partitions",
+      label: childTableGroupLabel(parent),
       type: "group-partitions",
       connectionId,
       database,
       schema: parent.schema,
       tableName: parent.label,
       objectCount: 0,
-      isExpanded: false,
+      isExpanded: isSuperTable(parent),
       children: [],
     };
     parent.children = [...(parent.children ?? []), group];
@@ -450,7 +504,7 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
 
   for (const obj of objects) {
     const objectType = normalizeObjectType(obj.object_type);
-    if (!["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"].includes(objectType)) {
+    if (!["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY"].includes(objectType)) {
       continue;
     }
 
@@ -458,7 +512,8 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
     if (!name) continue;
 
     const childSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;
-    const dedupeKey = `${objectType}\0${(childSchema || "").toLowerCase()}\0${name.toLowerCase()}`;
+    const signature = obj.signature?.trim() || "";
+    const dedupeKey = `${objectType}\0${(childSchema || "").toLowerCase()}\0${name.toLowerCase()}\0${signature.toLowerCase()}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
@@ -479,10 +534,13 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
     } else {
       const simpleNodeType = simpleObjectNodeType(objectType);
       objectNodes.push({
-        id: objectType === "VIEW" || objectType === "MATERIALIZED_VIEW" ? entry.node.id : `${nodeId}:${childSchema ? `${childSchema}:` : ""}${name}:${objectType}`,
-        label: name,
+        id: objectType === "VIEW" || objectType === "MATERIALIZED_VIEW" ? entry.node.id : `${nodeId}:${childSchema ? `${childSchema}:` : ""}${name}:${signature}:${objectType}`,
+        label: signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `${name}(${signature})` : name,
         type: simpleNodeType,
+        objectName: name,
+        signature: signature || undefined,
         comment: obj.comment,
+        valid: obj.valid ?? undefined,
         connectionId,
         database,
         schema: childSchema,
@@ -500,9 +558,12 @@ function simpleObjectNodeType(objectType: DatabaseObjectTreeKind): TreeNodeType 
   if (objectType === "MATERIALIZED_VIEW") return "materialized_view";
   if (objectType === "PROCEDURE") return "procedure";
   if (objectType === "FUNCTION") return "function";
+  if (objectType === "TRIGGER") return "trigger";
   if (objectType === "SEQUENCE") return "sequence";
   if (objectType === "PACKAGE_BODY") return "package-body";
   if (objectType === "PACKAGE") return "package";
+  if (objectType === "TYPE_BODY") return "type-body";
+  if (objectType === "TYPE") return "type";
   return "table";
 }
 
@@ -541,6 +602,13 @@ const groupDefs: Array<{
     childType: "function",
   },
   {
+    key: "__triggers",
+    label: "tree.triggers",
+    objectTypes: ["TRIGGER"],
+    nodeType: "group-triggers",
+    childType: "trigger",
+  },
+  {
     key: "__sequences",
     label: "tree.sequences",
     objectTypes: ["SEQUENCE"],
@@ -554,9 +622,16 @@ const groupDefs: Array<{
     nodeType: "group-packages",
     childType: (objectType) => (objectType === "PACKAGE_BODY" ? "package-body" : "package"),
   },
+  {
+    key: "__types",
+    label: "tree.types",
+    objectTypes: ["TYPE", "TYPE_BODY"],
+    nodeType: "group-types",
+    childType: (objectType) => (objectType === "TYPE_BODY" ? "type-body" : "type"),
+  },
 ];
 
-const objectGroupNodeTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-packages"]);
+const objectGroupNodeTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-triggers", "group-sequences", "group-packages", "group-types"]);
 
 export function buildObjectGroupPlaceholderNodes({ nodeId, connectionId, database, schema, objectTypes }: { nodeId: string; connectionId: string; database: string; schema?: string; objectTypes: DatabaseObjectTreeKind[] }): TreeNode[] {
   const supported = new Set(objectTypes);
@@ -593,7 +668,8 @@ export function buildGroupedObjectTreeNodes({ nodeId, connectionId, database, sc
     if (!name) continue;
     const t = normalizeObjectType(obj.object_type);
     const objectSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema || "";
-    const key = `${t}\0${objectSchema.toLowerCase()}\0${name.toLowerCase()}`;
+    const signature = (obj.signature ?? "").trim();
+    const key = `${t}\0${objectSchema.toLowerCase()}\0${name.toLowerCase()}\0${signature.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
     const arr = buckets.get(t) ?? [];
@@ -619,12 +695,17 @@ export function buildGroupedObjectTreeNodes({ nodeId, connectionId, database, sc
           const childSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;
           const objectType = normalizeObjectType(obj.object_type);
           const childType = typeof def.childType === "function" ? def.childType(objectType) : def.childType;
-          const objectTypeSuffix = objectType === "PACKAGE" || objectType === "PACKAGE_BODY" ? `:${objectType}` : "";
+          const objectTypeSuffix = objectType === "PACKAGE" || objectType === "PACKAGE_BODY" || objectType === "TYPE" || objectType === "TYPE_BODY" ? `:${objectType}` : "";
+          const signature = obj.signature?.trim() || "";
+          const signatureIdPart = signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `:${signature}` : "";
           return {
-            id: `${nodeId}:${def.key}:${childSchema ? `${childSchema}:` : ""}${obj.name}${objectTypeSuffix}`,
-            label: obj.name,
+            id: `${nodeId}:${def.key}:${childSchema ? `${childSchema}:` : ""}${obj.name}${signatureIdPart}${objectTypeSuffix}`,
+            label: signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `${obj.name}(${signature})` : obj.name,
             type: childType,
+            objectName: obj.name,
+            signature: signature || undefined,
             comment: obj.comment,
+            valid: obj.valid ?? undefined,
             connectionId,
             database,
             schema: childSchema,

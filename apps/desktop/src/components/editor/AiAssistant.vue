@@ -15,6 +15,7 @@ import {
   Copy,
   Database,
   FileCode,
+  FlaskConical,
   GitBranch,
   HelpCircle,
   History,
@@ -40,39 +41,45 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
-import { SearchableSelect } from "@/components/ui/searchable-select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useTheme } from "@/composables/useTheme";
-import { useSettingsStore, AI_PROVIDER_PRESETS, type AiProvider } from "@/stores/settingsStore";
+import { useSettingsStore, AI_PROVIDER_PRESETS, normalizeAiConfig } from "@/stores/settingsStore";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
+import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
 import { useQueryStore } from "@/stores/queryStore";
 import { useToast } from "@/composables/useToast";
 import { useNavigationTargets } from "@/composables/useNavigationTargets";
 import { buildAiContext, runAgentStream, isVectorDbType, isValidActionForMode, defaultActionForMode, type AiAction, type AiAssistantMode, type AiSqlFileContext } from "@/lib/ai/ai";
-import { formatAiModelOption } from "@/lib/ai/aiModelPresentation";
+import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
+import { normalizeClaudeCodeReasoningLevel } from "@/lib/ai/aiModelEffort";
+
 import type { AgentEvent } from "@/lib/backend/tauri";
 import { buildAiAgentPlan } from "@/lib/ai/aiAgentPlan";
+import { extractFirstSqlCodeBlock } from "@/lib/ai/aiSqlExecutionPolicy";
+import { productionContextForDatabase } from "@/lib/database/productionSafety";
+import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
 import { buildAiAgentStepItems, toolCallStepKey, upsertAgentStep, type AiAgentStepItem, type AiAgentStepTone } from "@/lib/ai/aiAgentStepPresentation";
 import { createAiShikiCodeHighlighter, type AiCodeHighlighter } from "@/lib/ai/aiCodeHighlighter";
 import { createAiMessageRenderer } from "@/lib/ai/aiMessageRender";
 import { formatAiInlineMarkdown, handleAiMarkdownLinkClick } from "@/lib/ai/aiMarkdown";
-import { aiCancelStream, aiListModels, saveAiConversation, loadAiConversations, deleteAiConversation, listSchemas, listTables, type AiConversation, type AiModelInfo } from "@/lib/backend/api";
+import { aiCancelStream, saveAiConversation, loadAiConversations, deleteAiConversation, listSchemas, listTables, type AiConversation } from "@/lib/backend/api";
 import type { AiMessage } from "@/lib/backend/api";
 import type { ConnectionConfig, QueryTab, SavedSqlFile, TableInfo } from "@/types/database";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import { decodeSelectableDatabaseValue, encodeSelectableDatabaseValue, formatDatabaseLabel, resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import ExplainPlanViewer from "@/components/explain/ExplainPlanViewer.vue";
-import { parseExplainResult, type ParsedExplainPlan } from "@/lib/diagram/explainPlan";
+import { parseExplainResult, parseOracleExplainText, type ParsedExplainPlan } from "@/lib/diagram/explainPlan";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { AI_TABLE_MENTION_CANDIDATE_LIMIT, AI_TABLE_MENTION_SCHEMA_LIMIT, filterAiTableMentionCandidates, formatAiTableMention, parseAiTableMentions, type AiTableMention } from "@/lib/ai/aiTableMentions";
 import { isAiPromptImeCompositionEvent, shouldSubmitAiPromptOnKeydown } from "@/lib/ai/aiPromptKeyboard";
 import { looksLikeActionProposal, containsChinese } from "@/lib/ai/aiProposalDetect";
 import { visibleToActualIndex } from "@/lib/ai/aiMessageEdit";
+import { shouldShowReasoningCharCount, reasoningCharCountClass } from "@/lib/ai/aiReasoningPresentation";
 
 const { t } = useI18n();
 const settings = useSettingsStore();
@@ -123,6 +130,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   replaceSql: [sql: string];
   executeSql: [sql: string];
+  tempRunSql: [sql: string];
   requestAutoExecuteSql: [sql: string];
   openExplainPlan: [sql: string];
   close: [];
@@ -159,6 +167,10 @@ const MESSAGE_SCROLL_BUTTON_HIDE_THRESHOLD_PX = 48;
 let messageScrollViewport: HTMLElement | null = null;
 let messageTouchStartY: number | null = null;
 let lastMessageScrollTop = 0;
+let assistantDeltaFrame: number | null = null;
+let pendingAssistantDelta = "";
+let pendingAssistantReasoning = "";
+let pendingAssistantIndex = -1;
 
 function startEditMessage(visibleIndex: number) {
   if (isGenerating.value) return;
@@ -187,7 +199,7 @@ function submitEdit(visibleIndex: number) {
   const actualIndex = visibleToActualIndex(messages.value, visibleIndex);
   if (actualIndex < 0) return;
   if (!props.connection || !props.tab) return;
-  if (!settings.isConfigured()) {
+  if (!settings.isConfigured) {
     toast(t("ai.noConfig"));
     return;
   }
@@ -214,72 +226,73 @@ function onEditKeydown(event: KeyboardEvent, visibleIndex: number) {
 }
 
 // Inline model selector
-const modelOptions = ref<AiModelInfo[]>([]);
-const modelLoading = ref(false);
-let modelRequestToken = 0;
 const providerSelectorOpen = ref(false);
+const modelSearchQuery = ref("");
 
-// Configured providers for quick switching
-const configuredProviders = computed(() => (Object.keys(AI_PROVIDER_PRESETS) as AiProvider[]).filter((p) => p !== settings.aiConfig.provider && settings.isAiProviderConfigured(p)));
-
-function handleProviderSwitch(provider: AiProvider) {
-  settings.updateAiConfig({ provider });
-  modelOptions.value = [];
-  providerSelectorOpen.value = false;
-}
-
-function normalizeModelOptions(models: AiModelInfo[]): AiModelInfo[] {
-  const seen = new Set<string>();
-  const normalized: AiModelInfo[] = [];
-  for (const model of models) {
-    const id = model.id?.trim();
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    normalized.push({ id, displayName: model.displayName?.trim() || undefined });
+// Configured providers for quick switching - get from aiConfigs
+const configuredProviders = computed(() => {
+  const providers = orderAiConfigsForDisplay(
+    settings.aiConfigs.filter((c) => {
+      // Check directly if config has required fields
+      const preset = AI_PROVIDER_PRESETS[c.provider];
+      if (c.provider === "codex-cli" || c.provider === "claude-code-cli") return true;
+      return !!c.endpoint?.trim() && !!c.model?.trim() && (!preset.requiresApiKey || !!c.apiKey?.trim());
+    }),
+  );
+  // Apply search filter - hide providers with no matching models
+  if (modelSearchQuery.value.trim()) {
+    const query = modelSearchQuery.value.trim().toLowerCase();
+    return providers.filter((c) => {
+      const models = getModelsForConfig(c.id);
+      return models.some((model) => model.toLowerCase().includes(query));
+    });
   }
-  return normalized;
-}
-
-async function fetchModelOptions() {
-  if (modelLoading.value) return;
-  if (!settings.isConfigured()) return;
-  const token = ++modelRequestToken;
-  modelLoading.value = true;
-  try {
-    const models = normalizeModelOptions(await aiListModels(settings.aiConfig));
-    if (token !== modelRequestToken) return;
-    modelOptions.value = models;
-  } catch {
-    if (token !== modelRequestToken) return;
-    modelOptions.value = [];
-  } finally {
-    if (token === modelRequestToken) modelLoading.value = false;
-  }
-}
-
-function handleModelSelect(modelId: string) {
-  settings.updateAiConfig({ model: modelId });
-}
-
-const modelOptionIds = computed(() => {
-  const currentModel = settings.aiConfig.model;
-  const ids = modelOptions.value.map((model) => model.id);
-  if (currentModel && !ids.includes(currentModel)) {
-    return [currentModel, ...ids];
-  }
-  return ids;
+  return providers;
 });
 
-function displayModelName(modelId: string) {
-  return modelOptions.value.find((model) => model.id === modelId)?.displayName || modelId;
+const activeFullConfig = computed(() => {
+  if (!settings.activeModel) return null;
+  const item = settings.aiConfigs.find((c) => c.id === settings.activeModel!.configId);
+  if (!item) return null;
+  const modelId = settings.activeModel.modelId;
+  const config = normalizeAiConfig({ ...item, model: modelId });
+  if (config.provider === "claude-code-cli") {
+    config.reasoningLevel = normalizeClaudeCodeReasoningLevel(
+      config.reasoningLevel,
+      item.models?.find((model) => model.name === modelId),
+    );
+  }
+  return config;
+});
+
+function getModelsForConfig(configId: string): string[] {
+  const config = settings.aiConfigs.find((c) => c.id === configId);
+  if (!config) return [];
+  const models = config.models?.map((m) => m.name) || [];
+  // Always include the current model
+  if (config.model && !models.includes(config.model)) {
+    return [config.model, ...models];
+  }
+  return models;
 }
 
-function modelOptionPresentation(modelId: string, label = displayModelName(modelId)) {
-  return formatAiModelOption(label, modelId);
+function getConfigModelOptionIds(configId: string): string[] {
+  const config = settings.aiConfigs.find((c) => c.id === configId);
+  if (!config) return [];
+  let models = getModelsForConfig(configId);
+  // Apply search filter
+  if (modelSearchQuery.value.trim()) {
+    const query = modelSearchQuery.value.trim().toLowerCase();
+    models = models.filter((model) => model.toLowerCase().includes(query));
+  }
+  return models;
 }
 
-function modelOptionSecondary(modelId: string, label = displayModelName(modelId)) {
-  return modelOptionPresentation(modelId, label).secondary;
+function handleModelSelect(configId: string, modelId: string) {
+  const config = settings.aiConfigs.find((c) => c.id === configId);
+  if (!config) return;
+  settings.updateActiveModel({ configId, modelId });
+  providerSelectorOpen.value = false;
 }
 
 /** Deferred context compaction info; applied after stream ends to avoid shifting assistantIdx. */
@@ -488,15 +501,30 @@ const proposalConfirmMessage = computed<ChatMessage | null>(() => {
   return null;
 });
 
+let allowWriteSqlForNextRun = false;
+
+const productionContext = computed(() => productionContextForDatabase(props.connection, props.tab?.database));
+
+function proposalContainsWriteSql(content: string) {
+  return /\b(insert|update|delete|replace|merge|create|alter|drop|truncate|rename|grant|revoke)\b/i.test(content);
+}
+
 function sendProposalReply(positive: boolean) {
   // Disable while a stream is in flight or no proposal is currently active.
   if (isGenerating.value) return;
   const target = proposalConfirmMessage.value;
   if (!target) return;
+  if (positive && productionContext.value.active && proposalContainsWriteSql(target.content)) {
+    const sql = extractFirstSqlCodeBlock(target.content);
+    if (sql) emit("replaceSql", sql);
+    toast(t("production.aiReviewRequired"), 5000);
+    return;
+  }
   const isZh = containsChinese(target.content || "");
   const replyZh = positive ? "请执行上面你刚提议的操作，不要再反问确认。" : "不用执行上面提到的操作，继续当前对话。";
   const replyEn = positive ? "Execute the action you just proposed above; do not ask for confirmation again." : "Do not execute the action mentioned above; continue the current conversation.";
   prompt.value = isZh ? replyZh : replyEn;
+  allowWriteSqlForNextRun = positive && assistantMode.value === "agent" && proposalContainsWriteSql(target.content);
   // Use the existing send pipeline so the message is added to history, persisted, etc.
   send();
 }
@@ -596,22 +624,44 @@ function changeDatabase(value: string) {
   queryStore.updateDatabase(tab.id, decodeSelectableDatabaseValue(connection.db_type, value));
 }
 
+function flushAssistantDeltas() {
+  assistantDeltaFrame = null;
+  const msg = messages.value[pendingAssistantIndex];
+  if (!msg) return;
+  if (pendingAssistantReasoning) {
+    msg.reasoning = (msg.reasoning || "") + pendingAssistantReasoning;
+    msg.isThinking = true;
+  }
+  if (pendingAssistantDelta) {
+    msg.isThinking = false;
+    msg.content += pendingAssistantDelta;
+  }
+  pendingAssistantDelta = "";
+  pendingAssistantReasoning = "";
+  scrollToBottom();
+}
+
+function scheduleAssistantDeltaFlush(assistantIdx: number) {
+  pendingAssistantIndex = assistantIdx;
+  if (assistantDeltaFrame !== null) return;
+  // Providers can emit many tiny chunks. Render once per animation frame so
+  // Markdown parsing, highlighting, and layout do not run for every token.
+  assistantDeltaFrame = requestAnimationFrame(flushAssistantDeltas);
+}
+
 function appendAssistantDelta(assistantIdx: number, delta: string) {
   const msg = messages.value[assistantIdx];
   if (msg.isThinking) msg.isThinking = false;
-  msg.content += delta;
-  scrollToBottom();
+  pendingAssistantDelta += delta;
+  scheduleAssistantDeltaFlush(assistantIdx);
 }
 
 function appendAssistantReasoning(assistantIdx: number, delta: string) {
-  const msg = messages.value[assistantIdx];
-  if (!msg.reasoning) msg.reasoning = "";
-  msg.reasoning += delta;
-  msg.isThinking = true;
-  scrollToBottom();
+  pendingAssistantReasoning += delta;
+  scheduleAssistantDeltaFlush(assistantIdx);
 }
 
-const expandedReasoning = ref<Set<number>>(new Set());
+const reasoningExpanded = ref(false);
 const expandedSteps = ref<Set<string>>(new Set());
 
 function toggleStep(key: string) {
@@ -674,6 +724,9 @@ function extractExplainData(result: unknown): unknown | undefined {
 
 /** Parse explain_data (a serialized QueryResult) into ParsedExplainPlan */
 function parseExplainFromData(explainData: unknown, dbType: string): ParsedExplainPlan | undefined {
+  if (dbType === "oracle" && typeof explainData === "string") {
+    return parseOracleExplainText(explainData);
+  }
   if (!explainData || typeof explainData !== "object") return undefined;
   const supportedTypes = ["mysql", "postgres", "dameng", "questdb"] as const;
   if (!supportedTypes.includes(dbType as (typeof supportedTypes)[number])) return undefined;
@@ -726,14 +779,8 @@ function agentEventToStep(event: AgentEvent, index: number): AiAgentStepItem | u
   };
 }
 
-function toggleReasoning(index: number) {
-  const next = new Set(expandedReasoning.value);
-  if (next.has(index)) {
-    next.delete(index);
-  } else {
-    next.add(index);
-  }
-  expandedReasoning.value = next;
+function toggleReasoning() {
+  reasoningExpanded.value = !reasoningExpanded.value;
 }
 
 function getMessageScrollViewport(): HTMLElement | null {
@@ -1339,7 +1386,7 @@ async function send() {
   if ((!text && !selectedMentions.value.length && !selectedSqlFileMentions.value.length) || isGenerating.value) return;
 
   if (!props.connection || !props.tab) return;
-  if (!settings.isConfigured()) {
+  if (!settings.isConfigured) {
     toast(t("ai.noConfig"));
     return;
   }
@@ -1364,6 +1411,9 @@ async function send() {
 
   const requestedAction = activeAction.value;
   const requestedMode = assistantMode.value;
+  // Agent confirmation cannot grant autonomous writes while the active database is production.
+  const allowWriteSql = requestedMode === "agent" && allowWriteSqlForNextRun && !productionContext.value.active;
+  allowWriteSqlForNextRun = false;
   isGenerating.value = true;
   messages.value.push({ role: "assistant", content: "" });
   const assistantIdx = messages.value.length - 1;
@@ -1380,11 +1430,12 @@ async function send() {
     const history: AiMessage[] = messagesForAgentHistory(messages.value.slice(0, -2));
     await runAgentStream(
       {
-        config: settings.aiConfig,
+        config: activeFullConfig.value!,
         action: requestedAction,
         mode: requestedMode,
         instruction: modelInstruction,
         context,
+        allowWriteSql,
       },
       history,
       (event: AgentEvent) => {
@@ -1426,6 +1477,8 @@ async function send() {
     const message = e instanceof Error ? e.message : String(e);
     messages.value[assistantIdx].content = `Error: ${message}`;
   } finally {
+    if (assistantDeltaFrame !== null) cancelAnimationFrame(assistantDeltaFrame);
+    flushAssistantDeltas();
     const msg = messages.value[assistantIdx];
     if (msg) msg.isThinking = false;
     isGenerating.value = false;
@@ -1446,6 +1499,7 @@ async function send() {
         instruction: modelInstruction,
         assistantContent: msg?.content || "",
         connection: props.connection,
+        database: props.tab?.database,
       });
       if (msg && requestedMode === "agent") msg.agentSteps = buildAiAgentStepItems(agentPlan);
       if (agentPlan.handoffSql) emit("requestAutoExecuteSql", agentPlan.handoffSql);
@@ -1481,8 +1535,11 @@ function applySql(code: string) {
 }
 
 function executeSql(code: string) {
-  emit("replaceSql", code);
   emit("executeSql", code);
+}
+
+function tempRunSql(code: string) {
+  emit("tempRunSql", code);
 }
 
 const copiedIndex = ref("");
@@ -1573,9 +1630,6 @@ onMounted(async () => {
     appearance: () => aiCodeAppearance.value,
   }).catch(() => undefined);
 
-  // Load available AI models for inline selector
-  fetchModelOptions();
-
   window.addEventListener("resize", handlePanelResize);
   if (typeof ResizeObserver !== "undefined" && assistantRootRef.value) {
     promptPanelResizeObserver = new ResizeObserver(handlePanelResize);
@@ -1634,6 +1688,7 @@ function stopResize() {
 }
 
 onUnmounted(() => {
+  if (assistantDeltaFrame !== null) cancelAnimationFrame(assistantDeltaFrame);
   clearTimeout(mentionTimer);
   cancelStream();
   detachMessageScrollListener();
@@ -1662,7 +1717,12 @@ function triggerAction(action: AiAction, instruction?: string) {
   send();
 }
 
-defineExpose({ triggerAction });
+function setPrompt(text: string) {
+  prompt.value = text;
+  nextTick(() => promptTextareaRef.value?.focus());
+}
+
+defineExpose({ triggerAction, setPrompt });
 
 const messageRenderer = computed(() => {
   const appearance = aiCodeAppearance.value;
@@ -1693,6 +1753,7 @@ async function openExternalUrl(url: string) {
       <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-tauri-drag-region>
         {{ chatTitle }}
       </span>
+      <ProductionContextBadge v-if="productionContext.active" compact />
       <Button variant="ghost" size="icon" class="h-6 w-6" @click="startNewChat" :title="t('ai.newChat')">
         <MessageSquarePlus class="h-3.5 w-3.5" />
       </Button>
@@ -1739,7 +1800,7 @@ async function openExternalUrl(url: string) {
         <div class="flex flex-col gap-3 p-3">
           <template v-for="(msg, i) in visibleMessages" :key="i">
             <div v-if="msg.role === 'user'" class="group flex justify-end">
-              <div class="min-w-0 max-w-[85%]" :class="{ 'w-[85%]': editingMessageIndex === i }">
+              <div class="relative min-w-0 max-w-[85%]" :class="{ 'w-[85%]': editingMessageIndex === i }">
                 <template v-if="editingMessageIndex === i">
                   <div v-if="editingMentions.length" class="mb-1.5 flex flex-wrap justify-end gap-1">
                     <button
@@ -1771,8 +1832,14 @@ async function openExternalUrl(url: string) {
                   </div>
                 </template>
                 <template v-else>
-                  <div class="flex items-start gap-1">
-                    <button v-if="!isGenerating" class="mt-1 hidden h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground group-hover:flex" :title="t('ai.editMessage')" @click="startEditMessage(i)">
+                  <div class="min-w-0">
+                    <!-- Keep the hover action out of normal flow so message wrapping stays stable. -->
+                    <button
+                      v-if="!isGenerating"
+                      class="pointer-events-none absolute right-full top-1 mr-1 flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground focus:pointer-events-auto focus:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+                      :title="t('ai.editMessage')"
+                      @click="startEditMessage(i)"
+                    >
                       <Pencil class="h-3 w-3" />
                     </button>
                     <div class="min-w-0 rounded-lg bg-primary px-3 py-2 text-xs text-primary-foreground">
@@ -1800,16 +1867,17 @@ async function openExternalUrl(url: string) {
             <div v-else-if="msg.content || msg.reasoning || msg.isThinking" class="flex">
               <div class="max-w-[95%] min-w-0 rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed">
                 <div v-if="msg.reasoning || msg.isThinking" class="mb-2">
-                  <button class="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" @click="toggleReasoning(i)">
-                    <ChevronRight class="h-3 w-3 transition-transform duration-200" :class="{ 'rotate-90': expandedReasoning.has(i) || msg.isThinking }" />
+                  <button class="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" @click="toggleReasoning()">
+                    <ChevronRight class="h-3 w-3 transition-transform duration-200" :class="{ 'rotate-90': reasoningExpanded }" />
                     <Loader2 v-if="msg.isThinking" class="h-3 w-3 animate-spin" />
                     <span>{{ t("ai.reasoningProcess") }}</span>
+                    <span v-if="shouldShowReasoningCharCount(msg.reasoning, reasoningExpanded)" :class="reasoningCharCountClass(!!msg.isThinking)">{{ msg.reasoning?.length ?? 0 }} {{ t("ai.chars") }}</span>
                   </button>
                   <div
                     class="overflow-hidden transition-[max-height,opacity] duration-200 ease-in-out"
                     :style="{
-                      maxHeight: expandedReasoning.has(i) || msg.isThinking ? '20000px' : '0px',
-                      opacity: expandedReasoning.has(i) || msg.isThinking ? '1' : '0',
+                      maxHeight: reasoningExpanded ? '20000px' : '0px',
+                      opacity: reasoningExpanded ? '1' : '0',
                     }"
                   >
                     <div class="mt-1.5 pl-4 border-l-2 border-muted-foreground/20 text-[11px] text-muted-foreground whitespace-pre-wrap">
@@ -1839,7 +1907,8 @@ async function openExternalUrl(url: string) {
                     </div>
                   </div>
                 </div>
-                <template v-for="(seg, j) in messageRenderer.render(msg.content)" :key="j">
+                <div v-if="isGenerating && msg === messages[messages.length - 1]" class="whitespace-pre-wrap break-words leading-relaxed">{{ msg.content }}</div>
+                <template v-else v-for="(seg, j) in messageRenderer.render(msg.content)" :key="j">
                   <div v-if="seg.type === 'text'" class="ai-markdown whitespace-normal" @click.capture="onMarkdownClick">
                     <div v-html="seg.html" />
                   </div>
@@ -1849,6 +1918,9 @@ async function openExternalUrl(url: string) {
                       <span>{{ seg.lang }}</span>
                       <span class="flex-1" />
                       <div class="flex items-center gap-1.5">
+                        <button v-if="seg.isSql" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.tempRunSql')" @click="tempRunSql(seg.content)">
+                          <FlaskConical class="h-3.5 w-3.5" />
+                        </button>
                         <button v-if="seg.isSql" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.executeSql')" @click="executeSql(seg.content)">
                           <Play class="h-3.5 w-3.5" />
                         </button>
@@ -1925,6 +1997,7 @@ async function openExternalUrl(url: string) {
                 <SelectItem v-for="conn in connectionStore.connections" :key="conn.id" :value="conn.id">
                   <div class="flex min-w-0 items-center gap-2">
                     <DatabaseIcon :db-type="connectionIconType(conn)" class="h-3.5 w-3.5 shrink-0" />
+                    <ConnectionGroupBadge :connection-id="conn.id" />
                     <span class="truncate">{{ conn.name }}</span>
                   </div>
                 </SelectItem>
@@ -2049,57 +2122,66 @@ async function openExternalUrl(url: string) {
               @update:model-value="(value) => selectAction(value as AiAction)"
             />
             <span class="min-w-0 flex-1" />
-            <template v-if="settings.isConfigured()">
+            <template v-if="settings.aiConfigs.length > 0">
               <!-- Combined provider + model selector -->
               <Popover v-model:open="providerSelectorOpen">
                 <PopoverTrigger as-child>
                   <button type="button" class="min-w-0 flex shrink items-center gap-1.5 max-w-[220px] rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground">
-                    <AiProviderLogo :provider="settings.aiConfig.provider" :label="AI_PROVIDER_PRESETS[settings.aiConfig.provider]?.label ?? settings.aiConfig.provider" :icon-slug="AI_PROVIDER_PRESETS[settings.aiConfig.provider]?.iconSlug" class="h-3 w-3 shrink-0" />
-                    <span class="min-w-0 truncate">{{ modelLoading ? t("ai.loadingModels") : settings.aiConfig.model }}</span>
+                    <AiProviderLogo
+                      :provider="activeFullConfig?.provider ?? 'claude'"
+                      :label="AI_PROVIDER_PRESETS[activeFullConfig?.provider ?? 'claude']?.label ?? activeFullConfig?.provider ?? 'claude'"
+                      :icon-slug="AI_PROVIDER_PRESETS[activeFullConfig?.provider ?? 'claude']?.iconSlug"
+                      class="h-3 w-3 shrink-0"
+                    />
+                    <span class="min-w-0 truncate">{{ activeFullConfig?.model || t("ai.selectModel") }}</span>
                     <svg class="h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>
                   </button>
                 </PopoverTrigger>
-                <PopoverContent align="end" class="w-72 gap-0 p-1.5" @open-auto-focus.prevent>
-                  <!-- Configured providers section -->
-                  <template v-if="configuredProviders.length">
-                    <p class="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{{ t("ai.switchProvider") }}</p>
-                    <button v-for="p in configuredProviders" :key="p" type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground" @click="handleProviderSwitch(p)">
-                      <AiProviderLogo :provider="p" :label="AI_PROVIDER_PRESETS[p]?.label ?? p" :icon-slug="AI_PROVIDER_PRESETS[p]?.iconSlug" class="h-3.5 w-3.5 shrink-0" />
-                      <span class="font-medium">{{ AI_PROVIDER_PRESETS[p]?.label ?? p }}</span>
-                      <span class="ml-auto min-w-0 truncate text-[11px] text-muted-foreground">{{ settings.aiProviderConfigs[p]?.model }}</span>
-                    </button>
-                    <div class="my-1 border-t" />
-                  </template>
-                  <!-- Model list for current provider -->
-                  <p class="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                    {{ AI_PROVIDER_PRESETS[settings.aiConfig.provider]?.label ?? settings.aiConfig.provider }}
-                  </p>
-                  <SearchableSelect
-                    :model-value="settings.aiConfig.model"
-                    :options="modelOptionIds"
-                    :placeholder="t('ai.browseModels')"
-                    :search-placeholder="t('ai.searchModels')"
-                    :empty-text="t('ai.modelListHint')"
-                    :loading-text="t('ai.loadingModels')"
-                    :loading="modelLoading"
-                    :display-name="displayModelName"
-                    trigger-class="w-full max-w-full justify-start rounded-sm px-2 py-1.5 text-xs text-foreground hover:bg-accent"
-                    content-class="w-72"
-                    item-class="h-auto min-h-8 px-2 py-1.5 text-xs"
-                    @update:model-value="handleModelSelect"
-                    @update:open="(open: boolean) => open && fetchModelOptions()"
-                  >
-                    <template #trigger-label="{ label, loading }">
-                      <AiProviderLogo :provider="settings.aiConfig.provider" :label="AI_PROVIDER_PRESETS[settings.aiConfig.provider]?.label ?? settings.aiConfig.provider" :icon-slug="AI_PROVIDER_PRESETS[settings.aiConfig.provider]?.iconSlug" class="h-3.5 w-3.5 shrink-0" />
-                      <span class="min-w-0 truncate">{{ loading ? t("ai.loadingModels") : label }}</span>
+                <PopoverContent
+                  align="end"
+                  class="w-80 gap-0 p-1.5"
+                  @open-auto-focus.prevent
+                  @update:open="
+                    (open: boolean) => {
+                      if (!open) modelSearchQuery = '';
+                    }
+                  "
+                >
+                  <!-- Search input -->
+                  <div class="relative px-1 pb-1">
+                    <Search class="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <input v-model="modelSearchQuery" type="text" :placeholder="t('ai.searchModels')" class="w-full rounded-sm border bg-background py-1.5 pl-7 pr-2 text-xs outline-none focus:ring-1 focus:ring-primary" @click.stop />
+                  </div>
+                  <!-- All configured providers with their models -->
+                  <div class="max-h-80 overflow-auto">
+                    <template v-for="config in configuredProviders" :key="config.id">
+                      <!-- Provider header -->
+                      <div class="flex items-center gap-2 rounded-sm px-2 py-1.5 text-xs" :class="config.id === settings.activeModel?.configId ? 'bg-accent text-accent-foreground' : 'text-foreground'">
+                        <AiProviderLogo :provider="config.provider" :label="AI_PROVIDER_PRESETS[config.provider]?.label ?? config.provider" :icon-slug="AI_PROVIDER_PRESETS[config.provider]?.iconSlug" class="h-3.5 w-3.5 shrink-0" />
+                        <span class="font-medium">{{ config.name }}</span>
+                        <span v-if="config.isDefault" class="ml-auto text-[10px] text-muted-foreground">{{ t("ai.default") }}</span>
+                      </div>
+                      <!-- No models hint -->
+                      <div v-if="!getConfigModelOptionIds(config.id).length" class="px-2 py-2 text-xs text-muted-foreground">
+                        {{ t("ai.noModel") }}
+                      </div>
+                      <!-- Model list -->
+                      <template v-else>
+                        <button
+                          v-for="modelId in getConfigModelOptionIds(config.id)"
+                          :key="modelId"
+                          type="button"
+                          class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+                          :class="modelId === settings.activeModel?.modelId && config.id === settings.activeModel?.configId ? 'bg-accent text-accent-foreground' : ''"
+                          @click="handleModelSelect(config.id, modelId)"
+                        >
+                          <span class="min-w-0 flex-1 truncate">{{ modelId }}</span>
+                          <Check v-if="modelId === settings.activeModel?.modelId && config.id === settings.activeModel?.configId" class="h-3.5 w-3.5 shrink-0 text-primary" />
+                        </button>
+                      </template>
+                      <div class="my-1 border-t" />
                     </template>
-                    <template #option-label="{ option, label }">
-                      <span class="flex min-w-0 flex-col leading-tight">
-                        <span class="truncate">{{ modelOptionPresentation(option, label).primary }}</span>
-                        <span v-if="modelOptionSecondary(option, label)" class="mt-0.5 truncate text-[11px] text-muted-foreground">{{ modelOptionSecondary(option, label) }}</span>
-                      </span>
-                    </template>
-                  </SearchableSelect>
+                  </div>
                 </PopoverContent>
               </Popover>
             </template>

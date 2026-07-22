@@ -25,6 +25,13 @@ export interface CanvasEditingCell {
   col: number;
 }
 
+/** 搜索匹配的数值 key：列头匹配 displayRow 为 -1。相比字符串拼接 key，
+ * 每次按键构建 matchSet、每帧对可见单元格查询都零字符串分配。
+ * ponytail: 列数上限 65536，网格列数远达不到 */
+export function dataGridSearchMatchKey(displayRow: number, col: number): number {
+  return (displayRow + 1) * 65536 + col;
+}
+
 export interface CanvasSearchMatch {
   kind: "cell" | "column";
   displayRow: number;
@@ -50,7 +57,7 @@ export interface DrawCanvasDataGridOptions {
   hoverCell: CanvasHoverCell | null;
   isScrolling: boolean;
   editingCell: CanvasEditingCell | null;
-  searchMatchKeys: ReadonlySet<string>;
+  searchMatchKeys: ReadonlySet<number>;
   currentSearchMatch: CanvasSearchMatch | null;
   formatCell: (value: CellValue, columnIndex: number) => string;
   draftCellPlaceholder?: string;
@@ -334,7 +341,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
       const isDirtyCell = item.isDirtyCol[actualColIdx];
       const selectedFillVisual = rowSelectionVisual || selectedCell;
       const selectedBorderVisual = rowSelectionVisual || selectedCell;
-      const isSearchMatch = paintSearchMatches && searchMatchKeys.has(`cell:${item.displayIndex}:${actualColIdx}`);
+      const isSearchMatch = paintSearchMatches && searchMatchKeys.has(dataGridSearchMatchKey(item.displayIndex, actualColIdx));
       const isCurrentSearchMatch = paintSearchMatches && currentSearchMatch?.displayRow === item.displayIndex && currentSearchMatch.col === actualColIdx;
       const clippedX = Math.max(drawX, rowNumberWidth);
       const cellPaintWidth = Math.min(width, drawX + colWidth) - clippedX;
@@ -381,16 +388,14 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
       ctx.font = value === null ? italicFont : tabularFont;
       setCanvasNumericVariant(ctx, value === null ? "normal" : "tabular-nums");
       const textLeft = alignCanvasPixel(drawX + 12, dpr);
-      const paddedMaxWidth = Math.max(0, drawX + colWidth - textLeft - 12);
+      const cellMaxWidth = Math.max(0, colWidth - 24);
       const isEditingThisCell = editingCell?.rowId === item.id && editingCell.col === actualColIdx;
       const rawDisplayText = item.isDraft && value === null ? (draftCellPlaceholder ?? "") : formatCell(value, actualColIdx);
       const displayText = isEditingThisCell ? "" : firstLineCellDisplayValue(rawDisplayText);
-      const needsTruncation = ctx.measureText(displayText).width > paddedMaxWidth;
-      const textMaxWidth = needsTruncation ? Math.max(0, drawX + colWidth - textLeft) : paddedMaxWidth;
-      const text = isEditingThisCell ? displayText : fitCanvasText(ctx, displayText, textMaxWidth - 12);
+      const text = isEditingThisCell ? displayText : fitCanvasText(ctx, displayText, cellMaxWidth);
       ctx.fillText(text, textLeft, textY);
       if (item.isDeleted && text) {
-        const textWidth = Math.min(ctx.measureText(text).width, textMaxWidth);
+        const textWidth = ctx.measureText(text).width;
         ctx.strokeStyle = theme.foreground;
         ctx.beginPath();
         ctx.moveTo(textLeft, textY);

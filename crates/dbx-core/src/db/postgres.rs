@@ -21,7 +21,7 @@ use tokio_postgres::{NoTls, Row, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
 use super::file_validator::validate_file_path;
-use crate::query::DbOperationBudget;
+use crate::query::{await_stream_with_progress_timeout, DbOperationBudget, StreamProgressClock};
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
@@ -304,123 +304,195 @@ fn format_pg_timestamptz(value: DateTime<Local>) -> String {
     value.to_rfc3339()
 }
 
-pub(crate) fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value {
+/// 时间类型解码失败后的回退目标，与原 if 链中时间分支之后的匹配顺序一一对应。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PgTemporalFallback {
+    /// 数组类型名（下划线开头）落到通用数组解码。
+    GenericArray,
+    /// `VECTOR(...)` 形式的类型名落到 pgvector 解码。
+    Vector,
+    /// 其余落到通用试探链。
+    Probe,
+}
+
+/// 每列一次的类型分类结果，避免在逐单元格路径上重复 `to_uppercase` 与字符串比较链。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PgColType {
+    Bytea,
+    Json,
+    Bool,
+    Temporal { fallback: PgTemporalFallback },
+    Numeric,
+    Uuid,
+    Inet { cidr: bool },
+    MacAddr,
+    BitString,
+    TsVector,
+    SystemU32,
+    InetArray { cidr: bool },
+    MacAddrArray,
+    BitStringArray,
+    GenericArray,
+    Vector,
+    Geometry,
+    Other,
+}
+
+pub(crate) fn classify_pg_type(type_name: &str) -> PgColType {
     let upper = type_name.to_uppercase();
 
     if upper == "BYTEA" {
-        return row
-            .try_get::<_, Vec<u8>>(idx)
-            .map(|bytes| super::binary_value_to_json(&bytes))
-            .unwrap_or(serde_json::Value::Null);
+        return PgColType::Bytea;
     }
-
     if upper == "JSON" || upper == "JSONB" {
-        if let Ok(v) = row.try_get::<_, serde_json::Value>(idx) {
-            return serde_json::Value::String(v.to_string());
-        }
-        if let Ok(v) = row.try_get::<_, String>(idx) {
-            return serde_json::Value::String(v);
-        }
-        return serde_json::Value::Null;
+        return PgColType::Json;
     }
-
     if upper == "BOOL" {
-        return row.try_get::<_, bool>(idx).map(serde_json::Value::Bool).unwrap_or(serde_json::Value::Null);
+        return PgColType::Bool;
     }
-
     if upper.contains("TIMESTAMP")
         || upper == "DATE"
         || upper == "TIME"
         || upper == "TIMETZ"
         || upper.contains("INTERVAL")
     {
-        if let Some(v) = pg_temporal_to_json_value(row, idx) {
-            return v;
-        }
+        let fallback = if upper.starts_with('_') {
+            PgTemporalFallback::GenericArray
+        } else if upper.starts_with("VECTOR(") {
+            PgTemporalFallback::Vector
+        } else {
+            PgTemporalFallback::Probe
+        };
+        return PgColType::Temporal { fallback };
     }
-
     if upper == "NUMERIC" || upper == "DECIMAL" || upper == "MONEY" {
-        return row
+        return PgColType::Numeric;
+    }
+    if upper == "UUID" {
+        return PgColType::Uuid;
+    }
+    if matches!(upper.as_str(), "INET" | "CIDR") {
+        return PgColType::Inet { cidr: upper == "CIDR" };
+    }
+    if matches!(upper.as_str(), "MACADDR" | "MACADDR8") {
+        return PgColType::MacAddr;
+    }
+    if matches!(upper.as_str(), "BIT" | "VARBIT") {
+        return PgColType::BitString;
+    }
+    if upper == "TSVECTOR" {
+        return PgColType::TsVector;
+    }
+    if matches!(upper.as_str(), "OID" | "XID" | "CID") {
+        return PgColType::SystemU32;
+    }
+    if matches!(upper.as_str(), "_INET" | "_CIDR") {
+        return PgColType::InetArray { cidr: upper == "_CIDR" };
+    }
+    if matches!(upper.as_str(), "_MACADDR" | "_MACADDR8") {
+        return PgColType::MacAddrArray;
+    }
+    if matches!(upper.as_str(), "_BIT" | "_VARBIT") {
+        return PgColType::BitStringArray;
+    }
+    if upper.starts_with('_') {
+        return PgColType::GenericArray;
+    }
+    if upper == "VECTOR" || upper.starts_with("VECTOR(") {
+        return PgColType::Vector;
+    }
+    if upper == "GEOMETRY" || upper == "GEOGRAPHY" {
+        return PgColType::Geometry;
+    }
+    PgColType::Other
+}
+
+pub(crate) fn classify_pg_column_types(column_types: &[String]) -> Vec<PgColType> {
+    column_types.iter().map(|type_name| classify_pg_type(type_name)).collect()
+}
+
+pub(crate) fn pg_value_to_json_classified(row: &Row, idx: usize, col_type: PgColType) -> serde_json::Value {
+    match col_type {
+        PgColType::Bytea => row
+            .try_get::<_, Vec<u8>>(idx)
+            .map(|bytes| super::binary_value_to_json(&bytes))
+            .unwrap_or(serde_json::Value::Null),
+        PgColType::Json => {
+            if let Ok(v) = row.try_get::<_, serde_json::Value>(idx) {
+                return serde_json::Value::String(v.to_string());
+            }
+            if let Ok(v) = row.try_get::<_, String>(idx) {
+                return serde_json::Value::String(v);
+            }
+            serde_json::Value::Null
+        }
+        PgColType::Bool => row.try_get::<_, bool>(idx).map(serde_json::Value::Bool).unwrap_or(serde_json::Value::Null),
+        PgColType::Temporal { fallback } => {
+            if let Some(v) = pg_temporal_to_json_value(row, idx) {
+                return v;
+            }
+            match fallback {
+                PgTemporalFallback::GenericArray => pg_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null),
+                PgTemporalFallback::Vector => pg_vector_value_to_json(row, idx),
+                PgTemporalFallback::Probe => pg_fallback_value_to_json(row, idx),
+            }
+        }
+        PgColType::Numeric => row
             .try_get::<_, Decimal>(idx)
             .map(|v: Decimal| serde_json::Value::String(v.to_string()))
-            .unwrap_or(serde_json::Value::Null);
-    }
-
-    if upper == "UUID" {
-        return row
+            .unwrap_or(serde_json::Value::Null),
+        PgColType::Uuid => row
             .try_get::<_, uuid::Uuid>(idx)
             .map(|v| serde_json::Value::String(v.to_string()))
-            .unwrap_or(serde_json::Value::Null);
-    }
-
-    if matches!(upper.as_str(), "INET" | "CIDR") {
-        return pg_network_address_to_json_value(row, idx, upper == "CIDR").unwrap_or(serde_json::Value::Null);
-    }
-
-    if matches!(upper.as_str(), "MACADDR" | "MACADDR8") {
-        return pg_macaddr_to_json_value(row, idx).unwrap_or(serde_json::Value::Null);
-    }
-
-    if matches!(upper.as_str(), "BIT" | "VARBIT") {
-        return pg_bit_string_to_json_value(row, idx).unwrap_or(serde_json::Value::Null);
-    }
-
-    if upper == "TSVECTOR" {
-        return row
+            .unwrap_or(serde_json::Value::Null),
+        PgColType::Inet { cidr } => pg_network_address_to_json_value(row, idx, cidr).unwrap_or(serde_json::Value::Null),
+        PgColType::MacAddr => pg_macaddr_to_json_value(row, idx).unwrap_or(serde_json::Value::Null),
+        PgColType::BitString => pg_bit_string_to_json_value(row, idx).unwrap_or(serde_json::Value::Null),
+        PgColType::TsVector => row
             .try_get::<_, PgRawBytes>(idx)
             .ok()
             .and_then(|raw| decode_tsvector_bytes(&raw.0))
             .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null);
-    }
-
-    if matches!(upper.as_str(), "OID" | "XID" | "CID") {
-        return pg_system_u32_to_json(row, idx).unwrap_or(serde_json::Value::Null);
-    }
-
-    if matches!(upper.as_str(), "_INET" | "_CIDR") {
-        return pg_network_address_array_to_json_value(row, idx, upper == "_CIDR").unwrap_or(serde_json::Value::Null);
-    }
-
-    if matches!(upper.as_str(), "_MACADDR" | "_MACADDR8") {
-        return pg_macaddr_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null);
-    }
-
-    if matches!(upper.as_str(), "_BIT" | "_VARBIT") {
-        return pg_bit_string_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null);
-    }
-
-    if upper.starts_with('_') {
-        return pg_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null);
-    }
-
-    if upper == "VECTOR" || upper.starts_with("VECTOR(") {
-        if let Ok(PgRawBytes(raw)) = row.try_get::<_, PgRawBytes>(idx) {
-            if let Some(floats) = decode_pgvector_bytes(&raw) {
-                return serde_json::Value::Array(
-                    floats
-                        .into_iter()
-                        .map(|v| {
-                            serde_json::Number::from_f64((v as f64 * 1_000_000.0).round() / 1_000_000.0)
-                                .map(serde_json::Value::Number)
-                                .unwrap_or(serde_json::Value::Null)
-                        })
-                        .collect(),
-                );
+            .unwrap_or(serde_json::Value::Null),
+        PgColType::SystemU32 => pg_system_u32_to_json(row, idx).unwrap_or(serde_json::Value::Null),
+        PgColType::InetArray { cidr } => {
+            pg_network_address_array_to_json_value(row, idx, cidr).unwrap_or(serde_json::Value::Null)
+        }
+        PgColType::MacAddrArray => pg_macaddr_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null),
+        PgColType::BitStringArray => pg_bit_string_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null),
+        PgColType::GenericArray => pg_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null),
+        PgColType::Vector => pg_vector_value_to_json(row, idx),
+        PgColType::Geometry => {
+            if let Ok(PgRawBytes(raw)) = row.try_get::<_, PgRawBytes>(idx) {
+                return super::wkb::wkb_to_wkt(&raw)
+                    .map(serde_json::Value::String)
+                    .unwrap_or_else(|| super::binary_value_to_json(&raw));
             }
+            serde_json::Value::Null
         }
-        return serde_json::Value::Null;
+        PgColType::Other => pg_fallback_value_to_json(row, idx),
     }
+}
 
-    if upper == "GEOMETRY" || upper == "GEOGRAPHY" {
-        if let Ok(PgRawBytes(raw)) = row.try_get::<_, PgRawBytes>(idx) {
-            return super::wkb::wkb_to_wkt(&raw)
-                .map(serde_json::Value::String)
-                .unwrap_or_else(|| super::binary_value_to_json(&raw));
+/// Serialize a pgvector `vector` component with f32 shortest round-trip decimal text.
+///
+/// Casting through `f64` (or fixed fractional rounding) either expands binary noise or
+/// truncates remaining single-precision digits; formatting via `f32` display keeps the
+/// full float4 value that pgvector stores.
+fn pg_vector_element_number(v: f32) -> serde_json::Value {
+    v.to_string().parse().map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+}
+
+fn pg_vector_value_to_json(row: &Row, idx: usize) -> serde_json::Value {
+    if let Ok(PgRawBytes(raw)) = row.try_get::<_, PgRawBytes>(idx) {
+        if let Some(floats) = decode_pgvector_bytes(&raw) {
+            return serde_json::Value::Array(floats.into_iter().map(pg_vector_element_number).collect());
         }
-        return serde_json::Value::Null;
     }
+    serde_json::Value::Null
+}
 
+fn pg_fallback_value_to_json(row: &Row, idx: usize) -> serde_json::Value {
     row.try_get::<_, String>(idx)
         .map(serde_json::Value::String)
         .or_else(|e| pg_system_u32_to_json(row, idx).ok_or(e))
@@ -630,6 +702,7 @@ async fn execute_select_prepared(
     );
     let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
     let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
+    let column_classes = classify_pg_column_types(&column_types);
 
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
     let query_start = Instant::now();
@@ -653,7 +726,9 @@ async fn execute_select_prepared(
         let row = row_result?;
         result_rows.push(
             (0..row.columns().len())
-                .map(|i| pg_value_to_json(&row, i, column_types.get(i).map(String::as_str).unwrap_or("")))
+                .map(|i| {
+                    pg_value_to_json_classified(&row, i, column_classes.get(i).copied().unwrap_or(PgColType::Other))
+                })
                 .collect(),
         );
     }
@@ -785,6 +860,7 @@ async fn stream_select_query_prepared(
         client.prepare_cached(sql).await.map_err(|err| PostgresQueryStreamError::Postgres { err, emitted: false })?;
     let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
     let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
+    let column_classes = classify_pg_column_types(&column_types);
 
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
     let stream = client
@@ -806,7 +882,7 @@ async fn stream_select_query_prepared(
             columns_emitted = true;
         }
         let values = (0..row.columns().len())
-            .map(|i| pg_value_to_json(&row, i, column_types.get(i).map(String::as_str).unwrap_or("")))
+            .map(|i| pg_value_to_json_classified(&row, i, column_classes.get(i).copied().unwrap_or(PgColType::Other)))
             .collect();
         on_item(PostgresQueryStreamItem::Row(values)).map_err(PostgresQueryStreamError::Export)?;
         rows_streamed += 1;
@@ -915,6 +991,7 @@ async fn stream_query_rows_on_client(
 ) -> Result<u64, String> {
     let stmt = client.prepare_cached(sql).await.map_err(pg_error_to_string)?;
     let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
+    let column_classes = classify_pg_column_types(&column_types);
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
     let stream = client.query_raw(&stmt, params).await.map_err(pg_error_to_string)?;
     tokio::pin!(stream);
@@ -930,7 +1007,7 @@ async fn stream_query_rows_on_client(
         }
         let row = row_result.map_err(pg_error_to_string)?;
         let values: Vec<serde_json::Value> = (0..row.columns().len())
-            .map(|i| pg_value_to_json(&row, i, column_types.get(i).map(String::as_str).unwrap_or("")))
+            .map(|i| pg_value_to_json_classified(&row, i, column_classes.get(i).copied().unwrap_or(PgColType::Other)))
             .collect();
         on_row(&values)?;
         rows_exported += 1;
@@ -974,18 +1051,28 @@ async fn stream_query_rows_text_on_client(
 }
 
 pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, String> {
+    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
+    connect_with_local_timezone(url, fallback_timeout, &timezone).await
+}
+
+async fn connect_with_local_timezone(url: &str, fallback_timeout: Duration, timezone: &str) -> Result<Pool, String> {
     let url_with_keepalive = inject_postgres_keepalive_params(url);
     let postgres_url = postgres_connection_url(&url_with_keepalive)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
-    let tz = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
 
     super::with_connection_timeout("PostgreSQL", timeout, async {
         let pg_config = tokio_postgres::Config::from_str(&postgres_url.url)
             .map_err(|e| format!("Invalid PostgreSQL connection URL: {e}"))?;
 
-        let mgr_config = ManagerConfig { recycling_method: RecyclingMethod::Verified };
+        // Fast recycling only checks whether the connection is already closed
+        // instead of issuing a validation query on every checkout, saving one
+        // round-trip per query. Connections that went stale without being
+        // observed are caught when the query runs and recovered by the
+        // executor's ReconnectAndRetry path (see pool_error_action / do_execute
+        // in query.rs).
+        let mgr_config = ManagerConfig { recycling_method: RecyclingMethod::Fast };
         let tls_config = postgres_tls_config(
             &pg_config,
             &postgres_url.ssl_files,
@@ -1006,20 +1093,76 @@ pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, Stri
             .build()
             .map_err(|e| format!("Failed to create PostgreSQL pool: {e}"))?;
 
-        // Verify connectivity and set timezone. Only set timezone if the user
-        // hasn't already specified one via connection parameters (e.g. options=-c timezone=...)
+        // Verify connectivity and set timezone. Explicit connection options are
+        // handled by PostgreSQL during startup and must remain strict.
         let client =
             pool.get().await.map_err(|e| format!("PostgreSQL connection failed: {}", pg_pool_error_to_string(e)))?;
         if !pg_url_has_timezone_setting(url) {
-            client
-                .execute(&format!("SET timezone = '{}'", tz.replace('\'', "''")), &[])
-                .await
-                .map_err(|e| format!("PostgreSQL SET timezone failed: {e}"))?;
+            set_automatic_postgres_timezone(&client, timezone).await?;
         }
 
         Ok(pool)
     })
     .await
+}
+
+async fn set_automatic_postgres_timezone(client: &deadpool_postgres::Client, timezone: &str) -> Result<(), String> {
+    let candidates = postgres_timezone_candidates(timezone);
+    for (index, candidate) in candidates.iter().enumerate() {
+        let sql = format!("SET timezone = '{}'", candidate.replace('\'', "''"));
+        match client.execute(&sql, &[]).await {
+            Ok(_) => {
+                if *candidate != timezone {
+                    log::warn!(
+                        "PostgreSQL does not recognize local timezone '{timezone}'; using compatible alias '{candidate}'"
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) if postgres_timezone_error_is_nonfatal(&error) => {
+                let detail = pg_error_to_string(error);
+                if index + 1 == candidates.len() {
+                    // A connected server may have older tzdata or only partial PostgreSQL compatibility.
+                    // Keep its session default rather than making optional local display alignment fatal.
+                    log::warn!(
+                        "PostgreSQL connected, but automatic local timezone '{timezone}' was rejected; \
+                         keeping the server default timezone: {detail}"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                return Err(format!("PostgreSQL SET timezone failed after connecting: {}", pg_error_to_string(error)));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn postgres_timezone_error_is_nonfatal(error: &tokio_postgres::Error) -> bool {
+    let Some(db_error) = error.as_db_error() else {
+        return false;
+    };
+    // SET failures reported as ordinary SQL errors are optional session setup.
+    // FATAL/PANIC responses mean the connection itself is not safe to return.
+    !matches!(
+        db_error.parsed_severity(),
+        Some(tokio_postgres::error::Severity::Fatal | tokio_postgres::error::Severity::Panic)
+    ) && !matches!(db_error.severity().to_ascii_uppercase().as_str(), "FATAL" | "PANIC")
+}
+
+fn postgres_timezone_candidates(timezone: &str) -> Vec<&str> {
+    let legacy_alias = match timezone {
+        "Asia/Saigon" => Some("Asia/Ho_Chi_Minh"),
+        "Asia/Ho_Chi_Minh" => Some("Asia/Saigon"),
+        "Europe/Kyiv" => Some("Europe/Kiev"),
+        "Europe/Kiev" => Some("Europe/Kyiv"),
+        "Asia/Calcutta" => Some("Asia/Kolkata"),
+        "Asia/Kolkata" => Some("Asia/Calcutta"),
+        _ => None,
+    };
+    std::iter::once(timezone).chain(legacy_alias).collect()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1375,17 +1518,23 @@ impl ServerCertVerifier for PostgresCaOnlyCertVerification {
 /// Check whether the user's connection URL already specifies a timezone via
 /// the `options` parameter so we don't overwrite it with the local timezone.
 fn pg_url_has_timezone_setting(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    // Match "timezone=" anywhere after the query string, covering:
-    //   ?options=-c timezone=Asia/Shanghai
-    //   ?options=--timezone=UTC
-    // Also handles URL-encoded forms like timezone%3D
-    if let Some(query) = lower.split('?').nth(1) {
-        if query.contains("timezone=") || query.contains("timezone%3d") {
-            return true;
+    let Some(query) = url.split_once('?').map(|(_, query)| query.split('#').next().unwrap_or(query)) else {
+        return false;
+    };
+
+    query.split('&').any(|parameter| {
+        let (raw_key, raw_value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        let key = percent_decode_str(raw_key).decode_utf8_lossy();
+        if !key.eq_ignore_ascii_case("options") {
+            return false;
         }
-    }
-    false
+
+        let options = percent_decode_str(raw_value).decode_utf8_lossy().to_ascii_lowercase();
+        options.split_ascii_whitespace().any(|token| {
+            let option = token.trim_start_matches('-');
+            option.starts_with("timezone=") || option.starts_with("time_zone=")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1451,7 +1600,8 @@ pub async fn completion_assistant_search(
     pool: &Pool,
     request: &CompletionAssistantRequest,
 ) -> Result<CompletionAssistantResponse, String> {
-    let schema = request.schema.as_deref().or(request.parent_schema.as_deref()).unwrap_or("public");
+    let schema = request.schema.as_deref().or(request.parent_schema.as_deref());
+    let routine_schema = schema.unwrap_or("public");
     let limit = request.max_results.unwrap_or(100).clamp(1, 1000);
     let kinds = if request.object_kinds.is_empty() {
         vec![CompletionAssistantObjectKind::Table, CompletionAssistantObjectKind::View]
@@ -1521,7 +1671,7 @@ pub async fn completion_assistant_search(
         let rows = postgres_query_cached(
             &client,
             postgres_completion_routines_sql(),
-            &[&schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
+            &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -1547,10 +1697,23 @@ pub async fn completion_assistant_search(
     if candidates.len() < limit && kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Column)) {
         let table = request.parent_name.as_deref().unwrap_or("");
         if !table.is_empty() {
+            // Unqualified PostgreSQL objects resolve through search_path, so column
+            // metadata must use the same visible relation instead of assuming public.
+            let resolved_schema = match schema {
+                Some(schema) => Some(schema.to_string()),
+                None => postgres_query_cached(&client, postgres_visible_table_schema_sql(), &[&table])
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .first()
+                    .map(|row| pg_row_try_string(row, 0)),
+            };
+            let Some(resolved_schema) = resolved_schema else {
+                return Ok(CompletionAssistantResponse { incomplete: false, candidates, fallback_used: false });
+            };
             let rows = postgres_query_cached(
                 &client,
                 postgres_completion_columns_sql(),
-                &[&schema, &table, &pattern, &((limit - candidates.len()) as i64)],
+                &[&resolved_schema, &table, &pattern, &((limit - candidates.len()) as i64)],
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -1559,8 +1722,8 @@ pub async fn completion_assistant_search(
                     name: pg_row_try_string(&row, 0),
                     kind: CompletionAssistantCandidateKind::Column,
                     database: Some(request.database.clone()),
-                    schema: Some(schema.to_string()),
-                    parent_schema: Some(schema.to_string()),
+                    schema: Some(resolved_schema.clone()),
+                    parent_schema: Some(resolved_schema.clone()),
                     parent_name: Some(table.to_string()),
                     comment: row.try_get::<_, Option<String>>(2).ok().flatten(),
                     data_type: Some(pg_row_try_string(&row, 1)),
@@ -1583,7 +1746,9 @@ fn postgres_completion_tables_sql() -> &'static str {
      LEFT JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid \
      LEFT JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
      LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
-     WHERE n.nspname = $1 AND c.relkind = ANY($3) \
+     WHERE ($1::text IS NOT NULL AND n.nspname = $1 \
+            OR $1::text IS NULL AND pg_catalog.pg_table_is_visible(c.oid)) \
+       AND c.relkind::text = ANY($3::text[]) \
        AND ($2 = '%%' OR c.relname ILIKE $2 ESCAPE '~') \
      ORDER BY c.relname LIMIT $4"
 }
@@ -1593,7 +1758,7 @@ fn postgres_completion_routines_sql() -> &'static str {
             obj_description(p.oid) AS routine_comment, COALESCE(pg_get_function_result(p.oid), '') AS data_type \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-     WHERE n.nspname = $1 AND p.prokind = ANY($3) \
+     WHERE n.nspname = $1 AND p.prokind::text = ANY($3::text[]) \
        AND ($2 = '%%' OR p.proname ILIKE $2 ESCAPE '~') \
      ORDER BY p.proname LIMIT $4"
 }
@@ -1606,6 +1771,13 @@ fn postgres_completion_columns_sql() -> &'static str {
      WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
        AND ($3 = '%%' OR a.attname ILIKE $3 ESCAPE '~') \
      ORDER BY a.attnum LIMIT $4"
+}
+
+fn postgres_visible_table_schema_sql() -> &'static str {
+    "SELECT n.nspname FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE c.relname = $1 AND pg_catalog.pg_table_is_visible(c.oid) \
+     LIMIT 1"
 }
 
 fn postgres_completion_relkinds(kinds: &[CompletionAssistantObjectKind]) -> Vec<String> {
@@ -1665,6 +1837,10 @@ fn postgres_table_comment_sql() -> &'static str {
 }
 
 fn postgres_tables_sql() -> &'static str {
+    // PostgreSQL and Redshift can infer different wire types for LIMIT/OFFSET
+    // placeholders. Keep them explicit so the shared i64 parameters serialize reliably.
+    // Root relations must precede partition descendants so a large partition
+    // hierarchy cannot push unrelated schema tables into later sidebar pages.
     "SELECT c.relname AS table_name, \
          CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' \
            WHEN 'm' THEN 'MATERIALIZED_VIEW' WHEN 'f' THEN 'FOREIGN TABLE' \
@@ -1679,8 +1855,8 @@ fn postgres_tables_sql() -> &'static str {
          LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
          WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p') \
            AND ($2 = '%%' OR c.relname ILIKE $2 ESCAPE '~' OR ($3 <> '' AND c.relname ILIKE $3 ESCAPE '~')) \
-         ORDER BY c.relname \
-         LIMIT $4 OFFSET $5"
+         ORDER BY CASE WHEN pc.relkind = 'p' THEN 1 ELSE 0 END, c.relname \
+         LIMIT CAST($4 AS BIGINT) OFFSET CAST($5 AS BIGINT)"
 }
 
 fn like_contains_pattern(value: &str) -> String {
@@ -1777,7 +1953,7 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
          THEN pg_xact_commit_timestamp(p.xmin)::text END AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        CASE WHEN p.prokind = 'p' OR p.prosp THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -1791,7 +1967,7 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
        NULL::text AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        CASE WHEN p.prokind = 'p' OR p.prosp THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -1808,7 +1984,7 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
          THEN pg_xact_commit_timestamp(p.xmin)::text END AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        CASE p.prokind WHEN 'p' THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -1822,7 +1998,7 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
        NULL::text AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        CASE p.prokind WHEN 'p' THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -1839,7 +2015,7 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
          THEN pg_xact_commit_timestamp(p.xmin)::text END AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        CASE WHEN p.prosp THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -1853,7 +2029,7 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
        NULL::text AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        CASE WHEN p.prosp THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -1869,7 +2045,7 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
          THEN pg_xact_commit_timestamp(p.xmin)::text END AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        3 AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -1883,19 +2059,49 @@ fn list_object_routines_sql(include_timestamps: bool, has_proc_prokind: bool, ha
        NULL::text AS updated_at, \
        NULL::text AS parent_schema, \
        NULL::text AS parent_name, \
-       pg_get_function_arguments(p.oid) AS signature, \
+       pg_get_function_identity_arguments(p.oid) AS signature, \
        3 AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
      WHERE n.nspname = $1 AND NOT p.proisagg AND NOT p.proiswindow"
 }
 
-fn list_objects_sql(include_timestamps: bool, has_proc_prokind: bool, has_proc_prosp: bool) -> String {
-    format!(
+fn list_objects_sql(
+    include_timestamps: bool,
+    has_proc_prokind: bool,
+    has_proc_prosp: bool,
+    has_function_identity_arguments: bool,
+) -> String {
+    let sql = format!(
         "{} UNION ALL {} ORDER BY sort_order, object_name",
         list_object_relations_sql(include_timestamps),
         list_object_routines_sql(include_timestamps, has_proc_prokind, has_proc_prosp)
-    )
+    );
+    if has_function_identity_arguments {
+        sql
+    } else {
+        // Redshift and older PostgreSQL-compatible servers may only expose the
+        // older formatter. It includes argument names but still distinguishes
+        // overloads instead of making the whole schema browser unavailable.
+        sql.replace("pg_get_function_identity_arguments(p.oid)", "pg_get_function_arguments(p.oid)")
+    }
+}
+
+fn postgres_has_function_identity_arguments_sql() -> &'static str {
+    "SELECT EXISTS ( \
+       SELECT 1 \
+       FROM pg_catalog.pg_proc p \
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+       WHERE n.nspname = 'pg_catalog' \
+         AND p.proname = 'pg_get_function_identity_arguments' \
+     )"
+}
+
+async fn postgres_has_function_identity_arguments(client: &deadpool_postgres::Client) -> Result<bool, String> {
+    let row = postgres_query_one_cached(client, postgres_has_function_identity_arguments_sql(), &[])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
 fn postgres_proc_has_prokind_sql() -> &'static str {
@@ -1935,8 +2141,9 @@ async fn list_objects_rows(
     include_timestamps: bool,
     has_proc_prokind: bool,
     has_proc_prosp: bool,
+    has_function_identity_arguments: bool,
 ) -> Result<Vec<Row>, String> {
-    let sql = list_objects_sql(include_timestamps, has_proc_prokind, has_proc_prosp);
+    let sql = list_objects_sql(include_timestamps, has_proc_prokind, has_proc_prosp, has_function_identity_arguments);
     postgres_query_cached(client, &sql, &[&schema]).await.map_err(|e| e.to_string())
 }
 
@@ -1946,11 +2153,30 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
     // Some GaussDB-compatible catalogs expose prosp alongside, or instead of,
     // PostgreSQL 11's prokind. Treat prosp as an extra procedure signal.
     let has_proc_prosp = postgres_proc_has_prosp(&client).await?;
-    let rows = match list_objects_rows(&client, schema, true, has_proc_prokind, has_proc_prosp).await {
+    let has_function_identity_arguments = postgres_has_function_identity_arguments(&client).await?;
+    let rows = match list_objects_rows(
+        &client,
+        schema,
+        true,
+        has_proc_prokind,
+        has_proc_prosp,
+        has_function_identity_arguments,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(primary_error) => {
             log::debug!("[postgres][list_objects:timestamp-fallback] primary_error={}", primary_error);
-            match list_objects_rows(&client, schema, false, has_proc_prokind, has_proc_prosp).await {
+            match list_objects_rows(
+                &client,
+                schema,
+                false,
+                has_proc_prokind,
+                has_proc_prosp,
+                has_function_identity_arguments,
+            )
+            .await
+            {
                 Ok(rows) => rows,
                 Err(fallback_error) => {
                     return Err(format!("{primary_error}; timestamp fallback failed: {fallback_error}"));
@@ -1965,6 +2191,7 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
             name: pg_row_try_string(row, 0),
             object_type: pg_row_try_string(row, 1),
             schema: Some(schema.to_string()),
+            valid: None,
             comment: row.try_get::<_, Option<String>>(2).ok().flatten().filter(|s| !s.is_empty()),
             created_at: row.try_get::<_, Option<String>>(3).ok().flatten().filter(|s| !s.is_empty()),
             updated_at: row.try_get::<_, Option<String>>(4).ok().flatten().filter(|s| !s.is_empty()),
@@ -2193,6 +2420,7 @@ fn column_info_from_row(row: &Row) -> ColumnInfo {
         numeric_scale: row.try_get::<_, Option<i32>>(8).ok().flatten(),
         character_maximum_length: row.try_get::<_, Option<i32>>(9).ok().flatten(),
         enum_values: parse_enum_values_from_row(row, 10),
+        ..Default::default()
     }
 }
 
@@ -2328,15 +2556,27 @@ pub async fn stream_select_query_with_cancel(
     }
 
     let pg_cancel_token = client.cancel_token();
-    let result = wait_postgres_query(
-        pg_cancel_token,
-        cancel_context,
-        cancel_token,
-        budget.query_timeout,
-        budget.cancel_timeout,
-        stream_select_query_inner(&client, sql, row_limit, &mut on_item),
+    let query_timeout = budget.query_timeout;
+    let timeout_error =
+        format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs()));
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
+    let mut on_stream_item = |item| {
+        on_item(item)?;
+        progress_clock_for_stream.mark();
+        Ok(())
+    };
+    let result = await_stream_with_progress_timeout(
+        stream_select_query_inner(&client, sql, row_limit, &mut on_stream_item),
+        query_timeout,
+        progress_clock,
+        cancel_token.as_ref(),
+        timeout_error.clone(),
     )
     .await;
+    if result.as_ref().is_err_and(|error| error == &timeout_error || error == crate::query::QUERY_CANCELED) {
+        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), budget.cancel_timeout).await;
+    }
 
     if schema_was_set {
         let reset_result = reset_postgres_search_path(&client, budget.cleanup_timeout, start).await;
@@ -3081,6 +3321,53 @@ pub async fn list_extensions(pool: &Pool, schema: &str) -> Result<Vec<ExtensionI
         .collect())
 }
 
+fn list_extension_member_objects_sql() -> &'static str {
+    "SELECT 'RELATION'::text AS object_kind, c.relname, ''::text AS signature \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 \
+       AND EXISTS ( \
+         SELECT 1 FROM pg_catalog.pg_depend d \
+         WHERE d.classid = 'pg_catalog.pg_class'::regclass \
+           AND d.objid = c.oid \
+           AND d.refclassid = 'pg_catalog.pg_extension'::regclass \
+           AND d.deptype = 'e' \
+       ) \
+     UNION ALL \
+     SELECT 'FUNCTION'::text, p.proname, pg_get_function_identity_arguments(p.oid) \
+     FROM pg_catalog.pg_proc p \
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+     WHERE n.nspname = $1 \
+       AND EXISTS ( \
+         SELECT 1 FROM pg_catalog.pg_depend d \
+         WHERE d.classid = 'pg_catalog.pg_proc'::regclass \
+           AND d.objid = p.oid \
+           AND d.refclassid = 'pg_catalog.pg_extension'::regclass \
+           AND d.deptype = 'e' \
+       )"
+}
+
+pub async fn list_extension_member_objects(pool: &Pool, schema: &str) -> Result<Vec<(String, String, String)>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = match postgres_query_cached(&client, list_extension_member_objects_sql(), &[&schema]).await {
+        Ok(rows) => rows,
+        Err(primary_error) => {
+            // PostgreSQL-compatible servers before the identity-argument
+            // formatter can still be filtered using their legacy formatter.
+            let fallback_sql = list_extension_member_objects_sql()
+                .replace("pg_get_function_identity_arguments(p.oid)", "pg_get_function_arguments(p.oid)");
+            postgres_query_cached(&client, &fallback_sql, &[&schema])
+                .await
+                .map_err(|fallback_error| format!("{primary_error}; legacy fallback failed: {fallback_error}"))?
+        }
+    };
+
+    Ok(rows
+        .iter()
+        .map(|row| (pg_row_try_string(row, 0), pg_row_try_string(row, 1), pg_row_try_string(row, 2)))
+        .collect())
+}
+
 pub async fn list_available_extensions(pool: &Pool) -> Result<Vec<ExtensionInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let rows = postgres_query_cached(
@@ -3199,6 +3486,51 @@ mod tests {
     use std::process::Command;
     use std::time::Instant;
     use tokio_postgres::types::FromSql;
+
+    #[test]
+    fn classify_pg_type_covers_all_dispatch_branches() {
+        assert_eq!(classify_pg_type("bytea"), PgColType::Bytea);
+        assert_eq!(classify_pg_type("json"), PgColType::Json);
+        assert_eq!(classify_pg_type("JSONB"), PgColType::Json);
+        assert_eq!(classify_pg_type("bool"), PgColType::Bool);
+        assert_eq!(classify_pg_type("timestamp"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
+        assert_eq!(classify_pg_type("timestamptz"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
+        assert_eq!(classify_pg_type("date"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
+        assert_eq!(classify_pg_type("time"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
+        assert_eq!(classify_pg_type("timetz"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
+        assert_eq!(classify_pg_type("interval"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
+        // 时间数组类型名在原实现中先进时间分支、解码失败后落到通用数组分支
+        assert_eq!(classify_pg_type("_timestamp"), PgColType::Temporal { fallback: PgTemporalFallback::GenericArray });
+        assert_eq!(classify_pg_type("_interval"), PgColType::Temporal { fallback: PgTemporalFallback::GenericArray });
+        // 同时命中时间关键字与 VECTOR( 前缀的类型名，原实现时间解码失败后走 vector 分支
+        assert_eq!(classify_pg_type("vector(timestamp)"), PgColType::Temporal { fallback: PgTemporalFallback::Vector });
+        assert_eq!(classify_pg_type("numeric"), PgColType::Numeric);
+        assert_eq!(classify_pg_type("money"), PgColType::Numeric);
+        assert_eq!(classify_pg_type("uuid"), PgColType::Uuid);
+        assert_eq!(classify_pg_type("inet"), PgColType::Inet { cidr: false });
+        assert_eq!(classify_pg_type("cidr"), PgColType::Inet { cidr: true });
+        assert_eq!(classify_pg_type("macaddr"), PgColType::MacAddr);
+        assert_eq!(classify_pg_type("macaddr8"), PgColType::MacAddr);
+        assert_eq!(classify_pg_type("bit"), PgColType::BitString);
+        assert_eq!(classify_pg_type("varbit"), PgColType::BitString);
+        assert_eq!(classify_pg_type("tsvector"), PgColType::TsVector);
+        assert_eq!(classify_pg_type("oid"), PgColType::SystemU32);
+        assert_eq!(classify_pg_type("xid"), PgColType::SystemU32);
+        assert_eq!(classify_pg_type("_inet"), PgColType::InetArray { cidr: false });
+        assert_eq!(classify_pg_type("_cidr"), PgColType::InetArray { cidr: true });
+        assert_eq!(classify_pg_type("_macaddr"), PgColType::MacAddrArray);
+        assert_eq!(classify_pg_type("_bit"), PgColType::BitStringArray);
+        assert_eq!(classify_pg_type("_varbit"), PgColType::BitStringArray);
+        assert_eq!(classify_pg_type("_int4"), PgColType::GenericArray);
+        assert_eq!(classify_pg_type("_time"), PgColType::GenericArray);
+        assert_eq!(classify_pg_type("vector"), PgColType::Vector);
+        assert_eq!(classify_pg_type("vector(3)"), PgColType::Vector);
+        assert_eq!(classify_pg_type("geometry"), PgColType::Geometry);
+        assert_eq!(classify_pg_type("geography"), PgColType::Geometry);
+        assert_eq!(classify_pg_type("int4"), PgColType::Other);
+        assert_eq!(classify_pg_type("varchar"), PgColType::Other);
+        assert_eq!(classify_pg_type(""), PgColType::Other);
+    }
 
     struct DockerPostgres {
         name: String,
@@ -3342,6 +3674,57 @@ mod tests {
         ];
 
         assert_eq!(decode_tsvector_bytes(&raw).as_deref(), Some("'back\\\\slash':3B 'o''clock':1,2A"));
+    }
+
+    fn encode_pgvector_bytes(values: &[f32]) -> Vec<u8> {
+        let dims = u16::try_from(values.len()).expect("dim fits u16");
+        let mut raw = Vec::with_capacity(4 + values.len() * 4);
+        raw.extend_from_slice(&dims.to_be_bytes());
+        raw.extend_from_slice(&0u16.to_be_bytes());
+        for value in values {
+            raw.extend_from_slice(&value.to_be_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn decodes_pgvector_binary_output() {
+        let values = [0.1f32, -2.5f32, 1.2345679e-5f32];
+        let decoded = decode_pgvector_bytes(&encode_pgvector_bytes(&values)).expect("decode vector");
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn pgvector_element_number_round_trips_full_f32_precision() {
+        let values = [0.1f32, 0.12345679f32, 1.2345679e-5f32, -0.00012345679f32, 1.2345678f32, 1e20f32];
+
+        for value in values {
+            let json = pg_vector_element_number(value);
+            let text = json.to_string();
+            let restored: f32 = text.parse().expect("json number parses as f32");
+            let rounded_six = ((value as f64 * 1_000_000.0).round() / 1_000_000.0) as f32;
+
+            // Display text must recover the exact stored float4 bits.
+            assert_eq!(restored, value, "lost f32 precision for {value} -> {text}");
+            // Fixed 6-decimal rounding is what caused #3931; reject that path when it differs.
+            if rounded_six != value {
+                assert_ne!(restored, rounded_six, "still clamped to 6 decimals for {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn pgvector_binary_to_json_preserves_component_precision() {
+        let values = [0.12345679f32, 1.2345679e-5f32, -2.5f32];
+        let decoded = decode_pgvector_bytes(&encode_pgvector_bytes(&values)).expect("decode vector");
+        let json = serde_json::Value::Array(decoded.into_iter().map(pg_vector_element_number).collect());
+        let arr = json.as_array().expect("vector json array");
+
+        assert_eq!(arr.len(), values.len());
+        for (component, expected) in arr.iter().zip(values) {
+            let restored: f32 = component.to_string().parse().expect("component parses as f32");
+            assert_eq!(restored, expected);
+        }
     }
 
     fn decode_hex(hex: &str) -> Vec<u8> {
@@ -3765,6 +4148,18 @@ mod tests {
         assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("regclass"));
     }
 
+    #[test]
+    fn extension_member_query_filters_only_owned_relations_and_routines() {
+        let sql = list_extension_member_objects_sql();
+
+        assert!(sql.contains("d.classid = 'pg_catalog.pg_class'::regclass"));
+        assert!(sql.contains("d.classid = 'pg_catalog.pg_proc'::regclass"));
+        assert!(sql.contains("d.refclassid = 'pg_catalog.pg_extension'::regclass"));
+        assert!(sql.contains("d.deptype = 'e'"));
+        assert!(sql.contains("pg_get_function_identity_arguments(p.oid)"));
+        assert!(!sql.contains("d.deptype = 'x'"));
+    }
+
     #[tokio::test]
     async fn postgres_column_metadata_query_returns_enum_values_against_real_postgres() {
         let Some(container) = start_docker_postgres().await else {
@@ -3860,14 +4255,14 @@ mod tests {
 
     #[test]
     fn list_objects_sql_includes_routines() {
-        let sql = list_objects_sql(true, true, false);
+        let sql = list_objects_sql(true, true, false, true);
         assert!(sql.contains("pg_catalog.pg_class"));
         assert!(sql.contains("pg_catalog.pg_proc"));
         assert!(sql.contains("pg_catalog.pg_inherits"));
         assert!(sql.contains("parent_schema"));
         assert!(sql.contains("parent_name"));
         assert!(sql.contains("NULL::text AS signature"));
-        assert!(sql.contains("pg_get_function_arguments(p.oid) AS signature"));
+        assert!(sql.contains("pg_get_function_identity_arguments(p.oid) AS signature"));
         assert!(sql.contains("pc.relkind = 'p'"));
         assert!(sql.contains("pg_stat_file"));
         assert!(sql.contains("pg_xact_commit_timestamp"));
@@ -3877,68 +4272,83 @@ mod tests {
 
     #[test]
     fn list_objects_sql_without_timestamps_omits_stat_file() {
-        let sql = list_objects_sql(false, true, false);
+        let sql = list_objects_sql(false, true, false, true);
         assert!(!sql.contains("pg_stat_file"));
         assert!(sql.contains("NULL::text AS created_at"));
         assert!(sql.contains("NULL::text AS updated_at"));
     }
 
     #[test]
+    fn redshift_compatible_list_objects_sql_uses_legacy_argument_formatter() {
+        let sql = list_objects_sql(false, false, false, false);
+        assert!(sql.contains("pg_get_function_arguments(p.oid) AS signature"));
+        assert!(!sql.contains("pg_get_function_identity_arguments"));
+    }
+
+    #[test]
+    fn function_identity_arguments_probe_uses_pg_proc() {
+        let sql = postgres_has_function_identity_arguments_sql();
+        assert!(sql.contains("pg_catalog.pg_proc"));
+        assert!(sql.contains("n.nspname = 'pg_catalog'"));
+        assert!(sql.contains("p.proname = 'pg_get_function_identity_arguments'"));
+    }
+
+    #[test]
     fn both_list_objects_sql_variants_use_parameter() {
-        assert!(list_objects_sql(true, true, true).contains("$1"));
-        assert!(list_objects_sql(false, true, true).contains("$1"));
-        assert!(list_objects_sql(true, true, false).contains("$1"));
-        assert!(list_objects_sql(false, true, false).contains("$1"));
-        assert!(list_objects_sql(true, false, true).contains("$1"));
-        assert!(list_objects_sql(false, false, true).contains("$1"));
-        assert!(list_objects_sql(true, false, false).contains("$1"));
-        assert!(list_objects_sql(false, false, false).contains("$1"));
+        assert!(list_objects_sql(true, true, true, true).contains("$1"));
+        assert!(list_objects_sql(false, true, true, true).contains("$1"));
+        assert!(list_objects_sql(true, true, false, true).contains("$1"));
+        assert!(list_objects_sql(false, true, false, true).contains("$1"));
+        assert!(list_objects_sql(true, false, true, true).contains("$1"));
+        assert!(list_objects_sql(false, false, true, true).contains("$1"));
+        assert!(list_objects_sql(true, false, false, true).contains("$1"));
+        assert!(list_objects_sql(false, false, false, true).contains("$1"));
     }
 
     #[test]
     fn both_list_objects_sql_variants_include_pg_proc() {
-        assert!(list_objects_sql(true, true, true).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, true, true).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(true, false, true).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, false, true).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(true, false, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, true, true, true).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, true, true, true).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, true, false, true).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, true, false, true).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, false, true, true).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, false, true, true).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, false, false, true).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, false, false, true).contains("pg_catalog.pg_proc"));
     }
 
     #[test]
     fn legacy_list_objects_sql_avoids_pg11_proc_kind_column() {
-        let sql = list_objects_sql(true, false, false);
+        let sql = list_objects_sql(true, false, false, true);
         assert!(!sql.contains("p.prokind"));
         assert!(!sql.contains("p.prosp"));
         assert!(sql.contains("NOT p.proisagg"));
         assert!(sql.contains("NOT p.proiswindow"));
-        assert!(sql.contains("pg_get_function_arguments(p.oid) AS signature"));
+        assert!(sql.contains("pg_get_function_identity_arguments(p.oid) AS signature"));
         assert!(sql.contains("'FUNCTION' AS object_type"));
         assert!(!sql.contains("'PROCEDURE'"));
     }
 
     #[test]
     fn gaussdb_compatible_list_objects_sql_uses_prosp_when_prokind_is_missing() {
-        let sql = list_objects_sql(true, false, true);
+        let sql = list_objects_sql(true, false, true, true);
         assert!(!sql.contains("p.prokind"));
         assert!(sql.contains("CASE WHEN p.prosp THEN 'PROCEDURE' ELSE 'FUNCTION' END AS object_type"));
         assert!(sql.contains("CASE WHEN p.prosp THEN 2 ELSE 3 END AS sort_order"));
         assert!(sql.contains("NOT p.proisagg"));
         assert!(sql.contains("NOT p.proiswindow"));
-        assert!(sql.contains("pg_get_function_arguments(p.oid) AS signature"));
+        assert!(sql.contains("pg_get_function_identity_arguments(p.oid) AS signature"));
     }
 
     #[test]
     fn gaussdb_compatible_list_objects_sql_uses_prosp_with_prokind_when_available() {
-        let sql = list_objects_sql(true, true, true);
+        let sql = list_objects_sql(true, true, true, true);
         assert!(
             sql.contains("CASE WHEN p.prokind = 'p' OR p.prosp THEN 'PROCEDURE' ELSE 'FUNCTION' END AS object_type")
         );
         assert!(sql.contains("CASE WHEN p.prokind = 'p' OR p.prosp THEN 2 ELSE 3 END AS sort_order"));
         assert!(sql.contains("p.prokind IN ('p','f') OR p.prosp"));
-        assert!(sql.contains("pg_get_function_arguments(p.oid) AS signature"));
+        assert!(sql.contains("pg_get_function_identity_arguments(p.oid) AS signature"));
     }
 
     #[test]
@@ -4078,6 +4488,64 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_timezone_text_is_not_treated_as_explicit() {
+        assert!(!pg_url_has_timezone_setting("postgres://localhost/db?timezone=UTC"));
+        assert!(!pg_url_has_timezone_setting(
+            "postgres://localhost/db?application_name=timezone%3DUTC&options=-c%20search_path%3Dpublic"
+        ));
+    }
+
+    #[test]
+    fn postgres_timezone_candidates_include_known_tzdata_aliases() {
+        assert_eq!(postgres_timezone_candidates("Europe/Kyiv"), vec!["Europe/Kyiv", "Europe/Kiev"]);
+        assert_eq!(postgres_timezone_candidates("Asia/Kolkata"), vec!["Asia/Kolkata", "Asia/Calcutta"]);
+        assert_eq!(postgres_timezone_candidates("America/New_York"), vec!["America/New_York"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn automatic_invalid_timezone_keeps_connected_server_default() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect_with_local_timezone(&url, Duration::from_secs(5), "Invalid/DBX_Timezone")
+            .await
+            .expect("automatic local timezone rejection must not reject a valid connection");
+        let client = pool.get().await.expect("checkout postgres");
+        let timezone: String = client.query_one("SHOW timezone", &[]).await.unwrap().get(0);
+        assert_ne!(timezone, "Invalid/DBX_Timezone");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn explicit_timezone_remains_strict_and_overrides_local_timezone() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let explicit_url = format!("{url}{separator}options=-c%20TimeZone%3DAsia%2FShanghai");
+        let pool = connect_with_local_timezone(&explicit_url, Duration::from_secs(5), "UTC")
+            .await
+            .expect("valid explicit timezone");
+        let client = pool.get().await.expect("checkout postgres");
+        let timezone: String = client.query_one("SHOW timezone", &[]).await.unwrap().get(0);
+        assert_eq!(timezone, "Asia/Shanghai");
+
+        let invalid_url = format!("{url}{separator}options=-c%20TimeZone%3DInvalid%2FDBX_Timezone");
+        let error = connect_with_local_timezone(&invalid_url, Duration::from_secs(5), "UTC")
+            .await
+            .expect_err("invalid explicit timezone must remain a connection error");
+        assert!(error.contains("Invalid/DBX_Timezone") || error.contains("time zone"), "{error}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn valid_automatic_timezone_is_applied_normally() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool =
+            connect_with_local_timezone(&url, Duration::from_secs(5), "UTC").await.expect("valid automatic timezone");
+        let client = pool.get().await.expect("checkout postgres");
+        let timezone: String = client.query_one("SHOW timezone", &[]).await.unwrap().get(0);
+        assert_eq!(timezone, "UTC");
+    }
+
+    #[test]
     fn like_contains_pattern_escapes_wildcards() {
         assert_eq!(like_contains_pattern(""), "%%");
         assert_eq!(like_contains_pattern("order_100%"), "%order~_100~%%");
@@ -4100,7 +4568,8 @@ mod tests {
         assert!(sql.contains("ILIKE $2 ESCAPE '~'"));
         assert!(sql.contains("$3 <> ''"));
         assert!(sql.contains("ILIKE $3 ESCAPE '~'"));
-        assert!(sql.contains("LIMIT $4 OFFSET $5"));
+        assert!(sql.contains("ORDER BY CASE WHEN pc.relkind = 'p' THEN 1 ELSE 0 END, c.relname"));
+        assert!(sql.contains("LIMIT CAST($4 AS BIGINT) OFFSET CAST($5 AS BIGINT)"));
     }
 
     #[test]
@@ -4116,8 +4585,13 @@ mod tests {
     #[test]
     fn postgres_completion_sql_filters_before_limit() {
         assert!(postgres_completion_tables_sql().contains("c.relname ILIKE $2 ESCAPE '~'"));
+        assert!(postgres_completion_tables_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
+        assert!(postgres_completion_tables_sql().contains("c.relkind::text = ANY($3::text[])"));
         assert!(postgres_completion_tables_sql().contains("ORDER BY c.relname LIMIT $4"));
         assert!(postgres_completion_routines_sql().contains("p.proname ILIKE $2 ESCAPE '~'"));
+        assert!(postgres_completion_routines_sql().contains("p.prokind::text = ANY($3::text[])"));
+        assert!(postgres_completion_routines_sql().contains("ORDER BY p.proname LIMIT $4"));
         assert!(postgres_completion_columns_sql().contains("a.attname ILIKE $3 ESCAPE '~'"));
+        assert!(postgres_visible_table_schema_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
     }
 }

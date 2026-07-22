@@ -11,7 +11,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
-use tokio::process::Command;
 use tokio::sync::Notify;
 
 const DEFAULT_CODEX_MODELS: &[&str] = &["default", "gpt-5.5", "gpt-5.4-mini"];
@@ -186,7 +185,7 @@ fn program_path_candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
 #[cfg(not(windows))]
 async fn shell_program_path(program: &str) -> Option<String> {
     let script = shell_resolve_script(program);
-    let mut command = Command::new(user_shell());
+    let mut command = cli_command(user_shell());
     command.args(user_shell_args(&script));
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let output = command.output().await.ok()?;
@@ -204,7 +203,7 @@ async fn shell_program_path(program: &str) -> Option<String> {
 #[cfg(windows)]
 async fn shell_program_path(program: &str) -> Option<String> {
     let script = format!("(Get-Command -All {} -ErrorAction SilentlyContinue).Source", windows_shell_quote(program));
-    let mut command = Command::new("powershell.exe");
+    let mut command = cli_command("powershell.exe");
     command.args(["-NoProfile", "-Command", &script]);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let output = command.output().await.ok()?;
@@ -434,8 +433,8 @@ pub fn build_codex_exec_command(config: &AiConfig, _prompt: &str, options: &Code
     CodexCommandSpec { program: codex_program(config), args }
 }
 
-pub fn build_codex_prompt(system_prompt: &str, messages: &[crate::ai::AiMessage]) -> String {
-    build_cli_agent_prompt("Codex", system_prompt, messages)
+pub fn build_codex_prompt(system_prompt: &str, messages: &[crate::ai::AiMessage], allow_write_sql: bool) -> String {
+    build_cli_agent_prompt("Codex", system_prompt, messages, allow_write_sql)
 }
 
 pub async fn list_codex_models(config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
@@ -464,7 +463,7 @@ fn parse_codex_models(stdout: &str) -> Option<Vec<AiModelInfo>> {
     let data = serde_json::from_str::<Value>(&stdout[json_start..]).ok()?;
     let models = data.get("models").and_then(Value::as_array)?;
 
-    let mut result = vec![AiModelInfo { id: "default".to_string(), display_name: Some("Default".to_string()) }];
+    let mut result = vec![AiModelInfo::new("default", Some("Default".to_string()))];
     for model in models {
         let Some(id) = model
             .get("slug")
@@ -484,7 +483,7 @@ fn parse_codex_models(stdout: &str) -> Option<Vec<AiModelInfo>> {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(ToString::to_string);
-        result.push(AiModelInfo { id: id.to_string(), display_name });
+        result.push(AiModelInfo::new(id, display_name));
     }
 
     (result.len() > 1).then_some(result)
@@ -569,6 +568,7 @@ pub async fn run_codex_agent(
         CliAgentProcessSpec {
             command,
             env,
+            current_dir: None,
             stdin: Some(prompt.to_string()),
             dialect: CliAgentJsonlDialect::CodexExec,
             classify_spawn_error: classify_codex_spawn_error,
@@ -606,6 +606,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: String::new(),
             model: model.to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -614,6 +615,8 @@ mod tests {
             context_window: None,
             codex_cli_path: None,
             codex_cli_env: Default::default(),
+            claude_code_cli_path: None,
+            claude_code_cli_env: Default::default(),
         }
     }
 
@@ -623,6 +626,8 @@ mod tests {
             connection_name: "local".to_string(),
             database: "demo".to_string(),
             agent_mode: true,
+            allow_writes: false,
+            allow_dangerous: false,
             mcp_server_command: None,
         }
     }
@@ -640,6 +645,7 @@ mod tests {
         assert!(spec.args.contains(&"mcp_servers.dbx.command=\"dbx-mcp-server\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.default_tools_approval_mode=\"approve\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_ALLOW_WRITES=\"0\"".to_string()));
+        assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_ALLOW_DANGEROUS_SQL=\"0\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_SCOPE_CONNECTION_ID=\"conn-1\"".to_string()));
         assert!(spec.args.iter().any(|arg| arg.contains("dbx_execute_query")));
     }

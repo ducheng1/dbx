@@ -19,8 +19,10 @@ pub struct SchemaQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub object_type: Option<dbx_core::db::ObjectSourceKind>,
+    pub signature: Option<String>,
     pub object_types: Option<String>,
     pub apply_visible_filter: Option<bool>,
+    pub client_session_id: Option<String>,
 }
 
 pub async fn list_databases(
@@ -110,6 +112,20 @@ pub async fn list_sqlserver_linked_server_tables(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
 }
 
+pub async fn get_sqlserver_column_metadata(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let table = q.table.as_deref().unwrap_or("");
+    let result =
+        dbx_core::schema::get_sqlserver_column_metadata_core(&state.app, &q.connection_id, database, schema, table)
+            .await
+            .map_err(AppError)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
 pub async fn list_schemas(
     State(state): State<Arc<WebState>>,
     Query(q): Query<SchemaQuery>,
@@ -193,6 +209,7 @@ pub async fn list_objects(
                 name: table.name,
                 object_type: table.table_type,
                 schema: Some(database.to_string()),
+                valid: None,
                 signature: None,
                 comment: table.comment,
                 created_at: None,
@@ -258,10 +275,17 @@ pub async fn get_object_source(
     let schema = q.schema.as_deref().unwrap_or("");
     let name = q.table.as_deref().unwrap_or("");
     let object_type = q.object_type.ok_or_else(|| AppError("Missing object_type".to_string()))?;
-    let result =
-        dbx_core::schema::get_object_source_core(&state.app, &q.connection_id, database, schema, name, object_type)
-            .await
-            .map_err(AppError)?;
+    let result = dbx_core::schema::get_object_source_core(
+        &state.app,
+        &q.connection_id,
+        database,
+        schema,
+        name,
+        object_type,
+        q.signature.as_deref(),
+    )
+    .await
+    .map_err(AppError)?;
     Ok(Json(result))
 }
 
@@ -277,9 +301,16 @@ pub async fn list_columns(
             .await
             .map_err(AppError)?
     } else {
-        dbx_core::schema::get_columns_core(&state.app, &q.connection_id, database, schema, table)
-            .await
-            .map_err(AppError)?
+        dbx_core::schema::get_columns_core_for_session(
+            &state.app,
+            &q.connection_id,
+            database,
+            schema,
+            table,
+            q.client_session_id.as_deref(),
+        )
+        .await
+        .map_err(AppError)?
     };
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
 }

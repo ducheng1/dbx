@@ -62,6 +62,8 @@ pub struct ObjectInfo {
     pub object_type: String,
     pub schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub comment: Option<String>,
     pub created_at: Option<String>,
@@ -93,9 +95,12 @@ pub enum ObjectSourceKind {
     MaterializedView,
     Procedure,
     Function,
+    Trigger,
     Sequence,
     Package,
     PackageBody,
+    Type,
+    TypeBody,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +113,7 @@ pub struct ObjectSource {
     pub editable: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
@@ -122,6 +127,10 @@ pub struct ColumnInfo {
     pub character_maximum_length: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_set: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,4 +314,19 @@ pub struct OwnerInfo {
     pub object_name: String,
     pub object_type: String,
     pub owner: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ObjectInfo;
+
+    #[test]
+    fn list_objects_payload_preserves_optional_validity() {
+        let objects: Vec<ObjectInfo> =
+            serde_json::from_str(r#"[{"name":"TRG_AUDIT","object_type":"TRIGGER","schema":"APP","valid":false}]"#)
+                .unwrap();
+
+        assert_eq!(objects[0].valid, Some(false));
+        assert_eq!(objects[0].object_type, "TRIGGER");
+    }
 }

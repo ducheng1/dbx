@@ -8,14 +8,14 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::db;
 use crate::db::duckdb_worker_protocol::{
-    DuckDbWorkerConnectParams, DuckDbWorkerError, DuckDbWorkerExecuteParams, DuckDbWorkerMethod, DuckDbWorkerRequest,
-    DuckDbWorkerResponse,
+    DuckDbWorkerConnectParams, DuckDbWorkerError, DuckDbWorkerExecuteParams, DuckDbWorkerMethod,
+    DuckDbWorkerObjectSourceParams, DuckDbWorkerRequest, DuckDbWorkerResponse,
 };
 use crate::models::connection::AttachedDatabaseConfig;
 use crate::storage::{normalize_duckdb_worker_max_processes, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
@@ -63,29 +63,37 @@ struct WorkerProcessState {
 }
 
 impl DuckDbWorkerClient {
-    pub async fn open(path: String, attached_databases: Vec<AttachedDatabaseConfig>) -> Result<Self, String> {
+    pub async fn open(
+        path: String,
+        attached_databases: Vec<AttachedDatabaseConfig>,
+        init_script: Option<String>,
+    ) -> Result<Self, String> {
         let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-        Self::open_with_executable(executable, path, attached_databases).await
+        Self::open_with_executable(executable, path, attached_databases, init_script).await
     }
 
     pub async fn open_with_process_limit(
         path: String,
         attached_databases: Vec<AttachedDatabaseConfig>,
+        init_script: Option<String>,
         process_limit: usize,
     ) -> Result<Self, String> {
         let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-        Self::open_with_executable_and_process_limit(executable, path, attached_databases, process_limit).await
+        Self::open_with_executable_and_process_limit(executable, path, attached_databases, init_script, process_limit)
+            .await
     }
 
     pub async fn open_with_executable(
         executable: PathBuf,
         path: String,
         attached_databases: Vec<AttachedDatabaseConfig>,
+        init_script: Option<String>,
     ) -> Result<Self, String> {
         Self::open_with_executable_and_process_limit(
             executable,
             path,
             attached_databases,
+            init_script,
             DUCKDB_WORKER_MAX_PROCESSES_DEFAULT,
         )
         .await
@@ -95,12 +103,14 @@ impl DuckDbWorkerClient {
         executable: PathBuf,
         path: String,
         attached_databases: Vec<AttachedDatabaseConfig>,
+        init_script: Option<String>,
         process_limit: usize,
     ) -> Result<Self, String> {
         let client = Self::new_unconnected_with_timeouts(
             executable,
             path,
             attached_databases,
+            init_script,
             process_limit,
             DEFAULT_WORKER_REQUEST_TIMEOUT,
             DEFAULT_WORKER_START_WAIT,
@@ -114,6 +124,7 @@ impl DuckDbWorkerClient {
         executable: PathBuf,
         path: String,
         attached_databases: Vec<AttachedDatabaseConfig>,
+        init_script: Option<String>,
         process_limit: usize,
         request_timeout: Duration,
         worker_start_timeout: Duration,
@@ -128,7 +139,7 @@ impl DuckDbWorkerClient {
                 process_limiter,
                 process_limit,
                 executable,
-                connect_params: DuckDbWorkerConnectParams { path, attached_databases },
+                connect_params: DuckDbWorkerConnectParams { path, attached_databases, init_script },
                 request_timeout,
                 worker_start_timeout,
                 next_id: AtomicU64::new(1),
@@ -231,6 +242,20 @@ impl DuckDbWorkerClient {
         self.metadata_request(
             DuckDbWorkerMethod::ListColumns,
             serde_json::json!({ "database": database, "schema": schema, "table": table }),
+        )
+        .await
+    }
+
+    pub async fn get_object_source(
+        &self,
+        database: String,
+        schema: String,
+        name: String,
+        object_type: db::ObjectSourceKind,
+    ) -> Result<String, String> {
+        self.metadata_request(
+            DuckDbWorkerMethod::GetObjectSource,
+            DuckDbWorkerObjectSourceParams { database, schema, name, object_type },
         )
         .await
     }
@@ -389,7 +414,7 @@ impl DuckDbWorkerClient {
                 .map_err(|_| "DuckDB worker process limiter is closed".to_string())?;
 
         log::info!("[duckdb-worker:start] executable={}", self.inner.executable.display());
-        let mut child = Command::new(&self.inner.executable)
+        let mut child = crate::process::new_tokio_command(&self.inner.executable)
             .arg("--duckdb-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -488,7 +513,8 @@ impl DuckDbWorkerClient {
             let mut pending = self.inner.pending.lock().await;
             let ids = pending
                 .iter()
-                .filter_map(|(id, request)| (request.generation == generation).then(|| id.clone()))
+                .filter(|&(_id, request)| request.generation == generation)
+                .map(|(id, _request)| id.clone())
                 .collect::<Vec<_>>();
             ids.into_iter().filter_map(|id| pending.remove(&id).map(|request| (id, request.sender))).collect::<Vec<_>>()
         };
@@ -547,7 +573,7 @@ fn is_transient_duckdb_file_lock_error(message: &str) -> bool {
         || lower.contains("file is already open");
     let mentions_lock = lower.contains("file is already open")
         || lower.contains("being used by another process")
-        || lower.contains("conflicting lock is held")
+        || lower.contains("conflicting lock")
         || lower.contains("process cannot access the file")
         || lower.contains("sharing violation")
         || lower.contains("resource temporarily unavailable")
@@ -606,7 +632,8 @@ fn spawn_stdout_reader(
             let mut pending = pending.lock().await;
             let ids = pending
                 .iter()
-                .filter_map(|(id, request)| (request.generation == generation).then(|| id.clone()))
+                .filter(|&(_id, request)| request.generation == generation)
+                .map(|(id, _request)| id.clone())
                 .collect::<Vec<_>>();
             ids.into_iter().filter_map(|id| pending.remove(&id).map(|request| (id, request.sender))).collect::<Vec<_>>()
         };

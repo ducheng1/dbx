@@ -91,6 +91,22 @@ BEGIN
 END;
 SELECT 2;`;
 
+const mysqlDelimitedRoutineFixture = `DELIMITER //
+CREATE PROCEDURE sp_insert_random_users(IN p_count INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  DECLARE v_name VARCHAR(32);
+
+  WHILE i < p_count DO
+    SET v_name = CONCAT('user_', i);
+    INSERT INTO t_user (username) VALUES (v_name);
+    SET i = i + 1;
+  END WHILE;
+END //
+DELIMITER ;
+
+CALL sp_insert_random_users(100);`;
+
 const sapHanaDoBlockFixture = `DO
 BEGIN
   SELECT 1 AS "Result" FROM DUMMY;
@@ -204,6 +220,54 @@ describe("splitSqlStatementRanges", () => {
 });
 
 describe("statementRangeAtCursor", () => {
+  it("splits Elasticsearch REST requests without semicolons", () => {
+    const sql = `# node information
+GET /_nodes/stats/jvm?pretty
+
+// search orders
+POST /orders/_search
+{
+  "query": { "match_all": {} }
+}
+
+HEAD /orders`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_nodes/stats/jvm?pretty", 'POST /orders/_search\n{\n  "query": { "match_all": {} }\n}', "HEAD /orders"]);
+    expect(hasMultipleExecutionTargets(sql, "elasticsearch")).toBe(true);
+  });
+
+  it("targets the Elasticsearch request following a comment", () => {
+    const sql = "# JVM statistics\nGET /_nodes/stats/jvm?pretty\n\nGET /_cluster/health";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "JVM"), "elasticsearch")?.sql).toBe("GET /_nodes/stats/jvm?pretty");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "cluster"), "elasticsearch")?.sql).toBe("GET /_cluster/health");
+  });
+
+  it("splits and targets Elasticsearch requests after block comments", () => {
+    const sql = `/* node information
+   including JVM details */
+GET /_nodes/stats/jvm?pretty
+
+/* cluster information */
+GET /_cluster/health`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_nodes/stats/jvm?pretty", "GET /_cluster/health"]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "JVM details"), "elasticsearch")?.sql).toBe("GET /_nodes/stats/jvm?pretty");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "cluster information"), "elasticsearch")?.sql).toBe("GET /_cluster/health");
+  });
+
+  it("ignores request-looking lines inside Elasticsearch block comments", () => {
+    const sql = `GET /_cluster/health
+
+/* disabled cleanup
+DELETE /important-index
+*/
+GET /_cat/indices`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_cluster/health", "GET /_cat/indices"]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "important-index"), "elasticsearch")?.sql).toBe("GET /_cat/indices");
+  });
+
   it("returns the first statement when the cursor is inside it", () => {
     const sql = "SELECT 1;\nSELECT 2;";
     const pos = indexOf(sql, "1");
@@ -356,6 +420,13 @@ COMMENT = '测试';`;
     expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual(["CREATE TABLE users (id int)", "COMMENT ON TABLE users IS 'Users'"]);
   });
 
+  it("keeps a line-start comment column inside a select projection", () => {
+    const sql = "SELECT\n  id,\n  comment,\n  created_at\nFROM project_info\nWHERE deleted = 0;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "comment"))?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([sql.slice(0, -1)]);
+  });
+
   it("keeps MySQL ALTER TABLE drop column clauses with the statement", () => {
     const sql = "ALTER TABLE t\n  DROP COLUMN a,\n  DROP COLUMN b;";
 
@@ -372,6 +443,44 @@ COMMENT = '测试';`;
     expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
   });
 
+  it("keeps issue #4045 ClickHouse ALTER TABLE UPDATE mutation together", () => {
+    const sql = `ALTER TABLE m2_db.history_data5
+UPDATE value = 14.06
+WHERE uuid IN (
+    SELECT uuid
+    FROM m2_db.pt_uuid_mapping
+    WHERE point_id = 'TEST_Location_1_L2_METER_2_AE_DIFF_H'
+)
+AND ts = toDateTime('2026-07-15 12:00:00');`;
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "ALTER"), "clickhouse")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(statementRangeAtCursor(sql, indexOf(sql, "UPDATE"), "clickhouse")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "clickhouse"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps a simple ClickHouse ALTER TABLE UPDATE mutation together", () => {
+    const sql = "ALTER TABLE `events` ON CLUSTER 'analytics'\nUPDATE value = 1\nWHERE id = 42;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "UPDATE"), "clickhouse")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "clickhouse"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("separates statements after a ClickHouse ALTER TABLE UPDATE mutation", () => {
+    const mutation = "ALTER TABLE events\nUPDATE value = 1\nWHERE id = 42";
+    const sql = `${mutation};\nSELECT * FROM events;\nUPDATE audit SET processed = 1;`;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "clickhouse"))).toEqual([mutation, "SELECT * FROM events", "UPDATE audit SET processed = 1"]);
+  });
+
+  it("does not merge independent UPDATE statements into other ALTER statements", () => {
+    const otherDatabaseSql = "ALTER TABLE events\nUPDATE audit SET processed = 1;";
+    const clickHouseSql = "ALTER TABLE events ADD COLUMN source String\nUPDATE audit SET processed = 1;";
+
+    expect(rangeSqlTexts(executableStatementRanges(otherDatabaseSql, "postgres"))).toEqual(["ALTER TABLE events", "UPDATE audit SET processed = 1"]);
+    expect(rangeSqlTexts(executableStatementRanges(otherDatabaseSql, "mysql"))).toEqual(["ALTER TABLE events", "UPDATE audit SET processed = 1"]);
+    expect(rangeSqlTexts(executableStatementRanges(clickHouseSql, "clickhouse"))).toEqual(["ALTER TABLE events ADD COLUMN source String", "UPDATE audit SET processed = 1"]);
+  });
+
   it("keeps insert-select with the INSERT statement", () => {
     const sql = "INSERT INTO archived_users (id, name)\nSELECT id, name FROM users\nUPDATE users SET archived = 1;";
     const range = statementRangeAtCursor(sql, indexOf(sql, "archived_users"));
@@ -382,6 +491,92 @@ COMMENT = '测试';`;
     const sql = "EXPLAIN\nSELECT * FROM users\nSELECT * FROM logs;";
     const range = statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"));
     expect(range?.sql.trim()).toBe("EXPLAIN\nSELECT * FROM users");
+  });
+
+  it("keeps issue #3567 EXPLAIN options and CTE target as one statement", () => {
+    const sql = "explain (analyze,buffers)\nwith tmp as(select* from test.tt)\nselect * from tmp;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "explain"), "postgres")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(statementRangeAtCursor(sql, indexOf(sql, "select * from tmp"), "postgres")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual([sql.slice(0, -1)]);
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps EXPLAIN ANALYZE with a CTE main query as one statement", () => {
+    const sql = "explain analyze\nwith tmp as (select 1)\nselect * from tmp;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "explain"), "postgres")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps a plain EXPLAIN CTE target as one statement without merging later queries", () => {
+    const sql = "EXPLAIN\nWITH tmp AS (SELECT 1)\nSELECT * FROM tmp\nSELECT * FROM logs;";
+    const expected = "EXPLAIN\nWITH tmp AS (SELECT 1)\nSELECT * FROM tmp";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"))?.sql.trim()).toBe(expected);
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([expected, "SELECT * FROM logs"]);
+  });
+
+  it("does not merge a query after an inline EXPLAIN options CTE statement", () => {
+    const sql = "EXPLAIN (ANALYZE) WITH tmp AS (SELECT 1)\nSELECT * FROM tmp\nSELECT 2;";
+    const expected = "EXPLAIN (ANALYZE) WITH tmp AS (SELECT 1)\nSELECT * FROM tmp";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "postgres")?.sql.trim()).toBe(expected);
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual([expected, "SELECT 2"]);
+  });
+
+  it("keeps EXPLAIN options CTE UPDATE assignments as one statement", () => {
+    const sql = "EXPLAIN (ANALYZE)\nWITH tmp AS (SELECT 1)\nUPDATE t\nSET x = 1;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "SET"), "postgres")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps CTE INSERT ... SELECT with the WITH statement", () => {
+    const sql = "WITH tmp AS (SELECT 1)\nINSERT INTO t (id)\nSELECT * FROM tmp;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "INSERT"))?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("does not merge a query after a CTE INSERT ... SELECT statement", () => {
+    const sql = "WITH tmp AS (SELECT 1)\nINSERT INTO t (id)\nSELECT * FROM tmp\nSELECT 2;";
+    const expected = "WITH tmp AS (SELECT 1)\nINSERT INTO t (id)\nSELECT * FROM tmp";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "INSERT"))?.sql.trim()).toBe(expected);
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([expected, "SELECT 2"]);
+  });
+
+  it("does not merge a query after an INSERT with a CTE source query", () => {
+    const sql = "INSERT INTO t (id)\nWITH tmp AS (SELECT 1)\nSELECT * FROM tmp\nSELECT 2;";
+    const expected = "INSERT INTO t (id)\nWITH tmp AS (SELECT 1)\nSELECT * FROM tmp";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "INSERT"))?.sql.trim()).toBe(expected);
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([expected, "SELECT 2"]);
+  });
+
+  it("skips block comments inside EXPLAIN options when resolving the target", () => {
+    const sql = "EXPLAIN (ANALYZE /* ) */) UPDATE t\nSET x = 1;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "SET"), "postgres")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("recovers later statements from an unclosed EXPLAIN option list", () => {
+    const sql = "EXPLAIN (ANALYZE\nSELECT 1\nSELECT 2;";
+    const explainSql = "EXPLAIN (ANALYZE\nSELECT 1";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "postgres")?.sql.trim()).toBe(explainSql);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "SELECT 2"), "postgres")?.sql.trim()).toBe("SELECT 2");
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual([explainSql, "SELECT 2"]);
+  });
+
+  it("does not treat a DESCRIBE subquery paren as EXPLAIN options", () => {
+    const sql = "DESCRIBE (SELECT 1)\nSELECT 2;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "DESCRIBE"), "clickhouse")?.sql.trim()).toBe("DESCRIBE (SELECT 1)");
+    expect(rangeSqlTexts(executableStatementRanges(sql, "clickhouse"))).toEqual(["DESCRIBE (SELECT 1)", "SELECT 2"]);
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual(["DESCRIBE (SELECT 1)", "SELECT 2"]);
   });
 
   it("keeps MySQL DESC UPDATE joins as one statement", () => {
@@ -547,6 +742,10 @@ describe("executableStatementRanges", () => {
     expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineWithLoopsFixture, "mysql"))).toEqual([mysqlRoutineWithLoopsFixture.slice(0, mysqlRoutineWithLoopsFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
   });
 
+  it("does not expose run targets for statements inside a delimited MySQL routine", () => {
+    expect(rangeSqlTexts(executableStatementRanges(mysqlDelimitedRoutineFixture, "mysql"))).toEqual([mysqlDelimitedRoutineFixture.slice(mysqlDelimitedRoutineFixture.indexOf("CREATE PROCEDURE"), mysqlDelimitedRoutineFixture.indexOf(" //\nDELIMITER")), "CALL sp_insert_random_users(100)"]);
+  });
+
   it("does not split executable SAP HANA DO ranges at inner statements", () => {
     expect(rangeSqlTexts(executableStatementRanges(sapHanaDoBlockFixture, "saphana"))).toEqual([sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")), "SELECT 2 FROM DUMMY"]);
   });
@@ -608,6 +807,14 @@ describe("buildExecutionCandidates", () => {
     const sql = "SELECT 1;\nSELECT 2;";
     const candidates = buildExecutionCandidates(sql, indexOf(sql, "2"));
     expect(candidateKinds(candidates)).toEqual(["cursor", "all"]);
+  });
+
+  it("preserves leading optimizer hints in current statement candidates", () => {
+    const hintedSql = "/*+ SET(polar_csi.enable_query on) SET(polar_csi.cost_threshold 0)*/\nselect count(1) from xxx";
+    const sql = `select 1;\n${hintedSql};`;
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "count"), "postgres");
+
+    expect(candidates[0].sql).toBe(hintedSql);
   });
 
   it("uses the cursor statement for the first candidate when there is no selection", () => {
@@ -727,7 +934,7 @@ describe("hasMultipleExecutionTargets", () => {
 });
 
 describe("supportsExecutionTargetPicker", () => {
-  it("enables the picker for SQL database connections and Redis", () => {
+  it("enables the picker for SQL database connections, Redis, and Elasticsearch", () => {
     expect(supportsExecutionTargetPicker("mysql")).toBe(true);
     expect(supportsExecutionTargetPicker("postgres")).toBe(true);
     expect(supportsExecutionTargetPicker("sqlserver")).toBe(true);
@@ -735,7 +942,7 @@ describe("supportsExecutionTargetPicker", () => {
     expect(supportsExecutionTargetPicker("jdbc")).toBe(true);
     expect(supportsExecutionTargetPicker("redis")).toBe(true);
     expect(supportsExecutionTargetPicker("mongodb")).toBe(false);
-    expect(supportsExecutionTargetPicker("elasticsearch")).toBe(false);
+    expect(supportsExecutionTargetPicker("elasticsearch")).toBe(true);
     expect(supportsExecutionTargetPicker("qdrant")).toBe(false);
     expect(supportsExecutionTargetPicker("milvus")).toBe(false);
     expect(supportsExecutionTargetPicker("weaviate")).toBe(false);

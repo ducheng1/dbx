@@ -75,7 +75,7 @@ function importConnectionIdForFolder(folder?: SavedSqlFolder) {
 }
 
 function sanitizeFileSystemSegment(name: string) {
-  return name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").trim() || "untitled";
+  return name.replace(/[<>:"/\\|?*\p{Cc}]/gu, "_").trim() || "untitled";
 }
 
 function relativeImportName(baseDir: string, filePath: string) {
@@ -421,13 +421,19 @@ function isFolderExpanded(folderId: string) {
 
 async function openNewFolderInput(parentFolderId?: string) {
   const parent = parentFolderId ? savedSqlStore.allFolders.find((folder) => folder.id === parentFolderId) : undefined;
+  if (parentFolderId && !parent) return;
   const connectionId = parent?.connectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
   if (parent?.id) {
     collapsedFolders.value = new Set([...collapsedFolders.value].filter((id) => id !== parent.id));
   }
-  const folder = await savedSqlStore.createFolder(connectionId, t("savedSql.newFolderDefault"), parent?.id);
-  startRenameFolder(folder);
+  try {
+    const folder = await savedSqlStore.createFolder(connectionId, t("savedSql.newFolderDefault"), parent?.id);
+    searchText.value = "";
+    startRenameFolder(folder);
+  } catch (e: any) {
+    toast(t("savedSql.createFolderFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 async function openNewQueryInFolder(folder?: SavedSqlFolder) {
@@ -563,7 +569,24 @@ function setRenameInputRef(el: unknown) {
   renameInputRef.value = (el as HTMLInputElement) ?? null;
 }
 
+function isRenamingFolder(folderId: string) {
+  return renamingTarget.value?.type === "folder" && renamingTarget.value.id === folderId;
+}
+
+function isRenamingFile(fileId: string) {
+  return renamingTarget.value?.type === "file" && renamingTarget.value.id === fileId;
+}
+
+function prepareRenameInput() {
+  resetDragState();
+  clearSelection();
+  markSuppressedClick();
+  renameInputRef.value = null;
+}
+
 function startRenameFolder(folder: SavedSqlFolder) {
+  prepareRenameInput();
+  setActiveItem(folder.id, "folder");
   renamingTarget.value = { type: "folder", id: folder.id };
   renameValue.value = folder.name;
   nextTick(() => {
@@ -572,6 +595,8 @@ function startRenameFolder(folder: SavedSqlFolder) {
 }
 
 function startRenameFile(file: SavedSqlFile) {
+  prepareRenameInput();
+  setActiveItem(file.id, "file");
   renamingTarget.value = { type: "file", id: file.id };
   renameValue.value = file.name.replace(/\.sql$/i, "");
   nextTick(() => {
@@ -873,7 +898,7 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
     ];
   }
   return [
-    { label: t("savedSql.newFolder"), action: () => openNewFolderInput(target.id), icon: FolderPlus },
+    { label: t("savedSql.newSubfolder"), action: () => openNewFolderInput(target.id), icon: FolderPlus },
     { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(target), icon: FilePlus },
     { label: t("sqlLibrary.importIntoFolder"), action: () => importDirectoryIntoLibrary(target), icon: Download },
     { label: t("sqlLibrary.exportFolder"), action: () => exportFolderContents(target), icon: Upload },
@@ -1131,7 +1156,7 @@ function showDropInside(targetId: string) {
         </Button>
       </LightTooltip>
       <LightTooltip :text="t('savedSql.newFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
-        <Button variant="ghost" size="icon" class="h-5 w-5" @click="openNewFolderInput">
+        <Button variant="ghost" size="icon" class="h-5 w-5" @click="openNewFolderInput()">
           <FolderPlus class="h-3 w-3" />
         </Button>
       </LightTooltip>
@@ -1189,10 +1214,35 @@ function showDropInside(targetId: string) {
                   "
                 >
                   <FolderClosed class="h-4 w-4 text-amber-500 shrink-0" />
-                  <span class="dbx-sql-library-drag-label min-w-0 flex-1 truncate">
+                  <template v-if="isRenamingFolder(item.item.id)">
+                    <input
+                      :ref="setRenameInputRef"
+                      v-model="renameValue"
+                      data-no-drag="true"
+                      class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
+                      @keydown.enter.prevent="confirmRename"
+                      @keydown.escape.prevent="cancelRename"
+                      @blur="confirmRename"
+                      @mousedown.stop
+                      @click.stop
+                    />
+                  </template>
+                  <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate">
                     {{ item.item.name }}
                     <span class="ml-1 text-muted-foreground">({{ folderFileCount(item.item.id) }})</span>
                   </span>
+                  <LightTooltip v-if="!isRenamingFolder(item.item.id)" :text="t('savedSql.newSubfolder')" side="left" :delay="0" :close-delay="0" nowrap>
+                    <button
+                      type="button"
+                      data-no-drag="true"
+                      class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      :aria-label="t('savedSql.newSubfolder')"
+                      @mousedown.stop
+                      @click.stop="openNewFolderInput(item.item.id)"
+                    >
+                      <FolderPlus class="h-3.5 w-3.5" />
+                    </button>
+                  </LightTooltip>
                 </div>
 
                 <div
@@ -1209,7 +1259,20 @@ function showDropInside(targetId: string) {
                 >
                   <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
                   <span v-if="isFileDirty(item.item)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
-                  <span class="dbx-sql-library-drag-label min-w-0 flex-1 truncate" :title="fileTitleLabel(item.item)" :style="fileTitleStyle(item.item)">{{ item.item.name }}</span>
+                  <template v-if="isRenamingFile(item.item.id)">
+                    <input
+                      :ref="setRenameInputRef"
+                      v-model="renameValue"
+                      data-no-drag="true"
+                      class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
+                      @keydown.enter.prevent="confirmRename"
+                      @keydown.escape.prevent="cancelRename"
+                      @blur="confirmRename"
+                      @mousedown.stop
+                      @click.stop
+                    />
+                  </template>
+                  <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate" :title="fileTitleLabel(item.item)" :style="fileTitleStyle(item.item)">{{ item.item.name }}</span>
                   <span class="min-w-0 max-w-[45%] shrink truncate text-[13px]" :class="fileMetaClass(item.item.id)" :title="getConnectionLabel(item.item.connectionId)">[{{ getConnectionLabel(item.item.connectionId) }}]</span>
                 </div>
               </div>
@@ -1236,7 +1299,7 @@ function showDropInside(targetId: string) {
                   <div v-if="showDropBefore(row.folder.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
                   <div v-if="showDropAfter(row.folder.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
                   <component :is="isFolderExpanded(row.folder.id) ? FolderOpen : FolderClosed" class="h-4 w-4 text-amber-500 shrink-0" />
-                  <template v-if="renamingTarget?.type === 'folder' && renamingTarget.id === row.folder.id">
+                  <template v-if="isRenamingFolder(row.folder.id)">
                     <input
                       :ref="setRenameInputRef"
                       v-model="renameValue"
@@ -1245,6 +1308,7 @@ function showDropInside(targetId: string) {
                       @keydown.enter.prevent="confirmRename"
                       @keydown.escape.prevent="cancelRename"
                       @blur="confirmRename"
+                      @mousedown.stop
                       @click.stop
                     />
                   </template>
@@ -1252,6 +1316,18 @@ function showDropInside(targetId: string) {
                     {{ row.folder.name }}
                     <span class="ml-1 text-muted-foreground">({{ folderFileCount(row.folder.id) }})</span>
                   </span>
+                  <LightTooltip v-if="!isRenamingFolder(row.folder.id)" :text="t('savedSql.newSubfolder')" side="left" :delay="0" :close-delay="0" nowrap>
+                    <button
+                      type="button"
+                      data-no-drag="true"
+                      class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      :aria-label="t('savedSql.newSubfolder')"
+                      @mousedown.stop
+                      @click.stop="openNewFolderInput(row.folder.id)"
+                    >
+                      <FolderPlus class="h-3.5 w-3.5" />
+                    </button>
+                  </LightTooltip>
                 </div>
 
                 <div
@@ -1273,7 +1349,7 @@ function showDropInside(targetId: string) {
                   <div v-if="showDropAfter(row.file.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
                   <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
                   <span v-if="isFileDirty(row.file)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
-                  <template v-if="renamingTarget?.type === 'file' && renamingTarget.id === row.file.id">
+                  <template v-if="isRenamingFile(row.file.id)">
                     <input
                       :ref="setRenameInputRef"
                       v-model="renameValue"
@@ -1282,6 +1358,7 @@ function showDropInside(targetId: string) {
                       @keydown.enter.prevent="confirmRename"
                       @keydown.escape.prevent="cancelRename"
                       @blur="confirmRename"
+                      @mousedown.stop
                       @click.stop
                     />
                   </template>
@@ -1319,7 +1396,7 @@ function showDropInside(targetId: string) {
                   <div v-if="showDropAfter(file.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
                   <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
                   <span v-if="isFileDirty(file)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
-                  <template v-if="renamingTarget?.type === 'file' && renamingTarget.id === file.id">
+                  <template v-if="isRenamingFile(file.id)">
                     <input
                       :ref="setRenameInputRef"
                       v-model="renameValue"
@@ -1328,6 +1405,7 @@ function showDropInside(targetId: string) {
                       @keydown.enter.prevent="confirmRename"
                       @keydown.escape.prevent="cancelRename"
                       @blur="confirmRename"
+                      @mousedown.stop
                       @click.stop
                     />
                   </template>

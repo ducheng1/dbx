@@ -5,6 +5,7 @@ export type GridCellValue = string | number | boolean | null | unknown[] | { [ke
 
 export interface DataGridTableMeta {
   catalog?: string;
+  database?: string;
   schema?: string;
   tableName: string;
   primaryKeys: string[];
@@ -22,6 +23,7 @@ export interface DataGridColumnInfo {
 
 export interface DataGridSaveStatementOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   tableMeta: DataGridTableMeta;
   columns: string[];
   sourceColumns?: Array<string | undefined>;
@@ -45,24 +47,29 @@ export interface DataGridCopyInsertStatementOptions {
   databaseType?: DatabaseType;
   tableMeta?: DataGridTableMeta;
   columns: string[];
+  columnTypes?: Array<string | null | undefined>;
   sourceColumns?: Array<string | undefined>;
   rows: GridCellValue[][];
   excludePrimaryKeys?: boolean;
   insertMode?: DataGridCopyInsertMode;
 }
 
-export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "greater-than";
+export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "greater-than" | "in" | "not-in" | "between" | "not-between";
 
 export interface DataGridContextFilterConditionOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   columnName: string;
   mode: DataGridContextFilterMode;
   value: GridCellValue;
+  values?: GridCellValue[];
+  endValue?: GridCellValue;
   columnInfo?: DataGridColumnInfo;
 }
 
 export interface DataGridColumnValueFilterConditionOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   columnName: string;
   columnInfo?: DataGridColumnInfo;
   rawValue: string;
@@ -70,6 +77,7 @@ export interface DataGridColumnValueFilterConditionOptions {
 
 export interface DataGridColumnValuesFilterConditionOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   columnName: string;
   columnInfo?: DataGridColumnInfo;
   values: GridCellValue[];
@@ -77,7 +85,9 @@ export interface DataGridColumnValuesFilterConditionOptions {
 
 export interface DataGridColumnDistinctValuesSqlOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   catalog?: string;
+  database?: string;
   schema?: string;
   tableName: string;
   columnName: string;
@@ -90,7 +100,9 @@ export interface DataGridColumnDistinctValuesSqlOptions {
 
 export interface DataGridCountSqlOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   catalog?: string;
+  database?: string;
   schema?: string;
   tableName: string;
   whereInput?: string;

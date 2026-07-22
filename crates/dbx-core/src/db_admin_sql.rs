@@ -71,6 +71,13 @@ pub struct DuckDbAttachDatabaseSqlOptions {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SqliteAttachDatabaseSqlOptions {
+    pub path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DropObjectSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_type: Option<DatabaseType>,
@@ -78,6 +85,8 @@ pub struct DropObjectSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -301,6 +310,14 @@ pub fn build_duckdb_attach_database_sql(options: DuckDbAttachDatabaseSqlOptions)
     )
 }
 
+pub fn build_sqlite_attach_database_sql(options: SqliteAttachDatabaseSqlOptions) -> String {
+    format!(
+        "ATTACH DATABASE {} AS {};",
+        quote_sql_string(&options.path),
+        quote_table_identifier(Some(DatabaseType::Sqlite), &options.name)
+    )
+}
+
 pub fn build_create_user_sql(username: &str, password: &str, tablespace: &str) -> String {
     format!(
         "CREATE USER {} IDENTIFIED BY {} DEFAULT TABLESPACE {};",
@@ -311,10 +328,18 @@ pub fn build_create_user_sql(username: &str, password: &str, tablespace: &str) -
 }
 
 pub fn build_drop_object_sql(options: DropObjectSqlOptions) -> String {
+    let signature = if matches!(options.database_type, Some(DatabaseType::Postgres))
+        && matches!(options.object_type, DatabaseObjectType::Function | DatabaseObjectType::Procedure)
+    {
+        options.signature.as_deref().map(|value| format!("({value})")).unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
-        "DROP {} {};",
+        "DROP {} {}{};",
         object_type_keyword(options.object_type),
-        qualified_name(options.database_type, options.schema.as_deref(), &options.name)
+        qualified_name(options.database_type, options.schema.as_deref(), &options.name),
+        signature
     )
 }
 
@@ -378,6 +403,7 @@ pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions
                         | DatabaseType::Dameng
                         | DatabaseType::OceanbaseOracle
                         | DatabaseType::Iris
+                        | DatabaseType::Sqlite
                 )
             ) && options.schema.as_deref().is_some_and(|schema| !schema.is_empty())
             {
@@ -1051,6 +1077,17 @@ mod tests {
     }
 
     #[test]
+    fn builds_sqlite_attach_sql() {
+        assert_eq!(
+            build_sqlite_attach_database_sql(SqliteAttachDatabaseSqlOptions {
+                path: "/Users/me/O'Reilly data.sqlite".to_string(),
+                name: "report db".to_string(),
+            }),
+            "ATTACH DATABASE '/Users/me/O''Reilly data.sqlite' AS \"report db\";"
+        );
+    }
+
+    #[test]
     fn builds_dameng_create_user_sql_with_escaped_values() {
         assert_eq!(
             build_create_user_sql("app\"user", "pa'ss", "main\"space"),
@@ -1206,8 +1243,19 @@ mod tests {
                 object_type: DatabaseObjectType::Procedure,
                 schema: Some("dbo".to_string()),
                 name: "refresh_cache".to_string(),
+                signature: None,
             }),
             "DROP PROCEDURE [dbo].[refresh_cache];"
+        );
+        assert_eq!(
+            build_drop_object_sql(DropObjectSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                object_type: DatabaseObjectType::Function,
+                schema: Some("public".to_string()),
+                name: "calc".to_string(),
+                signature: Some("integer, integer".to_string()),
+            }),
+            "DROP FUNCTION \"public\".\"calc\"(integer, integer);"
         );
         assert_eq!(
             build_drop_database_sql(DatabaseNameSqlOptions {
@@ -1297,6 +1345,17 @@ mod tests {
             })
             .unwrap(),
             "DROP INDEX \"public\".\"idx_orders_status\";"
+        );
+        assert_eq!(
+            build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {
+                database_type: Some(DatabaseType::Sqlite),
+                object_type: TableChildObjectType::Index,
+                schema: Some("analytics".to_string()),
+                table_name: "orders".to_string(),
+                name: "idx_orders_status".to_string(),
+            })
+            .unwrap(),
+            "DROP INDEX \"analytics\".\"idx_orders_status\";"
         );
         assert_eq!(
             build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {

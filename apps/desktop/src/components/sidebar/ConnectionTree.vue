@@ -1,15 +1,15 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, provide, onMounted, onUnmounted, type Component, type CSSProperties } from "vue";
+import { ref, computed, nextTick, watch, provide, onMounted, onUnmounted, type Component, type ComponentPublicInstance, type CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { Search, X, ListFilter, Crosshair, Server, Database, FolderTree, Table2, Eye, RotateCcw } from "@lucide/vue";
+import { Search, X, ListFilter, ListOrdered, ArrowDownAZ, ArrowUpZA, Crosshair, Server, Database, FolderTree, Table2, Eye, RotateCcw } from "@lucide/vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
-import type { TreeNode, TreeNodeType } from "@/types/database";
+import type { ObjectSourceKind, TreeNode, TreeNodeType } from "@/types/database";
 import { filterSidebarSearchRootsByConnectionState, filterSidebarTree } from "@/lib/sidebar/sidebarSearchTree";
 import { isCancelSearchShortcut, isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut } from "@/lib/editor/keyboardShortcuts";
-import { copyNameForTreeNode } from "@/lib/sidebar/treeNodeClick";
+import { copyNameForTreeNode, objectSourceKindForTreeNode } from "@/lib/sidebar/treeNodeClick";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { connectionPasteTargetGroupId, selectedConnectionClipboardNodes, selectedConnectionEditTarget } from "@/lib/sidebar/sidebarConnectionSelection";
 import { isEditableSidebarTypeSearchTarget, sidebarTypeSearchNextQuery } from "@/lib/sidebar/sidebarTypeSearch";
@@ -17,13 +17,27 @@ import { usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { activeTabSidebarTarget, findSidebarNodeForActiveTab, findSidebarNodeForTarget, findNodePathForTarget, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection, type ActiveTabSidebarTarget, type SidebarNodeScrollAlign } from "@/lib/sidebar/sidebarActiveTabTarget";
 import { findLoadedTableTargetForCandidate, queryContextTargetFromCandidate, queryCursorTableCandidate, type QueryCursorTableCandidate } from "@/lib/sql/queryCursorTableTarget";
-import { SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, shouldVirtualizeFlatTree, type FlatTreeNode } from "@/composables/useFlatTree";
+import { createFlatTreeIndex, SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, shouldVirtualizeFlatTree, type FlatTreeNode } from "@/composables/useFlatTree";
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
+import { createSidebarTreeRuntime, sidebarTreeRuntimeKey, type SidebarTreeRuntimeHostInstance } from "@/lib/sidebar/sidebarTreeRuntime";
+import { createSidebarPasteHandlerRegistry } from "@/lib/sidebar/sidebarPasteHandlerRegistry";
 import { insertSidebarTableSearchControls, isSidebarTableSearchControlNode } from "@/lib/sidebar/sidebarTableSearchControl";
 import TreeItem from "./TreeItem.vue";
+import SidebarTreeRuntimeHost from "./SidebarTreeRuntimeHost.vue";
+import SidebarTreeItemDialogs from "./SidebarTreeItemDialogs.vue";
+import InstallExtensionDialog from "@/components/objects/InstallExtensionDialog.vue";
 import { RecycleScroller } from "vue-virtual-scroller";
 import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
+import { cancelPendingSidebarDataOpen, runSidebarDataOpenImmediately, type SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
+import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
+import { codeMirrorSqlDialect } from "@/lib/database/jdbcDialect";
+import { sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
+import { createSidebarActionTarget, findSidebarActionTarget, type SidebarActionTarget } from "@/lib/sidebar/sidebarActionTarget";
+import type { SidebarDangerDialogRequest } from "@/lib/sidebar/sidebarDangerDialog";
+import { resetSidebarTreeDialogState } from "./sidebarTreeDialogState";
+import { SidebarDangerConfirmDialog, SidebarDdlViewDialog, SidebarObjectSourceDialog, SidebarProcedureExecutionDialog, SidebarVisibleDatabasesDialog, SidebarVisibleSchemasDialog } from "./sidebarAsyncDialogs";
+import { sortConnectionListForDisplay } from "@/lib/sidebar/connectionListSort";
 
 const { t } = useI18n();
 const store = useConnectionStore();
@@ -38,6 +52,40 @@ const pointerInsideTree = ref(false);
 const treeScrollerRef = ref<InstanceType<typeof RecycleScroller> | null>(null);
 const plainTreeScrollerRef = ref<HTMLElement | null>(null);
 const sidebarScrollbarTrackRef = ref<HTMLElement | null>(null);
+const sidebarContextMenuRef = ref<{ close: () => void } | null>(null);
+const sidebarContextMenuItems = ref<ContextMenuItem[]>([]);
+const sidebarContextMenuTarget = ref<SidebarActionTarget | null>(null);
+const sidebarDangerDialogRequest = ref<SidebarDangerDialogRequest | null>(null);
+const sidebarDangerDialogOpen = ref(false);
+const sidebarDangerDialogConfirming = ref(false);
+const sidebarTreeItemDialogController = ref<Record<string, any> | null>(null);
+const sidebarInstallExtensionTarget = ref<TreeNode | null>(null);
+const sidebarInstallExtensionDialogRef = ref<InstanceType<typeof InstallExtensionDialog> | null>(null);
+const sidebarTreeRuntimeHostRef = ref<SidebarTreeRuntimeHostInstance | null>(null);
+const sidebarTreeRuntime = createSidebarTreeRuntime();
+const sidebarTreeRuntimeInitialNode: TreeNode = { id: "__sidebar-runtime__", label: "", type: "connection-group" };
+const sidebarDdlTarget = ref<TreeNode | null>(null);
+const sidebarDdlOpen = ref(false);
+const sidebarObjectSourceTarget = ref<{ node: TreeNode; initialEditing: boolean } | null>(null);
+const sidebarObjectSourceOpen = ref(false);
+const sidebarProcedureTarget = ref<TreeNode | null>(null);
+const sidebarProcedureOpen = ref(false);
+const sidebarVisibleDatabasesTarget = ref<TreeNode | null>(null);
+const sidebarVisibleDatabasesOpen = ref(false);
+const sidebarVisibleSchemasTarget = ref<TreeNode | null>(null);
+const sidebarVisibleSchemasOpen = ref(false);
+let sidebarActionGeneration = 0;
+const sidebarDdlDatabaseType = computed(() => {
+  const connectionId = sidebarDdlTarget.value?.connectionId;
+  return connectionId ? effectiveDatabaseTypeForConnection(store.getConfig(connectionId)) : undefined;
+});
+const sidebarObjectSourceType = computed(() => (sidebarObjectSourceTarget.value ? objectSourceKindForTreeNode(sidebarObjectSourceTarget.value.node.type) : null));
+const sidebarObjectSourceDatabaseType = computed(() => {
+  const connectionId = sidebarObjectSourceTarget.value?.node.connectionId;
+  return connectionId ? effectiveDatabaseTypeForConnection(store.getConfig(connectionId)) : undefined;
+});
+const sidebarObjectSourceDialect = computed(() => codeMirrorSqlDialect(sidebarObjectSourceDatabaseType.value));
+const sidebarObjectSourceFormatDialect = computed(() => sqlFormatDialectForDbType(sidebarObjectSourceDatabaseType.value));
 type SearchScope = "connection" | "database" | "schema" | "table" | "view";
 const selectedSearchScopes = ref<SearchScope[]>([]);
 const searchCollapsedIds = ref<Set<string>>(new Set());
@@ -107,15 +155,21 @@ watch(deferredSearchQuery, (newQuery, oldQuery) => {
     .catch(() => {});
 });
 
-const searchableObjectGroupTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views"]);
+const searchableObjectGroupTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-triggers", "group-sequences", "group-packages", "group-types"]);
 const simpleObjectParentTypes = new Set<TreeNodeType>(["database", "schema", "linked-server-schema"]);
-const simpleObjectChildTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "sequence", "package", "package-body", "load-more"]);
+const simpleObjectChildTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "trigger", "sequence", "package", "package-body", "type", "type-body", "load-more"]);
 
 function isSimpleObjectSearchParent(node: TreeNode): boolean {
   return settingsStore.editorSettings.sidebarObjectDisplay === "simple" && simpleObjectParentTypes.has(node.type) && node.isExpanded === true && (!!node.children?.some((child) => simpleObjectChildTypes.has(child.type)) || !!store.sidebarTableSearchQueries[node.id]?.trim());
 }
 
 function collectExpandedObjectSearchTargets(node: TreeNode, tasks: Promise<void>[], refreshedNodeIds?: Set<string>) {
+  if (refreshedNodeIds && node.type === "connection" && node.connectionId) {
+    if (store.connectedIds.has(node.connectionId)) {
+      tasks.push(store.loadConnectedConnectionRootForSidebarSearch(node.connectionId));
+    }
+    if (node.connectionId !== store.activeConnectionId) return;
+  }
   if (refreshedNodeIds && isSimpleObjectSearchParent(node)) {
     refreshedNodeIds.add(node.id);
     tasks.push(store.refreshTreeNode(node));
@@ -194,6 +248,20 @@ const searchScopeMenuItems = computed(() => [
     : []),
 ]);
 
+const connectionListSortMenuItems = computed(() => [
+  { value: "manual", label: t("sidebar.sortConnectionsManual"), icon: ListOrdered },
+  { value: "asc", label: t("sidebar.sortConnectionsAscending"), icon: ArrowDownAZ },
+  { value: "desc", label: t("sidebar.sortConnectionsDescending"), icon: ArrowUpZA },
+]);
+
+const isConnectionListAlphabeticallySorted = computed(() => settingsStore.editorSettings.sidebarConnectionSortMode !== "manual");
+
+function updateConnectionListSortMode(mode: string) {
+  if (mode === "manual" || mode === "asc" || mode === "desc") {
+    settingsStore.updateEditorSettings({ sidebarConnectionSortMode: mode });
+  }
+}
+
 const hasSearchScopeFilter = computed(() => selectedSearchScopes.value.length > 0);
 const searchableNodeTypes = computed<Set<TreeNodeType> | undefined>(() => {
   if (!hasSearchScopeFilter.value) return undefined;
@@ -268,12 +336,14 @@ function focusTableSearchInput(parentNodeId: string) {
   });
 }
 
+const displayedTreeNodes = computed(() => sortConnectionListForDisplay(store.treeNodes, settingsStore.editorSettings.sidebarConnectionSortMode));
+
 const filteredNodes = computed(() => {
-  let nodes = store.treeNodes;
+  let nodes = displayedTreeNodes.value;
 
   const q = deferredSearchQuery.value;
+  nodes = filterSidebarTree(nodes, q, searchCollapsedIds.value, searchableNodeTypes.value);
   if (q) {
-    nodes = filterSidebarTree(nodes, q, searchCollapsedIds.value, searchableNodeTypes.value);
     nodes = filterSidebarSearchRootsByConnectionState(nodes, store.connectedIds);
   }
 
@@ -287,13 +357,19 @@ const flatNodes = computed<FlatTreeNode[]>(() =>
     activeQueries: store.sidebarTableSearchQueries,
   }),
 );
-const visibleNodes = computed<TreeNode[]>(() => flatNodes.value.map((item) => item.node));
-const selectableVisibleNodes = computed<TreeNode[]>(() => visibleNodes.value.filter((node) => !isSidebarTableSearchControlNode(node)));
-const selectableVisibleNodeIndexById = computed(() => {
-  const next = new Map<string, number>();
-  selectableVisibleNodes.value.forEach((node, index) => next.set(node.id, index));
-  return next;
-});
+// Build all lookup tables in one linear pass whenever the visible tree changes.
+// Selection, scrolling and sticky headers then avoid repeated full-array scans.
+const flatTreeIndex = computed(() =>
+  createFlatTreeIndex(flatNodes.value, {
+    isSelectable: (node) => !isSidebarTableSearchControlNode(node),
+    isBoundary: (type) => type === "connection" || type === "connection-group",
+    isDatabaseContainer: (type) => DATABASE_LEVEL_TYPES.has(type),
+    isSchemaContainer: (type) => SCHEMA_LEVEL_TYPES.has(type),
+  }),
+);
+const visibleNodes = computed<TreeNode[]>(() => flatTreeIndex.value.visibleNodes);
+const selectableVisibleNodes = computed<TreeNode[]>(() => flatTreeIndex.value.selectableVisibleNodes);
+const selectableVisibleNodeIndexById = computed(() => flatTreeIndex.value.selectableVisibleNodeIndexById);
 const useVirtualTree = computed(() => shouldVirtualizeFlatTree(flatNodes.value.length));
 const activeTab = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId));
 
@@ -381,51 +457,19 @@ const stickyNode = computed<FlatTreeNode | null>(() => {
   if (len === 0) return null;
 
   const topIndex = Math.min(Math.floor(stickyScrollTop.value / SIDEBAR_TREE_ROW_HEIGHT), len - 1);
-  // flatNodes is a DFS preorder spanning ALL connections, so walking up from a
-  // leaf visits `... -> schema -> database -> connection -> <other connection>`.
-  // Stop at the connection boundary so the sticky row never leaks across into a
-  // different connection's subtree (e.g. MySQL's last database sticking while
-  // scrolling Dameng). Within one connection: track both candidates and prefer
-  // database-level; only fall back to schema when the whole path has no
-  // database-level container (Dameng/Oracle-style trees).
-  let schemaCandidate: FlatTreeNode | null = null;
-  let schemaCandidateTop = 0;
-  for (let i = topIndex; i >= 0; i--) {
-    const item = nodes[i];
-    if (item.type === "connection" || item.type === "connection-group") break;
-    if (DATABASE_LEVEL_TYPES.has(item.type)) {
-      const rowTop = i * SIDEBAR_TREE_ROW_HEIGHT;
-      return stickyScrollTop.value > rowTop ? item : null;
-    }
-    if (item.type === "schema" && !schemaCandidate) {
-      schemaCandidate = item;
-      schemaCandidateTop = i * SIDEBAR_TREE_ROW_HEIGHT;
-    }
-  }
-  if (!schemaCandidate) return null;
-  return stickyScrollTop.value > schemaCandidateTop ? schemaCandidate : null;
+  const containerIndex = flatTreeIndex.value.stickyContainerIndexByIndex[topIndex] ?? -1;
+  if (containerIndex < 0) return null;
+  return stickyScrollTop.value > containerIndex * SIDEBAR_TREE_ROW_HEIGHT ? nodes[containerIndex] : null;
 });
 
 const stickyHeaderStyle = computed<CSSProperties>(() => {
   const node = stickyNode.value;
   if (!node) return {};
-  const nodes = flatNodes.value;
-  const currentIndex = nodes.findIndex((item) => item.id === node.id);
+  const currentIndex = flatTreeIndex.value.flatNodeIndexById.get(node.id) ?? -1;
   if (currentIndex < 0) return {};
-  // Look forward for the next sibling container at the SAME level as the sticky
-  // node so the push-up only fires when a peer scrolls in (database-to-database,
-  // or schema-to-schema for Dameng/Oracle), never schema-into-database. Stop at
-  // the connection boundary so we never reach into the next connection's rows.
-  const nextTypes = SCHEMA_LEVEL_TYPES.has(node.type) ? SCHEMA_LEVEL_TYPES : DATABASE_LEVEL_TYPES;
-  let nextDatabaseIndex = -1;
-  for (let i = currentIndex + 1; i < nodes.length; i++) {
-    const item = nodes[i];
-    if (item.type === "connection" || item.type === "connection-group") break;
-    if (nextTypes.has(item.type)) {
-      nextDatabaseIndex = i;
-      break;
-    }
-  }
+  // The next peer index is precomputed with the flat-tree snapshot so scrolling
+  // never scans the remaining tree. Connection boundaries reset the lookup.
+  const nextDatabaseIndex = SCHEMA_LEVEL_TYPES.has(node.type) ? flatTreeIndex.value.nextSchemaContainerIndexByIndex[currentIndex] : flatTreeIndex.value.nextDatabaseContainerIndexByIndex[currentIndex];
   if (nextDatabaseIndex < 0) return {};
   const distanceToNext = nextDatabaseIndex * SIDEBAR_TREE_ROW_HEIGHT - stickyScrollTop.value;
   if (distanceToNext >= SIDEBAR_TREE_ROW_HEIGHT) return {};
@@ -437,6 +481,11 @@ const stickyHeaderStyle = computed<CSSProperties>(() => {
 // Reset tracking when the tree rebuilds (connect/disconnect/collapse) so a
 // stale scrollTop doesn't keep the overlay mounted after a structural change.
 watch(flatNodes, () => {
+  // Menu actions originate from a rendered row instance. Close the singleton
+  // before a structural update can recycle that row onto another node.
+  sidebarContextMenuRef.value?.close();
+  sidebarContextMenuItems.value = [];
+  sidebarContextMenuTarget.value = null;
   stickyScrollTop.value = 0;
   void nextTick(scheduleSidebarScrollMetricsUpdate);
 });
@@ -520,6 +569,8 @@ function onSidebarScrollbarThumbPointerDown(event: PointerEvent) {
   window.addEventListener("pointercancel", stopSidebarScrollbarDrag);
 }
 
+const pasteHandlerRegistry = createSidebarPasteHandlerRegistry();
+
 provide(sidebarTreeContextKey, {
   getVisibleNodes: () => selectableVisibleNodes.value,
   getVisibleNodeIndex: (id: string) => selectableVisibleNodeIndexById.value.get(id) ?? -1,
@@ -528,7 +579,15 @@ provide(sidebarTreeContextKey, {
     store.setSidebarTableSearchQuery(parentNodeId, query);
     scheduleSidebarTableSearchRefresh(parentNodeId, { restoreFocus: true });
   },
+  registerPasteHandler: pasteHandlerRegistry.register,
 });
+provide(sidebarTreeRuntimeKey, sidebarTreeRuntime);
+
+function bindSidebarTreeRuntimeHost(host: Element | ComponentPublicInstance | null) {
+  const runtimeHost = host as SidebarTreeRuntimeHostInstance | null;
+  sidebarTreeRuntimeHostRef.value = runtimeHost;
+  sidebarTreeRuntime.bindHost(runtimeHost);
+}
 
 const pendingRenameGroupId = ref<string | null>(null);
 const highlightedNodeId = ref<string | null>(null);
@@ -563,7 +622,7 @@ function topOcclusionHeightForSidebarNode(nodeId: string): number {
 async function scrollToSidebarNode(nodeId: string, options?: { align?: SidebarNodeScrollAlign }) {
   await nextTick();
 
-  const index = flatNodes.value.findIndex((item) => item.id === nodeId);
+  const index = flatTreeIndex.value.flatNodeIndexById.get(nodeId) ?? -1;
   const scroller = currentTreeScroller();
   if (!scroller || index < 0) return;
 
@@ -759,6 +818,12 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
       if (force || !databaseChildrenLoaded) {
         await store.loadSqlServerDatabaseObjects(connId, target.database, loadOptions);
       }
+      if (targetSchema) {
+        const schemaNode = findSchemaNode(store.treeNodes, connId, target.database, targetSchema);
+        if (schemaNode && (force || !schemaNode.children || schemaNode.children.length === 0)) {
+          await store.loadTables(connId, target.database, targetSchema, loadOptions);
+        }
+      }
     } else if (usesSchemaTree) {
       if (force || !databaseChildrenLoaded) {
         await store.loadSchemas(connId, target.database, loadOptions);
@@ -841,10 +906,186 @@ function onSearchToggle(node: TreeNode) {
   searchCollapsedIds.value = next;
 }
 
+function openSidebarContextMenu(event: MouseEvent, node: TreeNode, openContextMenu: (event: MouseEvent, itemsOverride?: ContextMenuItem[]) => void) {
+  const items = sidebarTreeRuntime.buildContextMenu(node);
+  sidebarContextMenuTarget.value = createSidebarActionTarget(node);
+  sidebarContextMenuItems.value = items;
+  // Pass the current row's resolved menu atomically. Waiting for the items prop
+  // to flush would let the singleton menu briefly reuse the previous row menu.
+  openContextMenu(event, items);
+}
+
+function openSidebarDangerDialog(request: SidebarDangerDialogRequest) {
+  sidebarDangerDialogRequest.value = request;
+  sidebarDangerDialogConfirming.value = false;
+  sidebarDangerDialogOpen.value = true;
+}
+
+async function confirmSidebarDangerDialog() {
+  const request = sidebarDangerDialogRequest.value;
+  if (!request || sidebarDangerDialogConfirming.value) return;
+  if (request.closeOnConfirm !== false) sidebarDangerDialogOpen.value = false;
+  sidebarDangerDialogConfirming.value = true;
+  try {
+    await request.confirm();
+    sidebarDangerDialogOpen.value = false;
+  } finally {
+    sidebarDangerDialogConfirming.value = false;
+  }
+}
+
+function updateSidebarDangerDialogOption(event: Event) {
+  const option = sidebarDangerDialogRequest.value?.option;
+  if (!option) return;
+  option.checked = (event.target as HTMLInputElement).checked;
+  void option.onChange?.(option.checked);
+}
+
+function updateSidebarTreeItemDialogController(controller: Record<string, any> | null) {
+  sidebarTreeItemDialogController.value = controller;
+}
+
+async function openSidebarInstallExtension(node: TreeNode) {
+  sidebarInstallExtensionTarget.value = createSidebarActionTarget(node);
+  await nextTick();
+  sidebarInstallExtensionDialogRef.value?.show();
+}
+
+function beginSidebarAction(): number {
+  sidebarActionGeneration += 1;
+  sidebarDdlOpen.value = false;
+  sidebarObjectSourceOpen.value = false;
+  sidebarProcedureOpen.value = false;
+  sidebarVisibleDatabasesOpen.value = false;
+  sidebarVisibleSchemasOpen.value = false;
+  sidebarDdlTarget.value = null;
+  sidebarObjectSourceTarget.value = null;
+  sidebarProcedureTarget.value = null;
+  sidebarVisibleDatabasesTarget.value = null;
+  sidebarVisibleSchemasTarget.value = null;
+  return sidebarActionGeneration;
+}
+
+function tableDdlObjectTypeForSidebarNode(type: TreeNodeType): ObjectSourceKind | undefined {
+  if (type === "view") return "VIEW";
+  if (type === "materialized_view") return "MATERIALIZED_VIEW";
+  return undefined;
+}
+
+function openSidebarDdl(node: TreeNode) {
+  if (!node.connectionId || !node.database) return;
+  beginSidebarAction();
+  sidebarDdlTarget.value = createSidebarActionTarget(node);
+  sidebarDdlOpen.value = true;
+}
+
+function openSidebarObjectSource(node: TreeNode, initialEditing: boolean) {
+  if (!node.connectionId || !node.database || !objectSourceKindForTreeNode(node.type)) return;
+  const target = createSidebarActionTarget(node);
+  const requestGeneration = beginSidebarAction();
+  void store
+    .ensureConnected(target.connectionId!)
+    .then(() => {
+      if (requestGeneration !== sidebarActionGeneration) return;
+      store.activeConnectionId = target.connectionId!;
+      sidebarObjectSourceTarget.value = { node: target, initialEditing };
+      sidebarObjectSourceOpen.value = true;
+    })
+    .catch((error: any) => {
+      if (requestGeneration === sidebarActionGeneration) toast(error?.message || String(error), 5000);
+    });
+}
+
+function openSidebarProcedure(node: TreeNode) {
+  if (node.type !== "procedure" || !node.connectionId || !node.database) return;
+  beginSidebarAction();
+  sidebarProcedureTarget.value = createSidebarActionTarget(node);
+  sidebarProcedureOpen.value = true;
+}
+
+function openSidebarData(node: TreeNode, requireSelection: boolean, openMode: "default" | "new-tab", runner: (node: TreeNode, request: SidebarDataOpenRequest) => Promise<void>) {
+  const target = createSidebarActionTarget(node);
+  runSidebarDataOpenImmediately(
+    {
+      connectionKey: target.connectionId || target.id,
+      // Explicit new-tab opens are intentional independent work; ordinary
+      // navigation keeps latest-request-wins behavior.
+      supersede: openMode !== "new-tab",
+    },
+    (request) => {
+      if (requireSelection && store.selectedTreeNodeId !== target.id) return;
+      return runner(target, request);
+    },
+  );
+}
+
+function openSidebarVisibleDatabases(node: TreeNode) {
+  if (node.type !== "connection" || !node.connectionId) return;
+  beginSidebarAction();
+  sidebarVisibleDatabasesTarget.value = createSidebarActionTarget(node);
+  sidebarVisibleDatabasesOpen.value = true;
+}
+
+function openSidebarVisibleSchemas(node: TreeNode) {
+  if ((node.type !== "connection" && node.type !== "database") || !node.connectionId) return;
+  const database = node.type === "database" ? node.database : store.getConfig(node.connectionId)?.database;
+  if (database == null) return;
+  beginSidebarAction();
+  sidebarVisibleSchemasTarget.value = createSidebarActionTarget({ ...node, database });
+  sidebarVisibleSchemasOpen.value = true;
+}
+
+function openSidebarProcedureSql(sql: string) {
+  const target = sidebarProcedureTarget.value;
+  if (!target?.connectionId || !target.database || !sql) return;
+  const tabId = queryStore.createTab(target.connectionId, target.database, `Execute - ${target.label}`, "query", target.schema);
+  queryStore.updateSql(tabId, sql);
+}
+
+async function executeSidebarProcedureSql(sql: string) {
+  const target = sidebarProcedureTarget.value;
+  if (!target?.connectionId || !target.database || !sql) return;
+  const tabId = queryStore.createTab(target.connectionId, target.database, `Execute - ${target.label}`, "query", target.schema);
+  queryStore.updateSql(tabId, sql);
+  await queryStore.executeTabSql(tabId, sql);
+}
+
+async function refreshSidebarActionTarget() {
+  const target = sidebarObjectSourceTarget.value?.node || sidebarDdlTarget.value;
+  if (!target) return;
+  const currentTarget = findSidebarActionTarget(store.treeNodes, target);
+  if (!currentTarget) return;
+  try {
+    await store.refreshTreeNode(currentTarget);
+  } catch (error: any) {
+    toast(error?.message || String(error), 5000);
+  }
+}
+
+watch(sidebarDdlOpen, (open) => {
+  if (!open) sidebarDdlTarget.value = null;
+});
+
+watch(sidebarObjectSourceOpen, (open) => {
+  if (!open) sidebarObjectSourceTarget.value = null;
+});
+
+watch(sidebarProcedureOpen, (open) => {
+  if (!open) sidebarProcedureTarget.value = null;
+});
+
+watch(sidebarVisibleDatabasesOpen, (open) => {
+  if (!open) sidebarVisibleDatabasesTarget.value = null;
+});
+
+watch(sidebarVisibleSchemasOpen, (open) => {
+  if (!open) sidebarVisibleSchemasTarget.value = null;
+});
+
 function collapseAllTreeNodes() {
   store.collapseAllTreeNodes();
   if (isSearching.value) {
-    searchCollapsedIds.value = new Set(flatNodes.value.filter((item) => item.node.children?.length).map((item) => item.id));
+    searchCollapsedIds.value = new Set(flatTreeIndex.value.expandableNodeIds);
   }
 }
 
@@ -862,7 +1103,7 @@ async function selectActiveTabSidebarNode(options: { scroll: boolean }) {
 
   await nextTick();
 
-  const index = flatNodes.value.findIndex((item) => item.id === match.id);
+  const index = flatTreeIndex.value.flatNodeIndexById.get(match.id) ?? -1;
   const scroller = currentTreeScroller();
   if (!scroller || index < 0) return;
 
@@ -981,7 +1222,7 @@ function isEditConnectionShortcut(event: KeyboardEvent): boolean {
 
 function requestSelectedConnectionEdit(): boolean {
   const selectedNodeId = store.selectedTreeNodeId;
-  const currentNode = selectedNodeId ? visibleNodes.value.find((node) => node.id === selectedNodeId) : null;
+  const currentNode = selectedNodeId ? flatTreeIndex.value.nodeById.get(selectedNodeId) : null;
   if (!currentNode) return false;
   const editTarget = selectedConnectionEditTarget(currentNode, selectedSidebarNodesInVisibleOrder());
   if (!editTarget) return false;
@@ -1021,7 +1262,7 @@ function requestSelectedSidebarPaste(): boolean {
   const clipboard = store.treeClipboard;
   const selectedNodeId = store.selectedTreeNodeId;
   if (clipboard?.kind === "connection-copy") {
-    const selectedNode = selectedNodeId ? visibleNodes.value.find((node) => node.id === selectedNodeId) : null;
+    const selectedNode = selectedNodeId ? flatTreeIndex.value.nodeById.get(selectedNodeId) : null;
     const targetGroupId = connectionPasteTargetGroupId(selectedNode, (connectionId) => store.groupIdForConnection(connectionId));
     void store
       .pasteConnectionClipboard(targetGroupId)
@@ -1032,8 +1273,8 @@ function requestSelectedSidebarPaste(): boolean {
     return true;
   }
   if (clipboard?.kind !== "table-copy" || clipboard.tables.length === 0 || !selectedNodeId) return false;
-  window.dispatchEvent(new CustomEvent("dbx:sidebar-request-paste-table", { detail: { nodeId: selectedNodeId } }));
-  return true;
+
+  return pasteHandlerRegistry.request(selectedNodeId);
 }
 
 onMounted(() => {
@@ -1041,7 +1282,20 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  sidebarTreeRuntime.dispose();
+  sidebarActionGeneration += 1;
+  sidebarContextMenuTarget.value = null;
+  sidebarContextMenuItems.value = [];
+  sidebarDdlTarget.value = null;
+  sidebarObjectSourceTarget.value = null;
+  sidebarProcedureTarget.value = null;
+  sidebarVisibleDatabasesTarget.value = null;
+  sidebarVisibleSchemasTarget.value = null;
+  sidebarTreeItemDialogController.value = null;
+  sidebarDangerDialogRequest.value = null;
+  resetSidebarTreeDialogState();
   window.removeEventListener("keydown", onWindowKeydown);
+  cancelPendingSidebarDataOpen();
   for (const timer of tableSearchTimers.values()) {
     window.clearTimeout(timer);
   }
@@ -1059,6 +1313,22 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
 
 <template>
   <div ref="rootRef" class="h-full min-h-0 flex flex-col text-sm select-none" @pointerenter="pointerInsideTree = true" @pointerleave="pointerInsideTree = false">
+    <SidebarTreeRuntimeHost
+      :ref="bindSidebarTreeRuntimeHost"
+      :node="sidebarTreeRuntimeInitialNode"
+      :depth="0"
+      @search-toggle="onSearchToggle"
+      @open-ddl="openSidebarDdl"
+      @open-object-source="openSidebarObjectSource"
+      @open-procedure="openSidebarProcedure"
+      @open-data="openSidebarData"
+      @open-visible-databases="openSidebarVisibleDatabases"
+      @open-visible-schemas="openSidebarVisibleSchemas"
+      @request-group-rename="startRenamingCreatedGroup"
+      @open-danger-dialog="openSidebarDangerDialog"
+      @open-dialog-controller="updateSidebarTreeItemDialogController"
+      @open-install-extension="openSidebarInstallExtension"
+    />
     <div class="connection-tree-search sticky top-0 z-10 bg-background px-2 py-1">
       <div class="relative flex items-center gap-1">
         <div class="relative flex-1">
@@ -1080,6 +1350,23 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
         <button class="shrink-0 h-6 w-6 flex items-center justify-center rounded border border-border text-muted-foreground hover:bg-accent hover:text-foreground" :title="t('sidebar.locateActiveTab')" @click="locateActiveTabInSidebar">
           <Crosshair class="h-3.5 w-3.5" />
         </button>
+        <LightDropdown
+          :model-value="settingsStore.editorSettings.sidebarConnectionSortMode"
+          :items="connectionListSortMenuItems"
+          :aria-label="t('sidebar.sortConnections')"
+          :label="t('sidebar.sortConnections')"
+          :trigger-title="t('sidebar.sortConnections')"
+          :trigger-class="['shrink-0 h-6 w-6 flex items-center justify-center rounded border border-border hover:bg-accent', isConnectionListAlphabeticallySorted ? 'text-primary bg-primary/10 border-primary/30' : 'text-muted-foreground'].join(' ')"
+          trigger-icon-class="h-3.5 w-3.5"
+          item-icon-class="h-3.5 w-3.5"
+          content-class="w-max min-w-0"
+          selected-item-class="bg-primary/10 text-primary"
+          selected-check-class="text-primary"
+          :show-trigger-label="false"
+          :show-chevron="false"
+          align="end"
+          @update:model-value="updateConnectionListSortMode"
+        />
         <LightDropdown
           v-if="searchScopeOptions.length > 0"
           model-value=""
@@ -1103,60 +1390,138 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
         />
       </div>
     </div>
-    <div v-if="flatNodes.length > 0 && useVirtualTree" class="connection-tree-scroll-shell relative min-h-0 flex-1">
-      <RecycleScroller
-        ref="treeScrollerRef"
-        class="sidebar-tree connection-tree-scroller h-full overflow-y-auto"
-        :class="sidebarTreeOverflowClass"
-        @click="clearSidebarSelection"
-        :items="flatNodes"
-        :item-size="SIDEBAR_TREE_ROW_HEIGHT"
-        :buffer="SIDEBAR_TREE_SCROLL_BUFFER"
-        :prerender="SIDEBAR_TREE_PRERENDER_COUNT"
-        :skip-hover="true"
-        key-field="id"
-        type-field="poolType"
-        flow-mode
-      >
-        <template #default="{ item }">
+    <CustomContextMenu ref="sidebarContextMenuRef" :items="sidebarContextMenuItems" v-slot="contextMenuSlot">
+      <div v-if="flatNodes.length > 0 && useVirtualTree" class="connection-tree-scroll-shell relative min-h-0 flex-1">
+        <RecycleScroller
+          ref="treeScrollerRef"
+          class="sidebar-tree connection-tree-scroller h-full overflow-y-auto"
+          :class="sidebarTreeOverflowClass"
+          @click="clearSidebarSelection"
+          :items="flatNodes"
+          :item-size="SIDEBAR_TREE_ROW_HEIGHT"
+          :buffer="SIDEBAR_TREE_SCROLL_BUFFER"
+          :prerender="SIDEBAR_TREE_PRERENDER_COUNT"
+          :skip-hover="true"
+          key-field="id"
+          type-field="poolType"
+          flow-mode
+        >
+          <template #default="{ item }">
+            <TreeItem
+              :node="item.node"
+              :depth="item.depth"
+              :drag-disabled="isFiltering || isConnectionListAlphabeticallySorted"
+              :pending-rename="pendingRenameGroupId === item.node.id"
+              :highlighted="highlightedNodeId === item.node.id"
+              @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
+              @rename-started="pendingRenameGroupId = null"
+              @group-created="startRenamingCreatedGroup"
+            />
+          </template>
+        </RecycleScroller>
+        <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5] border-b border-border/60" :style="stickyHeaderStyle">
+          <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)" />
+        </div>
+        <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--scrolling': isScrollingSidebar, 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">
+          <div class="sidebar-tree-scrollbar__thumb" :style="sidebarScrollbarThumbStyle" @pointerdown.stop="onSidebarScrollbarThumbPointerDown" />
+        </div>
+      </div>
+      <div v-else-if="flatNodes.length > 0" class="connection-tree-scroll-shell relative min-h-0 flex-1">
+        <div ref="plainTreeScrollerRef" class="sidebar-tree connection-tree-scroller h-full overflow-y-auto" :class="sidebarTreeOverflowClass" @click="clearSidebarSelection" @scroll.passive="onTreeScroll">
           <TreeItem
+            v-for="item in flatNodes"
+            :key="item.id"
             :node="item.node"
             :depth="item.depth"
-            :drag-disabled="isFiltering"
+            :drag-disabled="isFiltering || isConnectionListAlphabeticallySorted"
             :pending-rename="pendingRenameGroupId === item.node.id"
-            :highlighted="highlightedNodeId === item.node.id"
-            @search-toggle="onSearchToggle"
+            :highlighted="highlightedNodeId === item.id"
+            @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
             @rename-started="pendingRenameGroupId = null"
             @group-created="startRenamingCreatedGroup"
           />
-        </template>
-      </RecycleScroller>
-      <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5] border-b border-border/60" :style="stickyHeaderStyle">
-        <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" @search-toggle="onSearchToggle" />
+        </div>
+        <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--scrolling': isScrollingSidebar, 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">
+          <div class="sidebar-tree-scrollbar__thumb" :style="sidebarScrollbarThumbStyle" @pointerdown.stop="onSidebarScrollbarThumbPointerDown" />
+        </div>
       </div>
-      <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--scrolling': isScrollingSidebar, 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">
-        <div class="sidebar-tree-scrollbar__thumb" :style="sidebarScrollbarThumbStyle" @pointerdown.stop="onSidebarScrollbarThumbPointerDown" />
-      </div>
-    </div>
-    <div v-else-if="flatNodes.length > 0" class="connection-tree-scroll-shell relative min-h-0 flex-1">
-      <div ref="plainTreeScrollerRef" class="sidebar-tree connection-tree-scroller h-full overflow-y-auto" :class="sidebarTreeOverflowClass" @click="clearSidebarSelection" @scroll.passive="onTreeScroll">
-        <TreeItem
-          v-for="item in flatNodes"
-          :key="item.id"
-          :node="item.node"
-          :depth="item.depth"
-          :drag-disabled="isFiltering"
-          :pending-rename="pendingRenameGroupId === item.node.id"
-          :highlighted="highlightedNodeId === item.id"
-          @search-toggle="onSearchToggle"
-          @rename-started="pendingRenameGroupId = null"
-          @group-created="startRenamingCreatedGroup"
-        />
-      </div>
-      <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--scrolling': isScrollingSidebar, 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">
-        <div class="sidebar-tree-scrollbar__thumb" :style="sidebarScrollbarThumbStyle" @pointerdown.stop="onSidebarScrollbarThumbPointerDown" />
-      </div>
-    </div>
+    </CustomContextMenu>
+    <SidebarDdlViewDialog
+      v-if="sidebarDdlTarget"
+      v-model:open="sidebarDdlOpen"
+      :connection-id="sidebarDdlTarget.connectionId!"
+      :database="sidebarDdlTarget.database!"
+      :catalog="sidebarDdlTarget.catalog"
+      :schema="sidebarDdlTarget.schema"
+      :table-name="sidebarDdlTarget.label"
+      :object-type="tableDdlObjectTypeForSidebarNode(sidebarDdlTarget.type)"
+      :database-type="sidebarDdlDatabaseType"
+      :dialect="codeMirrorSqlDialect(sidebarDdlDatabaseType)"
+      :format-dialect="sqlFormatDialectForDbType(sidebarDdlDatabaseType)"
+    />
+
+    <SidebarObjectSourceDialog
+      v-if="sidebarObjectSourceTarget && sidebarObjectSourceType"
+      v-model:open="sidebarObjectSourceOpen"
+      :connection-id="sidebarObjectSourceTarget.node.connectionId!"
+      :database="sidebarObjectSourceTarget.node.database!"
+      :schema="sidebarObjectSourceTarget.node.schema"
+      :name="sidebarObjectSourceTarget.node.objectName || sidebarObjectSourceTarget.node.label"
+      :signature="sidebarObjectSourceTarget.node.signature"
+      :object-type="sidebarObjectSourceType"
+      :database-type="sidebarObjectSourceDatabaseType"
+      :dialect="sidebarObjectSourceDialect"
+      :format-dialect="sidebarObjectSourceFormatDialect"
+      :initial-editing="sidebarObjectSourceTarget.initialEditing"
+      @saved="refreshSidebarActionTarget"
+    />
+
+    <SidebarProcedureExecutionDialog
+      v-if="sidebarProcedureTarget?.connectionId && sidebarProcedureTarget.database"
+      v-model:open="sidebarProcedureOpen"
+      :connection-id="sidebarProcedureTarget.connectionId"
+      :database="sidebarProcedureTarget.database"
+      :database-type="effectiveDatabaseTypeForConnection(store.getConfig(sidebarProcedureTarget.connectionId))"
+      :schema="sidebarProcedureTarget.schema"
+      :routine-name="sidebarProcedureTarget.label"
+      @open-sql="openSidebarProcedureSql"
+      @execute="executeSidebarProcedureSql"
+    />
+
+    <SidebarVisibleDatabasesDialog v-if="sidebarVisibleDatabasesTarget?.connectionId" v-model:open="sidebarVisibleDatabasesOpen" :connection-id="sidebarVisibleDatabasesTarget.connectionId" :connection-name="sidebarVisibleDatabasesTarget.label" />
+
+    <SidebarVisibleSchemasDialog
+      v-if="sidebarVisibleSchemasTarget?.connectionId && sidebarVisibleSchemasTarget.database != null"
+      v-model:open="sidebarVisibleSchemasOpen"
+      :connection-id="sidebarVisibleSchemasTarget.connectionId"
+      :connection-name="sidebarVisibleSchemasTarget.label"
+      :database="sidebarVisibleSchemasTarget.database"
+    />
+    <SidebarDangerConfirmDialog
+      v-if="sidebarDangerDialogRequest"
+      v-model:open="sidebarDangerDialogOpen"
+      :title="sidebarDangerDialogRequest.title"
+      :message="sidebarDangerDialogRequest.message"
+      :sql="sidebarDangerDialogRequest.sql"
+      :details="sidebarDangerDialogRequest.details"
+      :details-text="sidebarDangerDialogRequest.detailsText"
+      :confirm-label="sidebarDangerDialogRequest.confirmLabel"
+      :loading="sidebarDangerDialogConfirming || sidebarDangerDialogRequest.loading"
+      :close-on-confirm="false"
+      @confirm="confirmSidebarDangerDialog"
+    >
+      <template v-if="sidebarDangerDialogRequest.option" #options>
+        <label class="mb-3 flex items-start gap-2 rounded-md border bg-muted/20 px-3 py-2 text-sm">
+          <input :checked="sidebarDangerDialogRequest.option.checked" type="checkbox" class="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" @change="updateSidebarDangerDialogOption" />
+          <span class="grid gap-0.5">
+            <span class="font-medium text-foreground">{{ sidebarDangerDialogRequest.option.label }}</span>
+            <span class="text-xs leading-5 text-muted-foreground">{{ sidebarDangerDialogRequest.option.hint }}</span>
+          </span>
+        </label>
+      </template>
+    </SidebarDangerConfirmDialog>
+    <SidebarTreeItemDialogs v-if="sidebarTreeItemDialogController" :key="sidebarTreeItemDialogController.node?.id" :controller="sidebarTreeItemDialogController" @closed="sidebarTreeItemDialogController = null" />
+    <InstallExtensionDialog v-if="sidebarInstallExtensionTarget" ref="sidebarInstallExtensionDialogRef" :node="sidebarInstallExtensionTarget" @close="refreshSidebarActionTarget" />
     <div v-if="store.treeNodes.length === 0" class="px-3 py-8 text-center text-muted-foreground text-xs">
       {{ t("sidebar.noConnections") }}
     </div>

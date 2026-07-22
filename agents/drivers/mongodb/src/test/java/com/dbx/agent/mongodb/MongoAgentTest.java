@@ -12,13 +12,22 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.result.UpdateResult;
 import java.io.FileInputStream;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.PrivateKey;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import org.bson.Document;
 import org.bson.types.ObjectId;
 import org.junit.jupiter.api.BeforeAll;
@@ -81,6 +90,14 @@ class MongoAgentTest {
     // ─── existing tests ───
 
     @Test
+    void parsesExplicitStringDocumentIdsWithoutTreatingThemAsExtendedJson() {
+        assertEquals(
+            "{\"$numberLong\":\"2048938405781032962\"}",
+            MongoAgent.parseId("__dbx_mongo_string_id__\"{\\\"$numberLong\\\":\\\"2048938405781032962\\\"}\"")
+        );
+    }
+
+    @Test
     void exposesProtocolHandshakeOverJsonRpc() {
         String response = MongoAgent.handleRequest(
             "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"handshake\","
@@ -98,6 +115,16 @@ class MongoAgentTest {
     }
 
     @Test
+    void legacyJsonRpcHandshakeRemainsProtocolV1() {
+        JsonObject result = JsonParser.parseString(MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"handshake\",\"params\":{}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+
+        assertEquals(1, result.get("protocolVersion").getAsInt());
+        assertFalse(containsCapability(result.getAsJsonArray("capabilities"), AgentProtocol.CAPABILITY_MULTI_SESSION));
+    }
+
+    @Test
     void listIndexesMethodIsRecognizedOverJsonRpc() {
         String response = MongoAgent.handleRequest(
             "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"list_indexes\","
@@ -105,6 +132,18 @@ class MongoAgentTest {
 
         JsonObject json = JsonParser.parseString(response).getAsJsonObject();
         assertEquals(8, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void countDocumentsMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"count_documents\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\",\"filter\":\"{}\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(15, json.get("id").getAsInt());
         assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
         assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
     }
@@ -134,6 +173,27 @@ class MongoAgentTest {
         assertNotNull(filter);
         assertEquals(2_048_938_405_781_032_962L, filter.get("processInfoId"));
         assertEquals(9_007_199_254_740_993L, filter.get("snowflake"));
+    }
+
+    @Test
+    void preservesLongDocumentIdTypeForGridUpdates() {
+        Object id = MongoAgent.convertDocumentFieldValue("_id", 2_048_938_405_781_032_962L);
+        Object value = MongoAgent.convertDocumentFieldValue("snowflake", 2_048_938_405_781_032_962L);
+
+        assertEquals(Collections.singletonMap("$numberLong", "2048938405781032962"), id);
+        assertEquals("2048938405781032962", value);
+        assertEquals(2_048_938_405_781_032_962L, MongoAgent.parseId("{\"$numberLong\":\"2048938405781032962\"}"));
+    }
+
+    @Test
+    void preservesJsonLookingStringDocumentIds() {
+        assertEquals("{}", MongoAgent.parseId("{}"));
+        assertEquals("{\"tenant\":1}", MongoAgent.parseId("{\"tenant\":1}"));
+        assertEquals(
+            "{\"$numberLong\":\"2048938405781032962\",\"tenant\":1}",
+            MongoAgent.parseId("{\"$numberLong\":\"2048938405781032962\",\"tenant\":1}")
+        );
+        assertEquals("{\"$numberLong\":\"invalid\"}", MongoAgent.parseId("{\"$numberLong\":\"invalid\"}"));
     }
 
     @Test
@@ -177,6 +237,19 @@ class MongoAgentTest {
     }
 
     @Test
+    void dropCollectionMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"drop_collection\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(14, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+        assertTrue(AgentProtocol.MONGO_LEGACY_METHODS.contains(AgentProtocol.MONGO_METHOD_DROP_COLLECTION));
+    }
+
+    @Test
     void updateDocumentsMethodIsRecognizedOverJsonRpc() {
         String response = MongoAgent.handleRequest(
             "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"update_documents\","
@@ -187,6 +260,57 @@ class MongoAgentTest {
         assertEquals(10, json.get("id").getAsInt());
         assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
         assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void updateDocumentsRpcUsesDocumentOverloads() {
+        List<String> calls = new ArrayList<>();
+        MongoClient client = recordingMongoClient(calls);
+
+        assertRpcModifiedCount(client, 20, "{\"$set\":{\"status\":\"done\"}}", false);
+        assertRpcModifiedCount(client, 21, "{\"$unset\":{\"legacy\":1}}", true);
+
+        assertEquals(List.of("updateOne:document", "updateMany:document"), calls);
+    }
+
+    @Test
+    void updateDocumentsRpcUsesPipelineOverloads() {
+        List<String> calls = new ArrayList<>();
+        MongoClient client = recordingMongoClient(calls);
+
+        assertRpcModifiedCount(client, 22, "[{\"$set\":{\"status\":\"$source\"}}]", false);
+        assertRpcModifiedCount(client, 23, "[{\"$unset\":\"legacy\"}]", true);
+
+        assertEquals(List.of("updateOne:pipeline", "updateMany:pipeline"), calls);
+    }
+
+    @Test
+    void updatePipelineRejectsNonDocumentStages() {
+        IllegalArgumentException error = assertThrows(
+            IllegalArgumentException.class,
+            () -> MongoAgent.updatePipelineForWrite("[{\"$set\":{\"a\":1}}, 2]")
+        );
+
+        assertEquals("Each update pipeline stage must be an object", error.getMessage());
+    }
+
+    @Test
+    void parsesArrayFiltersUpdateOption() {
+        UpdateOptions options = MongoAgent.updateOptionsForWrite(
+            "{\"arrayFilters\":[{\"item.id\":322678}]}"
+        );
+
+        assertEquals(1, options.getArrayFilters().size());
+        assertEquals(322678, ((Document) options.getArrayFilters().get(0)).getInteger("item.id"));
+    }
+
+    @Test
+    void rejectsUnsupportedUpdateOptions() {
+        IllegalArgumentException error = assertThrows(
+            IllegalArgumentException.class,
+            () -> MongoAgent.updateOptionsForWrite("{\"upsert\":true}")
+        );
+        assertEquals("Unsupported update option: upsert", error.getMessage());
     }
 
     @Test
@@ -445,12 +569,52 @@ class MongoAgentTest {
     }
 
     @Test
-    void documentForWriteParsesLegacyDateDisplayStrings() {
-        Document doc = MongoAgent.documentForWrite("{\"$set\":{\"CreateDate\":\"2025-08-14 02:25:43.718\"}}");
+    void documentForWritePreservesDateShapedStrings() {
+        Document doc = MongoAgent.documentForWrite(
+            "{\"$set\":{\"CreateDate\":\"2025-08-14 02:25:43.718\"," +
+                "\"nested\":{\"updated\":\"2025-08-14T02:25:43\"}," +
+                "\"items\":[\"2025-08-14 02:25:43\"]}}"
+        );
 
         Document set = (Document) doc.get("$set");
-        assertTrue(set.get("CreateDate") instanceof Date);
-        assertEquals(1_755_138_343_718L, ((Date) set.get("CreateDate")).getTime());
+        assertEquals("2025-08-14 02:25:43.718", set.getString("CreateDate"));
+        assertEquals("2025-08-14T02:25:43", ((Document) set.get("nested")).getString("updated"));
+        assertEquals("2025-08-14 02:25:43", ((List<?>) set.get("items")).get(0));
+    }
+
+    @Test
+    void documentForWriteParsesExtendedJsonDates() {
+        Document doc = MongoAgent.documentForWrite(
+            "{\"created\":{\"$date\":\"2026-06-10T13:59:31.287Z\"}," +
+                "\"items\":[{\"updated\":{\"$date\":{\"$numberLong\":\"1781100000000\"}}}]}"
+        );
+
+        assertTrue(doc.get("created") instanceof Date);
+        Document item = (Document) ((List<?>) doc.get("items")).get(0);
+        assertTrue(item.get("updated") instanceof Date);
+    }
+
+    @Test
+    void updatePipelinePreservesStringsAndParsesExplicitDates() {
+        List<Document> pipeline = MongoAgent.updatePipelineForWrite(
+            "[{\"$set\":{\"label\":\"2025-08-14 02:25:43.718\"," +
+                "\"created\":\"ISODate(\\\"2026-06-10T13:59:31.287Z\\\")\"}}]"
+        );
+
+        Document set = (Document) pipeline.get(0).get("$set");
+        assertEquals("2025-08-14 02:25:43.718", set.getString("label"));
+        assertTrue(set.get("created") instanceof Date);
+    }
+
+    @Test
+    void filterDocumentsPreserveDateShapedStrings() {
+        Document filter = MongoAgent.documentForWrite(
+            "{\"created\":\"2025-08-14 02:25:43.718\"," +
+                "\"updated\":{\"$date\":\"2026-06-10T13:59:31.287Z\"}}"
+        );
+
+        assertEquals("2025-08-14 02:25:43.718", filter.getString("created"));
+        assertTrue(filter.get("updated") instanceof Date);
     }
 
     @Test
@@ -465,6 +629,63 @@ class MongoAgentTest {
     }
 
     // ─── helpers ───
+
+    private static void assertRpcModifiedCount(MongoClient client, int id, String updateJson, boolean many) {
+        JsonObject params = new JsonObject();
+        params.addProperty("database", "app");
+        params.addProperty("collection", "orders");
+        params.addProperty("filter_json", "{}");
+        params.addProperty("update_json", updateJson);
+        params.addProperty("many", many);
+
+        JsonObject request = new JsonObject();
+        request.addProperty("jsonrpc", "2.0");
+        request.addProperty("id", id);
+        request.addProperty("method", "update_documents");
+        request.add("params", params);
+
+        JsonObject response = JsonParser.parseString(MongoAgent.handleRequest(request.toString(), client)).getAsJsonObject();
+        assertFalse(response.has("error"), response.toString());
+        assertEquals(1, response.getAsJsonObject("result").get("modified_count").getAsLong());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static MongoClient recordingMongoClient(List<String> calls) {
+        MongoCollection<Document> collection = (MongoCollection<Document>) Proxy.newProxyInstance(
+            MongoCollection.class.getClassLoader(),
+            new Class<?>[] {MongoCollection.class},
+            (proxy, method, args) -> {
+                if ("updateOne".equals(method.getName()) || "updateMany".equals(method.getName())) {
+                    calls.add(method.getName() + ":" + (args[1] instanceof List<?> ? "pipeline" : "document"));
+                    return UpdateResult.acknowledged(1, 1L, null);
+                }
+                throw new UnsupportedOperationException(method.getName());
+            }
+        );
+        MongoDatabase database = (MongoDatabase) Proxy.newProxyInstance(
+            MongoDatabase.class.getClassLoader(),
+            new Class<?>[] {MongoDatabase.class},
+            (proxy, method, args) -> {
+                if ("getCollection".equals(method.getName())) {
+                    return collection;
+                }
+                throw new UnsupportedOperationException(method.getName());
+            }
+        );
+        return (MongoClient) Proxy.newProxyInstance(
+            MongoClient.class.getClassLoader(),
+            new Class<?>[] {MongoClient.class},
+            (proxy, method, args) -> {
+                if ("getDatabase".equals(method.getName())) {
+                    return database;
+                }
+                if ("close".equals(method.getName())) {
+                    return null;
+                }
+                throw new UnsupportedOperationException(method.getName());
+            }
+        );
+    }
 
     private static JsonObject minimalConnection() {
         JsonObject conn = new JsonObject();

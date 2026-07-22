@@ -14,17 +14,20 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import EditorSearchPanel from "@/components/editor/EditorSearchPanel.vue";
 import type { EditorView } from "@codemirror/view";
-import type { ObjectSourceKind } from "@/types/database";
+import type { DatabaseType, ObjectSourceKind } from "@/types/database";
 
 const props = withDefaults(
   defineProps<{
     open: boolean;
     connectionId: string;
     database: string;
+    catalog?: string;
     schema?: string;
     tableName: string;
     objectType?: ObjectSourceKind;
-    /** SQL dialect for syntax highlighting. Non-PG/non-MSSQL databases fall back to MySQL (same as QueryEditor's source viewer). */
+    /** Effective database type selects database-specific syntax rules; older callers can still rely on the dialect fallback. */
+    databaseType?: DatabaseType;
+    /** SQL dialect fallback for syntax highlighting when the effective database type is unavailable. */
     dialect: "mysql" | "postgres" | "sqlserver";
     /** SQL formatter dialect. Kept separate from the syntax-highlighting dialect because several PG-compatible DBs highlight as MySQL. */
     formatDialect?: SqlFormatDialect;
@@ -58,7 +61,7 @@ watch(
     ddlLoading.value = true;
     try {
       const schema = props.schema || props.database;
-      const ddl = await api.getTableDdl(props.connectionId, props.database, schema, props.tableName, props.objectType);
+      const ddl = await api.getTableDdl(props.connectionId, props.database, schema, props.tableName, props.objectType, props.catalog);
       ddlContent.value = await formatSqlForDisplay(ddl, props.formatDialect ?? props.dialect, settingsStore.editorSettings.sqlFormatter);
     } catch (e: any) {
       ddlError.value = e?.message || String(e);
@@ -88,7 +91,7 @@ async function initDdlEditor(content: string) {
   const fontFamily = settingsStore.editorSettings.fontFamily;
   const themeExt = await loadEditorTheme(editorTheme, appAppearance, undefined, themePalette.value);
   const fontExt = editorFontTheme(EditorView, fontSize, fontFamily, { fixedHeight: true, scrollable: true });
-  const dialect = createDbxCodeMirrorSqlDialect(langSql, props.dialect);
+  const dialect = createDbxCodeMirrorSqlDialect(langSql, props.dialect, props.databaseType);
   const state = EditorState.create({
     doc: content,
     extensions: [

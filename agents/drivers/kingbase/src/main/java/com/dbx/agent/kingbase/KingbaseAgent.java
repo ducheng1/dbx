@@ -6,7 +6,7 @@ import com.dbx.agent.DatabaseInfo;
 import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcIdentifiers;
-import com.dbx.agent.JsonRpcServer;
+import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.MetadataSqlSupport;
 import com.dbx.agent.ObjectInfo;
@@ -18,6 +18,7 @@ import com.dbx.agent.TriggerInfo;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
@@ -28,12 +29,17 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class KingbaseAgent extends PostgresLikeAgent {
+    private static final int TRIGGER_TYPE_BEFORE = 1 << 1;
+    private static final int TRIGGER_TYPE_INSTEAD = 1 << 6;
     private static final int KINGBASE_VOID_TYPE_OID = 2278;
     private static final String KINGBASE_REL_NAME = "CAST(c.relname AS varchar(256))";
     private static final String KINGBASE_REL_OID = "CAST(c.oid AS varchar(64))";
     private static final String KINGBASE_REL_NAMESPACE = "CAST(c.relnamespace AS varchar(64))";
+    private static final String KINGBASE_REL_OWNER = "c.relowner";
     private static final String KINGBASE_SCHEMA_NAME = "CAST(n.nspname AS varchar(256))";
     private static final String KINGBASE_NAMESPACE_OID = "CAST(n.oid AS varchar(64))";
     private static final String KINGBASE_DESCRIPTION = "CAST(d.description AS varchar(4000))";
@@ -44,6 +50,13 @@ public final class KingbaseAgent extends PostgresLikeAgent {
     private static final String KINGBASE_VIEW_SCHEMA = "CAST(v.schemaname AS varchar(256))";
     private static final String KINGBASE_MATVIEW_NAME = "CAST(mv.matviewname AS varchar(256))";
     private static final String KINGBASE_MATVIEW_SCHEMA = "CAST(mv.schemaname AS varchar(256))";
+    private static final Pattern BOUNDED_VARCHAR_TYPE = Pattern.compile(
+        "^(?:varchar|character\\s+varying)\\s*\\(\\s*(\\d+)\\s*\\)$",
+        Pattern.CASE_INSENSITIVE
+    );
+    private boolean postgresCatalogMode;
+    private boolean sqlServerIdentityCatalogMode;
+    private volatile boolean usePgDefaultExpressionFunction;
 
     public static final PostgresLikeAgentProfile KINGBASE_PROFILE = new PostgresLikeAgentProfile(
         "com.kingbase8.Driver",
@@ -56,27 +69,78 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     protected void afterConnect(ConnectParams params, Connection connection) {
+        postgresCatalogMode = false;
+        sqlServerIdentityCatalogMode = false;
+        usePgDefaultExpressionFunction = false;
+        setMysqlCompatMode(params.isMysql_compat_mode());
         if (params.isMysql_compat_mode()) {
+            return;
+        }
+        postgresCatalogMode = !catalogExists(connection, "sys_catalog.sys_namespace")
+            && catalogExists(connection, "pg_catalog.pg_namespace");
+        if (!postgresCatalogMode && detectMysqlCompatMode(connection)) {
             setMysqlCompatMode(true);
+        }
+        // SQLServer compatibility exposes identity metadata through this catalog only.
+        sqlServerIdentityCatalogMode = !postgresCatalogMode
+            && !isMysqlCompatMode()
+            && catalogExists(connection, "sys.identity_columns");
+    }
+
+    private static boolean detectMysqlCompatMode(Connection connection) {
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                 "SELECT setting FROM sys_catalog.sys_settings WHERE LOWER(name) = 'database_mode'"
+             )) {
+            if (rs.next()) {
+                return "mysql".equalsIgnoreCase(rs.getString(1));
+            }
+        } catch (Exception ignored) {
+            // Older Kingbase versions do not expose database_mode.
+        }
+        return mysqlSqlModeExists(connection);
+    }
+
+    private static boolean mysqlSqlModeExists(Connection connection) {
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT 1 FROM sys_catalog.sys_settings WHERE LOWER(name) = 'sql_mode'")) {
+            return rs.next();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean catalogExists(Connection connection, String catalog) {
+        try (Statement stmt = connection.createStatement();
+             ResultSet ignored = stmt.executeQuery("SELECT 1 FROM " + catalog + " WHERE 1 = 0")) {
+            return true;
+        } catch (Exception ignored) {
+            // Kingbase compatibility modes expose different catalog families.
+            return false;
         }
     }
 
     @Override
     public List<DatabaseInfo> listDatabases() {
+        if (postgresCatalogMode) return super.listDatabases();
         return unchecked(() -> {
-            if (isMysqlCompatMode()) {
-                List<DatabaseInfo> result = queryDatabases("SELECT current_database() AS database_name");
-                if (!result.isEmpty()) return result;
-            }
             for (String sql : List.of(
-                "SELECT datname AS database_name FROM sys_catalog.sys_database WHERE datistemplate = false ORDER BY datname",
-                "SELECT datname AS database_name FROM pg_database WHERE datistemplate = false ORDER BY datname"
+                "SELECT datname AS database_name FROM sys_catalog.sys_database WHERE datistemplate = false AND datallowconn = true ORDER BY datname",
+                "SELECT datname AS database_name FROM pg_catalog.pg_database WHERE datistemplate = false AND datallowconn = true ORDER BY datname"
             )) {
                 try {
                     List<DatabaseInfo> result = queryDatabases(sql);
                     if (!result.isEmpty()) return result;
                 } catch (Exception ignored) {
                     // Kingbase catalog names differ across compatibility modes and versions.
+                }
+            }
+            if (isMysqlCompatMode()) {
+                try {
+                    List<DatabaseInfo> result = queryDatabases("SELECT current_database() AS database_name");
+                    if (!result.isEmpty()) return result;
+                } catch (Exception ignored) {
+                    // Keep the configured database as the final fallback if current_database() is unavailable.
                 }
             }
             return Collections.singletonList(new DatabaseInfo(getConfiguredDatabase()));
@@ -96,17 +160,18 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public List<String> listSchemas() {
+        if (postgresCatalogMode) return super.listSchemas();
         return unchecked(() -> {
             List<String> result = new ArrayList<>();
             String sql = isMysqlCompatMode()
                 ? "SELECT schema_name " +
                     "FROM information_schema.schemata " +
                     "WHERE UPPER(schema_name) <> 'INFORMATION_SCHEMA' " +
-                    "AND UPPER(schema_name) NOT LIKE 'SYS%' " +
-                    "AND UPPER(schema_name) NOT LIKE 'XLOG%' " +
+                    "AND UPPER(schema_name) NOT LIKE 'SYS\\_%' ESCAPE '\\' " +
+                    "AND UPPER(schema_name) NOT LIKE 'XLOG\\_%' ESCAPE '\\' " +
                     "ORDER BY schema_name"
                 : "SELECT nspname AS schema_name " +
-                    "FROM sys_namespace " +
+                    "FROM sys_catalog.sys_namespace " +
                     "WHERE nspname NOT LIKE 'sys_temp_%' " +
                     "AND nspname NOT LIKE 'sys_toast_temp_%' " +
                     "ORDER BY nspname";
@@ -122,14 +187,16 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public List<TableInfo> listTables(String schema) {
+        if (postgresCatalogMode) return super.listTables(schema);
         if (isMysqlCompatMode()) {
-            return listTables(schema, "table_type IN ('BASE TABLE', 'VIEW')");
+            return queryMysqlCompatTables(schema, MetadataListConstraints.NONE);
         }
         return queryRegularTables(schema, MetadataListConstraints.NONE);
     }
 
     @Override
     public List<TableInfo> listTables(String schema, MetadataListConstraints constraints) {
+        if (postgresCatalogMode) return super.listTables(schema, constraints);
         MetadataListConstraints normalized = MetadataListConstraints.orNone(constraints);
         if (isUnconstrained(normalized)) {
             return listTables(schema);
@@ -176,20 +243,76 @@ public final class KingbaseAgent extends PostgresLikeAgent {
     }
 
     private List<TableInfo> queryMysqlCompatTables(String schema, MetadataListConstraints constraints) {
+        try {
+            return queryMysqlCompatInformationSchemaTables(schema, constraints);
+        } catch (RuntimeException error) {
+            if (!isSysFreespacePermissionError(error)) {
+                throw error;
+            }
+            return queryMysqlCompatCatalogTables(schema, constraints);
+        }
+    }
+
+    private List<TableInfo> queryMysqlCompatInformationSchemaTables(
+        String schema,
+        MetadataListConstraints constraints
+    ) {
         return unchecked(() -> {
             List<TableInfo> result = new ArrayList<>();
             List<Object> args = new ArrayList<>();
-            StringBuilder sql = new StringBuilder("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = ?");
-            args.add(effectiveSchema(schema));
+            StringBuilder sql = new StringBuilder("SELECT t.table_name, t.table_type, ")
+                .append(KINGBASE_DESCRIPTION).append(" AS table_comment ")
+                .append("FROM information_schema.tables t ")
+                .append("LEFT JOIN sys_catalog.sys_namespace n ON ").append(KINGBASE_SCHEMA_NAME)
+                .append(" = CAST(t.table_schema AS varchar(256)) ")
+                .append("LEFT JOIN sys_catalog.sys_class c ON ").append(KINGBASE_REL_NAMESPACE)
+                .append(" = ").append(KINGBASE_NAMESPACE_OID)
+                .append(" AND ").append(KINGBASE_REL_NAME).append(" = CAST(t.table_name AS varchar(256)) ")
+                .append("LEFT JOIN sys_catalog.sys_description d ON CAST(d.objoid AS varchar(64)) = ")
+                .append(KINGBASE_REL_OID).append(" AND d.objsubid = 0 ")
+                .append("WHERE t.table_schema = ").append(sqlString(effectiveSchema(schema)));
             appendMysqlCompatTableTypePredicate(sql, args, constraints);
-            MetadataSqlSupport.appendNameFilter(sql, args, "table_name", constraints);
-            sql.append(" ORDER BY table_name");
+            MetadataSqlSupport.appendNameFilter(sql, args, "t.table_name", constraints);
+            sql.append(" ORDER BY t.table_name");
             MetadataSqlSupport.appendLiteralLimitOffset(sql, constraints);
             try (PreparedStatement stmt = requireConnected().prepareStatement(sql.toString())) {
                 MetadataSqlSupport.bind(stmt, args);
                 try (ResultSet rs = stmt.executeQuery()) {
                     while (rs.next()) {
-                        result.add(new TableInfo(rs.getString(1), normalizeTableType(rs.getString(2))));
+                        result.add(new TableInfo(rs.getString(1), normalizeTableType(rs.getString(2)), rs.getString(3)));
+                    }
+                }
+            }
+            return constraints.withoutPaging().filterTables(result);
+        });
+    }
+
+    private List<TableInfo> queryMysqlCompatCatalogTables(String schema, MetadataListConstraints constraints) {
+        return unchecked(() -> {
+            List<TableInfo> result = new ArrayList<>();
+            List<Object> args = new ArrayList<>();
+            StringBuilder sql = new StringBuilder("SELECT ")
+                .append(KINGBASE_REL_NAME).append(" AS table_name, ")
+                .append("CASE WHEN CAST(c.relkind AS varchar(16)) IN ('r', 'p') THEN 'TABLE' ELSE 'VIEW' END AS table_type, ")
+                .append(KINGBASE_DESCRIPTION).append(" AS table_comment ")
+                .append("FROM sys_catalog.sys_class c ")
+                .append("JOIN sys_catalog.sys_namespace n ON ").append(KINGBASE_NAMESPACE_OID).append(" = ").append(KINGBASE_REL_NAMESPACE).append(' ')
+                .append("LEFT JOIN sys_catalog.sys_description d ON CAST(d.objoid AS varchar(64)) = ").append(KINGBASE_REL_OID).append(" AND d.objsubid = 0 ")
+                .append("WHERE ").append(KINGBASE_SCHEMA_NAME).append(" = ").append(sqlString(effectiveSchema(schema)));
+            appendMysqlCompatCatalogTypePredicate(sql, constraints);
+            appendRelationVisibilityPredicate(sql);
+            MetadataSqlSupport.appendNameFilter(sql, args, KINGBASE_REL_NAME, constraints);
+            sql.append(" ORDER BY ").append(KINGBASE_REL_NAME);
+            MetadataSqlSupport.appendLiteralLimitOffset(sql, constraints);
+            try (PreparedStatement stmt = requireConnected().prepareStatement(sql.toString())) {
+                MetadataSqlSupport.bind(stmt, args);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        result.add(new TableInfo(
+                            rs.getString("table_name"),
+                            normalizeTableType(rs.getString("table_type")),
+                            rs.getString("table_comment")
+                        ));
                     }
                 }
             }
@@ -199,6 +322,7 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public List<ObjectInfo> listObjects(String schema) {
+        if (postgresCatalogMode) return super.listObjects(schema);
         return unchecked(() -> {
             String effectiveSchema = effectiveSchema(schema);
             List<ObjectInfo> result = new ArrayList<>();
@@ -235,6 +359,7 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public List<ObjectInfo> listObjects(String schema, MetadataListConstraints constraints) {
+        if (postgresCatalogMode) return super.listObjects(schema, constraints);
         MetadataListConstraints normalized = MetadataListConstraints.orNone(constraints);
         if (isUnconstrained(normalized)) {
             return listObjects(schema);
@@ -299,6 +424,7 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public ObjectSource getObjectSource(String schema, String name, String objectType) {
+        if (postgresCatalogMode) return super.getObjectSource(schema, name, objectType);
         if ("FUNCTION".equalsIgnoreCase(objectType) || "PROCEDURE".equalsIgnoreCase(objectType)) {
             return routineSource(schema, name, objectType);
         }
@@ -354,6 +480,7 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public List<ColumnInfo> getColumns(String schema, String table) {
+        if (postgresCatalogMode) return super.getColumns(schema, table);
         return unchecked(() -> {
             Set<String> primaryKeys = primaryKeys(schema, table);
             if (!isMysqlCompatMode()) {
@@ -364,12 +491,30 @@ public final class KingbaseAgent extends PostgresLikeAgent {
     }
 
     private List<ColumnInfo> getRegularColumns(String schema, String table, Set<String> primaryKeys) {
+        boolean usePgFunction = usePgDefaultExpressionFunction;
+        try {
+            return queryRegularColumns(schema, table, primaryKeys, usePgFunction ? "pg_get_expr" : "sys_get_expr");
+        } catch (RuntimeException error) {
+            if (usePgFunction || !isUndefinedFunction(error, "sys_get_expr")) {
+                throw error;
+            }
+            usePgDefaultExpressionFunction = true;
+            return queryRegularColumns(schema, table, primaryKeys, "pg_get_expr");
+        }
+    }
+
+    private List<ColumnInfo> queryRegularColumns(
+        String schema,
+        String table,
+        Set<String> primaryKeys,
+        String defaultExpressionFunction
+    ) {
         return unchecked(() -> {
             List<ColumnInfo> result = new ArrayList<>();
             String sql = "SELECT a.attname AS column_name, " +
                 "format_type(a.atttypid, a.atttypmod) AS data_type, " +
                 "NOT a.attnotnull AS is_nullable, " +
-                "sys_get_expr(ad.adbin, ad.adrelid) AS column_default, " +
+                defaultExpressionFunction + "(ad.adbin, ad.adrelid) AS column_default, " +
                 "d.description AS column_comment, " +
                 "CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 " +
                 "THEN ((a.atttypmod - 4) >> 16) & 65535 ELSE NULL END AS numeric_precision, " +
@@ -406,34 +551,90 @@ public final class KingbaseAgent extends PostgresLikeAgent {
                     }
                 }
             }
+            applySqlServerIdentityMetadata(schema, table, result);
             return result;
         });
+    }
+
+    private void applySqlServerIdentityMetadata(String schema, String table, List<ColumnInfo> columns) {
+        if (!sqlServerIdentityCatalogMode || columns.isEmpty()) return;
+        String sql = "SELECT a.attname AS column_name, ic.seed_value AS identity_seed, " +
+            "ic.increment_value AS identity_increment " +
+            "FROM sys.identity_columns ic " +
+            "JOIN sys_catalog.sys_class c ON c.oid = ic.object_id " +
+            "JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace " +
+            "JOIN sys_catalog.sys_attribute a ON a.attrelid = c.oid AND a.attnum = ic.column_id " +
+            "WHERE n.nspname = " + sqlString(effectiveSchema(schema)) +
+            " AND c.relname = " + sqlString(table);
+        try (Statement stmt = requireConnected().createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            Map<String, ColumnInfo> columnsByName = new LinkedHashMap<>();
+            for (ColumnInfo column : columns) {
+                columnsByName.put(column.getName(), column);
+            }
+            while (rs.next()) {
+                ColumnInfo column = columnsByName.get(rs.getString("column_name"));
+                if (column != null) {
+                    column.setExtra(identityExtra(rs));
+                }
+            }
+        } catch (SQLException ignored) {
+            // Identity metadata is optional and some Kingbase versions expose a broken compatibility view.
+            sqlServerIdentityCatalogMode = false;
+        }
+    }
+
+    private static String identityExtra(ResultSet rs) throws SQLException {
+        String seed = rs.getString("identity_seed");
+        String increment = rs.getString("identity_increment");
+        if (seed == null || increment == null) {
+            return null;
+        }
+        return "identity(" + seed + "," + increment + ")";
     }
 
     private List<ColumnInfo> getInformationSchemaColumns(String schema, String table, Set<String> primaryKeys) {
         return unchecked(() -> {
             List<ColumnInfo> result = new ArrayList<>();
-            String sql = "SELECT column_name, data_type, is_nullable, column_default, " +
-                "numeric_precision, numeric_scale, character_maximum_length " +
-                "FROM information_schema.columns " +
-                "WHERE table_schema = " + sqlString(effectiveSchema(schema)) +
-                " AND table_name = " + sqlString(table) + " " +
-                "ORDER BY ordinal_position";
+            String sql = "SELECT ic.column_name, ic.data_type, ic.is_nullable, ic.column_default, " +
+                "ic.numeric_precision, ic.numeric_scale, ic.character_maximum_length, " +
+                "format_type(a.atttypid, a.atttypmod) AS catalog_data_type, " +
+                "d.description AS column_comment " +
+                "FROM information_schema.columns ic " +
+                // information_schema preserves MySQL-compatible type metadata but does not expose comments.
+                "LEFT JOIN sys_catalog.sys_namespace n ON n.nspname = ic.table_schema " +
+                "LEFT JOIN sys_catalog.sys_class c ON c.relnamespace = n.oid AND c.relname = ic.table_name " +
+                "LEFT JOIN sys_catalog.sys_attribute a ON a.attrelid = c.oid AND a.attname = ic.column_name " +
+                "AND a.attnum > 0 AND NOT a.attisdropped " +
+                "LEFT JOIN sys_catalog.sys_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum " +
+                "WHERE ic.table_schema = " + sqlString(effectiveSchema(schema)) +
+                " AND ic.table_name = " + sqlString(table) + " " +
+                "ORDER BY ic.ordinal_position";
             try (Statement stmt = requireConnected().createStatement()) {
                 try (ResultSet rs = stmt.executeQuery(sql)) {
                     while (rs.next()) {
                         String columnName = rs.getString("column_name");
+                        String dataType = rs.getString("data_type");
+                        Integer characterLength = intObject(rs, "character_maximum_length");
+                        String catalogDataType = rs.getString("catalog_data_type");
+                        Integer catalogCharacterLength = boundedCharacterLength(catalogDataType);
+                        if ("varchar".equalsIgnoreCase(dataType)
+                            && (characterLength == null || characterLength <= 0)
+                            && catalogCharacterLength != null) {
+                            dataType = catalogDataType;
+                            characterLength = catalogCharacterLength;
+                        }
                         result.add(new ColumnInfo(
                             columnName,
-                            rs.getString("data_type"),
+                            dataType,
                             "YES".equalsIgnoreCase(coalesce(rs.getString("is_nullable"))),
                             rs.getString("column_default"),
                             primaryKeys.contains(columnName),
                             null,
-                            null,
+                            rs.getString("column_comment"),
                             intObject(rs, "numeric_precision"),
                             intObject(rs, "numeric_scale"),
-                            intObject(rs, "character_maximum_length")
+                            characterLength
                         ));
                     }
                 }
@@ -442,8 +643,21 @@ public final class KingbaseAgent extends PostgresLikeAgent {
         });
     }
 
+    private static Integer boundedCharacterLength(String dataType) {
+        if (dataType == null) return null;
+        Matcher match = BOUNDED_VARCHAR_TYPE.matcher(dataType.trim());
+        if (!match.matches()) return null;
+        try {
+            int length = Integer.parseInt(match.group(1));
+            return length > 0 ? length : null;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     @Override
     public List<IndexInfo> listIndexes(String schema, String table) {
+        if (postgresCatalogMode) return super.listIndexes(schema, table);
         return unchecked(() -> {
             Map<String, CatalogIndexBuilder> indexes = new LinkedHashMap<>();
             String sql = "SELECT i.relname AS index_name, am.amname AS index_type, " +
@@ -454,8 +668,8 @@ public final class KingbaseAgent extends PostgresLikeAgent {
                 "JOIN SYS_CATALOG.SYS_CLASS i ON i.oid = ix.indexrelid " +
                 "JOIN SYS_CATALOG.SYS_NAMESPACE n ON n.oid = t.relnamespace " +
                 "JOIN SYS_CATALOG.SYS_AM am ON am.oid = i.relam " +
-                "JOIN generate_series(1, 64) AS pos(n) ON pos.n <= array_length(string_to_array(ix.indkey::text, ' '), 1) " +
-                "JOIN SYS_CATALOG.SYS_ATTRIBUTE a ON a.attrelid = t.oid AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 " +
+                "JOIN unnest(ix.indkey) WITH ORDINALITY AS pos(attnum, n) ON true " +
+                "JOIN SYS_CATALOG.SYS_ATTRIBUTE a ON a.attrelid = t.oid AND a.attnum = pos.attnum " +
                 "WHERE n.nspname = " + sqlString(effectiveSchema(schema)) +
                 " AND t.relname = " + sqlString(table) + " " +
                 "ORDER BY i.relname, pos.n";
@@ -487,6 +701,7 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public List<ForeignKeyInfo> listForeignKeys(String schema, String table) {
+        if (postgresCatalogMode) return super.listForeignKeys(schema, table);
         return unchecked(() -> {
             List<ForeignKeyInfo> result = new ArrayList<>();
             String sql = "SELECT fk.constraint_name, fk.column_name, pk.table_name AS ref_table, pk.column_name AS ref_column " +
@@ -525,15 +740,50 @@ public final class KingbaseAgent extends PostgresLikeAgent {
 
     @Override
     public List<TriggerInfo> listTriggers(String schema, String table) {
-        return Collections.emptyList();
+        if (postgresCatalogMode) return super.listTriggers(schema, table);
+        return unchecked(() -> {
+            List<TriggerInfo> result = new ArrayList<>();
+            String sql = "SELECT tg.tgname AS trigger_name, " +
+                "trim(trailing ',' FROM (" +
+                "CASE WHEN (tg.tgtype & 4) <> 0 THEN 'INSERT,' ELSE '' END || " +
+                "CASE WHEN (tg.tgtype & 8) <> 0 THEN 'DELETE,' ELSE '' END || " +
+                "CASE WHEN (tg.tgtype & 16) <> 0 THEN 'UPDATE,' ELSE '' END || " +
+                "CASE WHEN (tg.tgtype & 32) <> 0 THEN 'TRUNCATE,' ELSE '' END" +
+                ")) AS event_manipulation, tg.tgtype AS trigger_type " +
+                "FROM sys_catalog.sys_trigger tg " +
+                "JOIN sys_catalog.sys_class c ON c.oid = tg.tgrelid " +
+                "JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace " +
+                "WHERE n.nspname = " + sqlString(effectiveSchema(schema)) +
+                " AND c.relname = " + sqlString(table) + " AND NOT tg.tgisinternal " +
+                "ORDER BY tg.tgname";
+            try (Statement stmt = requireConnected().createStatement()) {
+                try (ResultSet rs = stmt.executeQuery(sql)) {
+                    while (rs.next()) {
+                        result.add(new TriggerInfo(
+                            rs.getString("trigger_name"),
+                            rs.getString("event_manipulation"),
+                            decodeTriggerTiming(rs.getInt("trigger_type"))
+                        ));
+                    }
+                }
+            }
+            return result;
+        });
+    }
+
+    private static String decodeTriggerTiming(int triggerType) {
+        // INSTEAD OF has its own catalog bit and must not fall through to AFTER.
+        if ((triggerType & TRIGGER_TYPE_INSTEAD) != 0) return "INSTEAD OF";
+        if ((triggerType & TRIGGER_TYPE_BEFORE) != 0) return "BEFORE";
+        return "AFTER";
     }
 
     @Override
     public String setSchemaSQL(String schema) {
-        // Kingbase searches sys_catalog implicitly before user schemas unless it
-        // is listed explicitly. Put it after the selected schema so business
-        // tables named like system tables (for example sys_config) win.
-        return "SET search_path TO " + JdbcIdentifiers.INSTANCE.doubleQuote(effectiveSchema(schema)) + ", sys_catalog";
+        if (postgresCatalogMode) return super.setSchemaSQL(schema);
+        // Keep sys_catalog's implicit priority for functions, types, and
+        // operators. User table references are schema-qualified before execution.
+        return "SET search_path TO " + JdbcIdentifiers.INSTANCE.doubleQuote(effectiveSchema(schema));
     }
 
     @Override
@@ -593,23 +843,6 @@ public final class KingbaseAgent extends PostgresLikeAgent {
         });
     }
 
-    private List<TableInfo> listTables(String schema, String tableTypePredicate) {
-        return unchecked(() -> {
-            List<TableInfo> result = new ArrayList<>();
-            String sql = "SELECT table_name, table_type " +
-                "FROM information_schema.tables " +
-                "WHERE table_schema = " + sqlString(effectiveSchema(schema)) + " AND " + tableTypePredicate + " " +
-                "ORDER BY table_name";
-            try (Statement stmt = requireConnected().createStatement();
-                 ResultSet rs = stmt.executeQuery(sql)) {
-                    while (rs.next()) {
-                        result.add(new TableInfo(rs.getString(1), normalizeTableType(rs.getString(2))));
-                    }
-            }
-            return result;
-        });
-    }
-
     private static boolean isUnconstrained(MetadataListConstraints constraints) {
         return !constraints.hasFilter() && !constraints.hasLimit() && !constraints.hasOffset() && !constraints.hasObjectTypes();
     }
@@ -656,8 +889,12 @@ public final class KingbaseAgent extends PostgresLikeAgent {
             .append("FROM sys_catalog.sys_class c ")
             .append("JOIN sys_catalog.sys_namespace n ON ").append(KINGBASE_NAMESPACE_OID).append(" = ").append(KINGBASE_REL_NAMESPACE).append(' ')
             .append("LEFT JOIN sys_catalog.sys_description d ON CAST(d.objoid AS varchar(64)) = ").append(KINGBASE_REL_OID).append(" AND d.objsubid = 0 ")
-            .append("WHERE ").append(KINGBASE_SCHEMA_NAME).append(" = ").append(sqlString(schema));
-        appendRegularTablePredicate(sql);
+            .append("WHERE ").append(KINGBASE_SCHEMA_NAME).append(" = ").append(sqlString(schema))
+            .append(" AND (EXISTS (SELECT 1 FROM sys_catalog.sys_tables t ")
+            .append("WHERE CAST(t.schemaname AS varchar(256)) = ").append(KINGBASE_SCHEMA_NAME)
+            .append(" AND CAST(t.tablename AS varchar(256)) = ").append(KINGBASE_REL_NAME).append(')')
+            .append(" OR EXISTS (SELECT 1 FROM sys_catalog.sys_foreign_table ft ")
+            .append("WHERE CAST(ft.ftrelid AS varchar(64)) = ").append(KINGBASE_REL_OID).append("))");
         MetadataSqlSupport.appendNameFilter(sql, args, KINGBASE_REL_NAME, constraints);
         return sql.toString();
     }
@@ -706,20 +943,35 @@ public final class KingbaseAgent extends PostgresLikeAgent {
         return sql.toString();
     }
 
-    private static void appendRegularTablePredicate(StringBuilder sql) {
-        sql.append(" AND NOT EXISTS (SELECT 1 FROM sys_catalog.sys_rewrite r ")
-            .append("WHERE CAST(r.ev_class AS varchar(64)) = ").append(KINGBASE_REL_OID)
-            .append(" AND CAST(r.rulename AS varchar(256)) = '_RETURN')")
-            .append(" AND NOT EXISTS (SELECT 1 FROM sys_catalog.sys_index ix ")
-            .append("WHERE CAST(ix.indexrelid AS varchar(64)) = ").append(KINGBASE_REL_OID).append(')')
-            .append(" AND NOT EXISTS (SELECT 1 FROM sys_catalog.sys_attribute sa1 ")
-            .append("JOIN sys_catalog.sys_attribute sa2 ON CAST(sa2.attrelid AS varchar(64)) = CAST(sa1.attrelid AS varchar(64)) ")
-            .append("WHERE CAST(sa1.attrelid AS varchar(64)) = ").append(KINGBASE_REL_OID)
-            .append(" AND CAST(sa1.attname AS varchar(256)) = 'last_value'")
-            .append(" AND CAST(sa2.attname AS varchar(256)) = 'log_cnt')");
+    private static void appendRelationVisibilityPredicate(StringBuilder sql) {
+        sql.append(" AND (SYS_HAS_ROLE(").append(KINGBASE_REL_OWNER).append(", 'USAGE')")
+            .append(" OR HAS_TABLE_PRIVILEGE(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')")
+            .append(" OR HAS_ANY_COLUMN_PRIVILEGE(c.oid, 'SELECT, INSERT, UPDATE, REFERENCES'))");
     }
 
-    private static void appendMysqlCompatTableTypePredicate(StringBuilder sql, List<Object> args, MetadataListConstraints constraints) {
+    private static void appendMysqlCompatCatalogTypePredicate(
+        StringBuilder sql,
+        MetadataListConstraints constraints
+    ) {
+        boolean includeTables = constraints.tableTypeAllowed("TABLE");
+        boolean includeViews = constraints.tableTypeAllowed("VIEW");
+        if (includeTables && includeViews) {
+            sql.append(" AND (CAST(c.relkind AS varchar(16)) IN ('r', 'p')")
+                .append(" OR (CAST(c.relkind AS varchar(16)) = 'v' AND c.oid >= 16384))");
+        } else if (includeTables) {
+            sql.append(" AND CAST(c.relkind AS varchar(16)) IN ('r', 'p')");
+        } else if (includeViews) {
+            sql.append(" AND CAST(c.relkind AS varchar(16)) = 'v' AND c.oid >= 16384");
+        } else {
+            sql.append(" AND 1 = 0");
+        }
+    }
+
+    private static void appendMysqlCompatTableTypePredicate(
+        StringBuilder sql,
+        List<Object> args,
+        MetadataListConstraints constraints
+    ) {
         if (!constraints.hasObjectTypes()) {
             sql.append(" AND table_type IN ('BASE TABLE', 'VIEW')");
             return;
@@ -737,6 +989,40 @@ public final class KingbaseAgent extends PostgresLikeAgent {
         }
         sql.append(" AND table_type IN (").append(MetadataSqlSupport.placeholders(types.size())).append(")");
         args.addAll(types);
+    }
+
+    private static boolean isSysFreespacePermissionError(Throwable error) {
+        boolean insufficientPrivilege = false;
+        boolean mentionsSysFreespace = false;
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            if (current instanceof SQLException && "42501".equals(((SQLException) current).getSQLState())) {
+                insufficientPrivilege = true;
+            }
+            String message = current.getMessage();
+            if (message != null) {
+                String normalized = message.toLowerCase(Locale.ROOT);
+                mentionsSysFreespace |= normalized.contains("sys_freespace")
+                    || normalized.contains("pg_relation_size_ex");
+            }
+        }
+        return insufficientPrivilege && mentionsSysFreespace;
+    }
+
+    private static boolean isUndefinedFunction(Throwable error, String functionName) {
+        boolean undefinedFunction = false;
+        boolean mentionsFunction = false;
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            if (current instanceof SQLException && "42883".equals(((SQLException) current).getSQLState())) {
+                undefinedFunction = true;
+            }
+            String message = current.getMessage();
+            if (message != null) {
+                String normalized = message.toLowerCase(Locale.ROOT);
+                mentionsFunction |= normalized.contains(functionName.toLowerCase(Locale.ROOT));
+                undefinedFunction |= normalized.contains("does not exist") || normalized.contains("不存在");
+            }
+        }
+        return undefinedFunction && mentionsFunction;
     }
 
     private static void appendRoutineKindPredicate(StringBuilder sql, List<Object> args, MetadataListConstraints constraints) {
@@ -807,6 +1093,6 @@ public final class KingbaseAgent extends PostgresLikeAgent {
     }
 
     public static void main(String[] args) {
-        new JsonRpcServer(new KingbaseAgent()).run();
+        new MultiSessionJsonRpcServer(KingbaseAgent::new).run();
     }
 }

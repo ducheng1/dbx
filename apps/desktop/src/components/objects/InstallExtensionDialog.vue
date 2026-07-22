@@ -7,12 +7,15 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { buildCreateExtensionSql, buildDropExtensionSql } from "@/lib/database/dbAdminSql";
 import * as api from "@/lib/backend/api";
+import { useConnectionStore } from "@/stores/connectionStore";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { useToast } from "@/composables/useToast";
 import { translateBackendError } from "@/i18n/backend-errors";
 import type { ExtensionInfo, TreeNode } from "@/types/database";
 
 const { t } = useI18n();
 const { toast } = useToast();
+const connectionStore = useConnectionStore();
 
 const props = defineProps<{
   node: TreeNode;
@@ -53,7 +56,14 @@ async function installExtension(name: string) {
   installing.value = name;
   try {
     const sql = buildCreateExtensionSql(name, props.node.schema ?? null);
-    await api.executeQuery(props.node.connectionId, props.node.database, sql, props.node.schema ?? undefined);
+    const result = await executeWithProductionSqlGuard({
+      connection: connectionStore.getConfig(props.node.connectionId),
+      database: props.node.database,
+      sql,
+      source: t("production.sourceExtension"),
+      execute: () => api.executeQuery(props.node.connectionId!, props.node.database!, sql, props.node.schema ?? undefined),
+    });
+    if (!result) return;
     await loadData();
     emit("close");
   } catch (e: any) {
@@ -68,7 +78,14 @@ async function dropExtension(name: string) {
   dropping.value = name;
   try {
     const sql = buildDropExtensionSql(name, false);
-    await api.executeQuery(props.node.connectionId, props.node.database, sql, props.node.schema ?? undefined);
+    const result = await executeWithProductionSqlGuard({
+      connection: connectionStore.getConfig(props.node.connectionId),
+      database: props.node.database,
+      sql,
+      source: t("production.sourceExtension"),
+      execute: () => api.executeQuery(props.node.connectionId!, props.node.database!, sql, props.node.schema ?? undefined),
+    });
+    if (!result) return;
     await loadData();
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
@@ -82,7 +99,7 @@ defineExpose({ show });
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent class="sm:max-w-3xl">
+    <DialogContent class="h-[min(760px,calc(100dvh-2rem))] flex flex-col overflow-hidden sm:max-w-3xl">
       <DialogHeader>
         <DialogTitle>{{ t("extension.manageTitle") }}</DialogTitle>
       </DialogHeader>
@@ -91,15 +108,15 @@ defineExpose({ show });
         <Loader2 class="h-6 w-6 animate-spin text-muted-foreground" />
       </div>
 
-      <div v-else class="grid grid-cols-2 gap-4">
+      <div v-else class="grid flex-1 min-h-0 grid-cols-1 gap-4 sm:grid-cols-2">
         <!-- Left: Available -->
-        <div class="flex flex-col min-h-[300px]">
+        <div class="flex min-h-0 flex-col">
           <div class="flex items-center gap-1.5 mb-2 text-sm font-medium text-muted-foreground">
             <Package class="h-4 w-4" />
             {{ t("extension.available") }}
             <span class="ml-auto text-xs">({{ available.length }})</span>
           </div>
-          <ScrollArea class="flex-1 rounded-md border">
+          <ScrollArea class="min-h-0 flex-1 rounded-md border">
             <div v-if="available.length === 0" class="flex items-center justify-center py-12 text-sm text-muted-foreground">
               {{ t("extension.noAvailable") }}
             </div>
@@ -120,13 +137,13 @@ defineExpose({ show });
         </div>
 
         <!-- Right: Installed -->
-        <div class="flex flex-col min-h-[300px]">
+        <div class="flex min-h-0 flex-col">
           <div class="flex items-center gap-1.5 mb-2 text-sm font-medium text-muted-foreground">
             <Package class="h-4 w-4" />
             {{ t("extension.installed") }}
             <span class="ml-auto text-xs">({{ installed.length }})</span>
           </div>
-          <ScrollArea class="flex-1 rounded-md border">
+          <ScrollArea class="min-h-0 flex-1 rounded-md border">
             <div v-if="installed.length === 0" class="flex items-center justify-center py-12 text-sm text-muted-foreground">
               {{ t("extension.noInstalled") }}
             </div>

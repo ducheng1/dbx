@@ -14,6 +14,7 @@ const assetIcons: Record<string, string> = {
   sqlite: "sqlite",
   rqlite: "rqlite.png",
   turso: "turso.png",
+  cloudflare_d1: "cloudflare-d1",
   redis: "redis",
   mongodb: "mongodb",
   mongodb_legacy: "mongodb",
@@ -87,10 +88,12 @@ const assetIcons: Record<string, string> = {
   mq: "pulsar",
   pulsar: "pulsar",
   kafka: "kafka",
+  rocketmq: "rocketmq",
   nacos: "nacos.png",
   iris: "iris.png",
   influxdb: "influxdb",
   zookeeper: "zookeeper",
+  jdbcx: "jdbcx",
 };
 
 const letterIcons: Record<string, { letter: string; color: string }> = {

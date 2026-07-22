@@ -222,7 +222,7 @@ fn build_query_url(client: &InfluxdbClient, database: Option<&str>, sql: &str) -
     }
     let encoded_sql = utf8_percent_encode(sql, NON_ALPHANUMERIC);
     params.push(format!("q={encoded_sql}"));
-    format!("{}/query?{}", &client.base_url, params.join("&").as_str())
+    format!("{}/query?{}", client.base_url, params.join("&").as_str())
 }
 
 fn encode_url_param(value: &str) -> String {
@@ -231,12 +231,12 @@ fn encode_url_param(value: &str) -> String {
 
 fn build_v2_buckets_url(client: &InfluxdbClient, offset: usize) -> Result<String, String> {
     let org = client.org.as_deref().ok_or_else(|| "InfluxDB 2.x organization is required".to_string())?;
-    Ok(format!("{}/api/v2/buckets?org={}&limit=100&offset={offset}", &client.base_url, encode_url_param(org)))
+    Ok(format!("{}/api/v2/buckets?org={}&limit=100&offset={offset}", client.base_url, encode_url_param(org)))
 }
 
 fn build_v2_query_url(client: &InfluxdbClient) -> Result<String, String> {
     let org = client.org.as_deref().ok_or_else(|| "InfluxDB 2.x organization is required".to_string())?;
-    Ok(format!("{}/api/v2/query?org={}", &client.base_url, encode_url_param(org)))
+    Ok(format!("{}/api/v2/query?org={}", client.base_url, encode_url_param(org)))
 }
 
 fn build_request(client: &InfluxdbClient, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -424,6 +424,7 @@ pub async fn get_columns(client: &InfluxdbClient, database: &str, table: &str) -
         numeric_scale: None,
         character_maximum_length: None,
         enum_values: None,
+        ..Default::default()
     };
 
     let cols: Vec<ColumnInfo> = std::iter::once(time_col)
@@ -439,6 +440,7 @@ pub async fn get_columns(client: &InfluxdbClient, database: &str, table: &str) -
             numeric_scale: None,
             character_maximum_length: None,
             enum_values: None,
+            ..Default::default()
         }))
         .chain(field_series.first().into_iter().flat_map(|s| s.values.iter()).map(|row| {
             let data_type = row.get(1).and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
@@ -454,6 +456,7 @@ pub async fn get_columns(client: &InfluxdbClient, database: &str, table: &str) -
                 numeric_scale: None,
                 character_maximum_length: None,
                 enum_values: None,
+                ..Default::default()
             }
         }))
         .collect();
@@ -519,6 +522,7 @@ async fn get_columns_v2(client: &InfluxdbClient, bucket: &str, measurement: &str
         numeric_scale: None,
         character_maximum_length: None,
         enum_values: None,
+        ..Default::default()
     };
     let tag_cols = flux_column_values(&tag_result, "_value")
         .into_iter()
@@ -535,6 +539,7 @@ async fn get_columns_v2(client: &InfluxdbClient, bucket: &str, measurement: &str
             numeric_scale: None,
             character_maximum_length: None,
             enum_values: None,
+            ..Default::default()
         });
     let field_cols = flux_column_values(&field_result, "_value").into_iter().map(|name| ColumnInfo {
         name,
@@ -548,6 +553,7 @@ async fn get_columns_v2(client: &InfluxdbClient, bucket: &str, measurement: &str
         numeric_scale: None,
         character_maximum_length: None,
         enum_values: None,
+        ..Default::default()
     });
     Ok(std::iter::once(time_col).chain(tag_cols).chain(field_cols).collect())
 }

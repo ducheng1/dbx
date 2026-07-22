@@ -3,6 +3,71 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentifierCase {
+    Lower,
+    Upper,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseConnectionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_charset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unquoted_identifier_case: Option<IdentifierCase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_identifier_case: Option<IdentifierCase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jdbc_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionTestResult {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_info: Option<DatabaseConnectionInfo>,
+}
+
+impl ConnectionTestResult {
+    pub fn success(message: impl Into<String>) -> Self {
+        Self { message: message.into(), database_info: None }
+    }
+
+    pub fn with_database_info(mut self, database_info: Option<DatabaseConnectionInfo>) -> Self {
+        self.database_info = database_info;
+        self
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseInfoEnvelope {
+    #[serde(default)]
+    database_info: Option<DatabaseConnectionInfo>,
+}
+
+pub fn database_info_from_protocol_value(value: &Value) -> Option<DatabaseConnectionInfo> {
+    serde_json::from_value::<DatabaseInfoEnvelope>(value.clone()).ok()?.database_info
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ConnectionConfig {
     pub id: String,
@@ -27,6 +92,10 @@ pub struct ConnectionConfig {
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
+    /// SQL statements executed right after the connection is established
+    /// (DuckDB only for now): INSTALL/LOAD, SET, CREATE SECRET, ATTACH, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_script: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -90,6 +159,15 @@ pub struct ConnectionConfig {
     pub one_time: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
+    /// Explicitly marks every database reachable through this connection as production.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_production: bool,
+    /// Database-level production markers for multi-database connections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub production_databases: Vec<String>,
+    /// Metadata captured from the latest successful connection test for this saved config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_info: Option<DatabaseConnectionInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,11 +180,70 @@ pub enum TransportLayerConfig {
 }
 
 impl TransportLayerConfig {
+    pub fn same_type_as(&self, other: &TransportLayerConfig) -> bool {
+        matches!(
+            (self, other),
+            (TransportLayerConfig::Ssh(_), TransportLayerConfig::Ssh(_))
+                | (TransportLayerConfig::Proxy(_), TransportLayerConfig::Proxy(_))
+                | (TransportLayerConfig::HttpTunnel(_), TransportLayerConfig::HttpTunnel(_))
+        )
+    }
+
     pub fn id(&self) -> &str {
         match self {
             TransportLayerConfig::Ssh(layer) => &layer.id,
             TransportLayerConfig::Proxy(layer) => &layer.id,
             TransportLayerConfig::HttpTunnel(layer) => &layer.id,
+        }
+    }
+
+    pub fn profile_id(&self) -> &str {
+        match self {
+            TransportLayerConfig::Ssh(layer) => &layer.profile_id,
+            TransportLayerConfig::Proxy(layer) => &layer.profile_id,
+            TransportLayerConfig::HttpTunnel(layer) => &layer.profile_id,
+        }
+    }
+
+    /// Builds the concrete layer used at connect time for a layer that
+    /// references a shared tunnel profile: the profile supplies the whole
+    /// configuration while the referencing layer keeps its own identity,
+    /// enabled flag, and profile reference.
+    pub fn resolved_from_profile(&self, profile: &TransportLayerConfig) -> TransportLayerConfig {
+        let mut resolved = profile.clone();
+        let (id, enabled, profile_id) = (self.id().to_string(), self.enabled(), self.profile_id().to_string());
+        match &mut resolved {
+            TransportLayerConfig::Ssh(layer) => {
+                layer.id = id;
+                layer.enabled = enabled;
+                layer.profile_id = profile_id;
+            }
+            TransportLayerConfig::Proxy(layer) => {
+                layer.id = id;
+                layer.enabled = enabled;
+                layer.profile_id = profile_id;
+            }
+            TransportLayerConfig::HttpTunnel(layer) => {
+                layer.id = id;
+                layer.enabled = enabled;
+                layer.profile_id = profile_id;
+            }
+        }
+        resolved
+    }
+
+    pub fn scrub_secrets(&mut self) {
+        match self {
+            TransportLayerConfig::Ssh(layer) => {
+                layer.password = String::new();
+                layer.key_passphrase = String::new();
+            }
+            TransportLayerConfig::Proxy(layer) => {
+                layer.password = String::new();
+            }
+            TransportLayerConfig::HttpTunnel(layer) => {
+                layer.token = String::new();
+            }
         }
     }
 
@@ -175,6 +312,12 @@ pub struct SshTunnelConfig {
     /// only tries that method (after the standard `none` probe).
     #[serde(default)]
     pub auth_method: String,
+    /// When non-empty, this layer references a shared tunnel profile
+    /// (Settings > Tunnels). The profile's configuration replaces this
+    /// layer's own fields at connect time; only `id` and `enabled` are
+    /// kept from the referencing layer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +338,14 @@ pub struct ProxyTunnelConfig {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    /// Optional target for tunnel profile testing. When set, the test connects
+    /// to this `host:port`; when empty, the test performs an endpoint-only
+    /// liveness probe that requires no external destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_target: Option<String>,
+    /// See [`SshTunnelConfig::profile_id`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +362,9 @@ pub struct HttpTunnelConfig {
     pub token: String,
     #[serde(default = "default_http_tunnel_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// See [`SshTunnelConfig::profile_id`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,7 +394,7 @@ pub fn default_connect_timeout_secs() -> u64 {
 }
 
 pub fn default_query_timeout_secs() -> u64 {
-    30
+    60
 }
 
 pub fn default_idle_timeout_secs() -> u64 {
@@ -362,6 +516,8 @@ pub enum DatabaseType {
     Iris,
     #[serde(rename = "turso")]
     Turso,
+    #[serde(rename = "cloudflare-d1")]
+    CloudflareD1,
     #[serde(rename = "influxdb")]
     InfluxDb,
     #[serde(rename = "questdb")]
@@ -397,6 +553,8 @@ struct ConnectionConfigData {
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
+    #[serde(default)]
+    pub init_script: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
     #[serde(default)]
@@ -457,6 +615,12 @@ struct ConnectionConfigData {
     pub one_time: bool,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default)]
+    pub is_production: bool,
+    #[serde(default)]
+    pub production_databases: Vec<String>,
+    #[serde(default)]
+    pub database_info: Option<DatabaseConnectionInfo>,
 }
 
 impl From<ConnectionConfigData> for ConnectionConfig {
@@ -477,6 +641,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             visible_databases: data.visible_databases,
             visible_schemas: data.visible_schemas,
             attached_databases: data.attached_databases,
+            init_script: data.init_script,
             color: data.color,
             transport_layers: data.transport_layers,
             connect_timeout_secs: data.connect_timeout_secs,
@@ -507,6 +672,9 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             jdbc_driver_paths: data.jdbc_driver_paths,
             one_time: data.one_time,
             read_only: data.read_only,
+            is_production: data.is_production,
+            production_databases: data.production_databases,
+            database_info: data.database_info,
         }
     }
 }
@@ -663,11 +831,7 @@ impl ConnectionConfig {
     }
 
     pub fn effective_database(&self) -> Option<&str> {
-        self.database
-            .as_deref()
-            .map(str::trim)
-            .filter(|database| !database.is_empty())
-            .or_else(|| self.default_database())
+        self.database.as_deref().filter(|database| !database.trim().is_empty()).or_else(|| self.default_database())
     }
 
     fn default_database(&self) -> Option<&'static str> {
@@ -678,7 +842,7 @@ impl ConnectionConfig {
             },
             DatabaseType::Redshift => Some("dev"),
             DatabaseType::ClickHouse => Some("default"),
-            DatabaseType::Rqlite | DatabaseType::Turso => Some("main"),
+            DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => Some("main"),
             DatabaseType::Gaussdb | DatabaseType::OpenGauss => Some("postgres"),
             DatabaseType::Kwdb => Some("defaultdb"),
             DatabaseType::Vastbase => Some("postgres"),
@@ -789,6 +953,7 @@ impl ConnectionConfig {
             DatabaseType::ClickHouse => clickhouse_http_url(self, raw_host, port),
             DatabaseType::Rqlite => rqlite_http_url(self, raw_host, port),
             DatabaseType::Turso => turso_http_url(self, raw_host, port),
+            DatabaseType::CloudflareD1 => cloudflare_d1_api_url(self),
             DatabaseType::SqlServer => {
                 format!("server=tcp:{host},{port};database={}", self.database.as_deref().unwrap_or("master"))
             }
@@ -926,6 +1091,7 @@ impl ConnectionConfig {
             DatabaseType::ClickHouse => clickhouse_http_url(self, raw_host, port),
             DatabaseType::Rqlite => rqlite_http_url(self, raw_host, port),
             DatabaseType::Turso => turso_http_url(self, raw_host, port),
+            DatabaseType::CloudflareD1 => cloudflare_d1_api_url(self),
             DatabaseType::SqlServer => format!(
                 "server=tcp:{host},{port};user={};password={};database={}",
                 self.username,
@@ -1109,6 +1275,17 @@ impl ConnectionConfig {
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
             DatabaseType::Nacos => self.nacos_admin_url(),
         }
+    }
+
+    pub fn sqlserver_port_explicit(&self) -> bool {
+        if self.db_type != DatabaseType::SqlServer {
+            return false;
+        }
+        self.external_config
+            .as_ref()
+            .and_then(|value| value.get("portExplicit").or_else(|| value.get("port_explicit")))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     fn message_queue_admin_url(&self) -> String {
@@ -1522,8 +1699,9 @@ fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
     }
 
     if connection_options.is_empty() {
-        if force_tls && !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
-            parts.insert(0, "sslmode=require".to_string());
+        if !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
+            // TLS is opt-in in the connection form; avoid tokio-postgres' implicit prefer mode.
+            parts.insert(0, if force_tls { "sslmode=require" } else { "sslmode=disable" }.to_string());
         }
         return parts.join("&");
     }
@@ -1550,8 +1728,8 @@ fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
         parts.push(format!("options={}", encode_url_part(&combined)));
     }
 
-    if force_tls && !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
-        parts.insert(0, "sslmode=require".to_string());
+    if !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
+        parts.insert(0, if force_tls { "sslmode=require" } else { "sslmode=disable" }.to_string());
     }
 
     parts.join("&")
@@ -1610,6 +1788,12 @@ fn turso_http_url(config: &ConnectionConfig, host: &str, port: u16) -> String {
     // Default: bare hostname -> prefer HTTPS for Turso (default port 443)
     let scheme = if port == 443 || config.ssl { "https" } else { "http" };
     format!("{scheme}://{}:{port}", bracket_ipv6(trimmed))
+}
+
+fn cloudflare_d1_api_url(config: &ConnectionConfig) -> String {
+    let account_id = config.host.trim();
+    let database_id = config.database.as_deref().unwrap_or_default().trim();
+    format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}")
 }
 
 fn trim_http_host_port(value: &str, default_port: u16) -> String {
@@ -1683,7 +1867,7 @@ fn rewrite_mongo_uri_host(uri: &str, new_host: &str, new_port: u16) -> String {
 }
 
 pub fn parse_jdbc_host_port(url: &str) -> Option<(String, u16)> {
-    let rest = url.strip_prefix("jdbc:")?;
+    let rest = jdbc_transport_rest(url)?;
 
     // jdbc:oracle:thin:@host:port:SID  or  jdbc:oracle:thin:@//host:port/service
     if let Some(after) = rest.strip_prefix("oracle:") {
@@ -1725,11 +1909,35 @@ pub fn parse_jdbc_host_port(url: &str) -> Option<(String, u16)> {
     }
 }
 
+fn jdbc_transport_rest(url: &str) -> Option<&str> {
+    if let Some(rest) = url.strip_prefix("jdbc:").or_else(|| url.strip_prefix("JDBC:")) {
+        return Some(rest);
+    }
+
+    let rest = url.strip_prefix("jdbcx:").or_else(|| url.strip_prefix("JDBCX:"))?;
+    if let Some(scheme_end) = rest.find("://") {
+        let scheme = &rest[..scheme_end];
+        return Some(match scheme.rfind(':') {
+            Some(extension_end) => &rest[extension_end + 1..],
+            None => rest,
+        });
+    }
+
+    // Oracle's descriptor and thin URL forms do not contain `://`. In an
+    // extended JDBCX URL the vendor transport follows the first colon.
+    let tail = rest.split_once(':').map(|(_, tail)| tail);
+    match tail {
+        Some(tail) if tail.get(.."oracle:".len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case("oracle:")) => {
+            Some(tail)
+        }
+        _ => Some(rest),
+    }
+}
+
 pub fn rewrite_jdbc_url_host(url: &str, new_host: &str, new_port: u16) -> String {
     let normalized_url = url.to_ascii_uppercase();
-    if normalized_url.starts_with("JDBC:ORACLE:")
-        && normalized_url.contains("(HOST=")
-        && normalized_url.contains("(PORT=")
+    let normalized_rest = jdbc_transport_rest(url).map(str::to_ascii_uppercase).unwrap_or_default();
+    if normalized_rest.starts_with("ORACLE:") && normalized_url.contains("(HOST=") && normalized_url.contains("(PORT=")
     {
         return rewrite_oracle_descriptor_host(url, new_host, new_port);
     }
@@ -1782,10 +1990,51 @@ fn bracket_ipv6(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_query_timeout_secs, default_redis_key_separator, default_ssh_connect_timeout_secs, ConnectionConfig,
-        DatabaseType, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
+        database_info_from_protocol_value, default_query_timeout_secs, default_redis_key_separator,
+        default_ssh_connect_timeout_secs, ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType,
+        IdentifierCase, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
     };
     use std::str::FromStr;
+
+    #[test]
+    fn default_query_timeout_is_sixty_seconds() {
+        assert_eq!(default_query_timeout_secs(), 60);
+    }
+
+    #[test]
+    fn connection_test_result_uses_camel_case_and_omits_missing_details() {
+        let result =
+            ConnectionTestResult::success("Connection successful").with_database_info(Some(DatabaseConnectionInfo {
+                product_name: Some("H2".to_string()),
+                unquoted_identifier_case: Some(IdentifierCase::Upper),
+                ..DatabaseConnectionInfo::default()
+            }));
+
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["message"], "Connection successful");
+        assert_eq!(value["databaseInfo"]["productName"], "H2");
+        assert_eq!(value["databaseInfo"]["unquotedIdentifierCase"], "upper");
+        assert!(value["databaseInfo"].get("driverName").is_none());
+    }
+
+    #[test]
+    fn protocol_database_info_parser_accepts_details_and_legacy_responses() {
+        let parsed = database_info_from_protocol_value(&serde_json::json!({
+            "ok": true,
+            "databaseInfo": {
+                "productName": "H2",
+                "currentDatabase": "app",
+                "serverCharset": "utf8mb4",
+                "jdbcVersion": "4.2"
+            }
+        }))
+        .unwrap();
+        assert_eq!(parsed.product_name.as_deref(), Some("H2"));
+        assert_eq!(parsed.current_database.as_deref(), Some("app"));
+        assert_eq!(parsed.server_charset.as_deref(), Some("utf8mb4"));
+        assert_eq!(parsed.jdbc_version.as_deref(), Some("4.2"));
+        assert_eq!(database_info_from_protocol_value(&serde_json::json!({ "ok": true })), None);
+    }
 
     fn mysql_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
@@ -1804,6 +2053,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: super::default_connect_timeout_secs(),
@@ -1834,7 +2084,52 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: false,
+            is_production: false,
+            production_databases: vec![],
+            database_info: None,
         }
+    }
+
+    #[test]
+    fn legacy_mcp_access_is_ignored_and_not_serialized() {
+        let legacy: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "db_type": "mysql",
+            "host": "127.0.0.1",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "database": null,
+            "mcp_access": "read_only"
+        }))
+        .unwrap();
+        assert!(serde_json::to_value(&legacy).unwrap().get("mcp_access").is_none());
+        assert!(!legacy.read_only);
+    }
+
+    #[test]
+    fn database_identifier_whitespace_is_preserved_and_percent_encoded() {
+        let mut config = mysql_config("root", "secret", Some(" analytics "));
+
+        assert_eq!(config.effective_database(), Some(" analytics "));
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/%20analytics%20?ssl-mode=disabled&charset=utf8mb4"
+        );
+
+        config.db_type = DatabaseType::Postgres;
+        assert_eq!(config.effective_database(), Some(" analytics "));
+        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/%20analytics%20?sslmode=disable");
+    }
+
+    #[test]
+    fn whitespace_only_database_uses_database_type_default() {
+        let mut config = mysql_config("root", "secret", Some("   "));
+        assert_eq!(config.effective_database(), None);
+
+        config.db_type = DatabaseType::Postgres;
+        assert_eq!(config.effective_database(), Some("postgres"));
     }
 
     fn mongodb_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
@@ -1848,6 +2143,22 @@ mod tests {
     fn zookeeper_database_type_uses_stable_wire_name() {
         assert_eq!(serde_json::to_string(&DatabaseType::ZooKeeper).unwrap(), "\"zookeeper\"");
         assert_eq!(serde_json::from_str::<DatabaseType>("\"zookeeper\"").unwrap(), DatabaseType::ZooKeeper);
+    }
+
+    #[test]
+    fn cloudflare_d1_database_type_and_api_url_are_stable() {
+        assert_eq!(serde_json::to_string(&DatabaseType::CloudflareD1).unwrap(), "\"cloudflare-d1\"");
+        assert_eq!(serde_json::from_str::<DatabaseType>("\"cloudflare-d1\"").unwrap(), DatabaseType::CloudflareD1);
+
+        let mut config = mysql_config("", "secret-token", Some("database-id"));
+        config.db_type = DatabaseType::CloudflareD1;
+        config.host = "account-id".to_string();
+        config.port = 443;
+        assert_eq!(
+            config.connection_url(),
+            "https://api.cloudflare.com/client/v4/accounts/account-id/d1/database/database-id"
+        );
+        assert!(!config.connection_url().contains("secret-token"));
     }
 
     #[test]
@@ -1865,6 +2176,25 @@ mod tests {
         .unwrap();
 
         assert!(config.agent_java_options.is_empty());
+        assert_eq!(config.database_info, None);
+    }
+
+    #[test]
+    fn connection_config_database_info_survives_json_round_trip() {
+        let mut config = mysql_config("root", "secret", Some("app"));
+        config.database_info = Some(DatabaseConnectionInfo {
+            product_name: Some("MySQL".to_string()),
+            product_version: Some("8.4.0".to_string()),
+            current_database: Some("app".to_string()),
+            server_charset: Some("utf8mb4".to_string()),
+            ..DatabaseConnectionInfo::default()
+        });
+
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["database_info"]["productVersion"], "8.4.0");
+
+        let restored: ConnectionConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.database_info, config.database_info);
     }
 
     #[test]
@@ -2014,6 +2344,7 @@ mod tests {
     fn serialized_connection_config_omits_legacy_transport_fields() {
         let mut config = mysql_config("root", "", None);
         config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            profile_id: String::new(),
             id: "proxy".to_string(),
             name: String::new(),
             enabled: true,
@@ -2022,6 +2353,7 @@ mod tests {
             port: 1080,
             username: String::new(),
             password: String::new(),
+            test_target: None,
         })];
 
         let saved = serde_json::to_value(config).unwrap();
@@ -2046,6 +2378,16 @@ mod tests {
         config.query_timeout_secs = 3600;
 
         assert_eq!(config.effective_query_timeout_secs(), 3600);
+    }
+
+    #[test]
+    fn mysql_url_encodes_proxy_style_username_with_colons_and_at() {
+        let config = mysql_config("1234:xxx@xx.xx:abc123", "p@ss:word", None);
+
+        assert_eq!(
+            config.connection_url(),
+            "mysql://1234%3Axxx%40xx%2Exx%3Aabc123:p%40ss%3Aword@10.1.2.3:2883?ssl-mode=disabled&charset=utf8mb4"
+        );
     }
 
     #[test]
@@ -2339,6 +2681,14 @@ mod tests {
     }
 
     #[test]
+    fn postgres_url_disables_tls_by_default() {
+        let mut config = mysql_config("postgres", "secret", Some("test"));
+        config.db_type = DatabaseType::Postgres;
+
+        assert_eq!(config.connection_url(), "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable");
+    }
+
+    #[test]
     fn postgres_tls_switch_adds_require_sslmode() {
         let mut config = mysql_config("postgres", "secret", Some("test"));
         config.db_type = DatabaseType::Postgres;
@@ -2369,7 +2719,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=%2Dc%20search%5Fpath%3Dpublic"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=%2Dc%20search%5Fpath%3Dpublic"
         );
         let pg_config = tokio_postgres::Config::from_str(&config.connection_url()).unwrap();
         assert_eq!(pg_config.get_options(), Some("-c search_path=public"));
@@ -2383,7 +2733,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=%2Dc%20search%5Fpath%3Dapp"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=%2Dc%20search%5Fpath%3Dapp"
         );
         let pg_config = tokio_postgres::Config::from_str(&config.connection_url()).unwrap();
         assert_eq!(pg_config.get_options(), Some("-c search_path=app"));
@@ -2417,7 +2767,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=%2Dc%20statement%5Ftimeout%3D5000%20%2Dc%20TimeZone%3DUTC"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=%2Dc%20statement%5Ftimeout%3D5000%20%2Dc%20TimeZone%3DUTC"
         );
     }
 
@@ -2429,7 +2779,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=-c%20TimeZone%3DUTC"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=-c%20TimeZone%3DUTC"
         );
     }
 
@@ -2438,7 +2788,7 @@ mod tests {
         let mut config = mysql_config("root", "secret", None);
         config.db_type = DatabaseType::Postgres;
 
-        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres");
+        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres?sslmode=disable");
     }
 
     #[test]
@@ -2446,7 +2796,7 @@ mod tests {
         let mut config = mysql_config("root", "secret", Some(""));
         config.db_type = DatabaseType::Postgres;
 
-        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres");
+        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres?sslmode=disable");
     }
 
     #[test]
@@ -2454,7 +2804,7 @@ mod tests {
         let mut config = mysql_config("awsuser", "secret", Some(""));
         config.db_type = DatabaseType::Redshift;
 
-        assert_eq!(config.connection_url(), "postgres://awsuser:secret@10.1.2.3:2883/dev");
+        assert_eq!(config.connection_url(), "postgres://awsuser:secret@10.1.2.3:2883/dev?sslmode=disable");
     }
 
     #[test]
@@ -2463,7 +2813,7 @@ mod tests {
         config.db_type = DatabaseType::Postgres;
         config.driver_profile = Some("cockroachdb".to_string());
 
-        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/defaultdb");
+        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/defaultdb?sslmode=disable");
     }
 
     #[test]
@@ -2843,6 +3193,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_jdbcx_host_port_with_and_without_extension() {
+        assert_eq!(
+            super::parse_jdbc_host_port("jdbcx:mysql://db.example.com:3306/app"),
+            Some(("db.example.com".to_string(), 3306))
+        );
+        assert_eq!(
+            super::parse_jdbc_host_port("jdbcx:prql:postgresql://pg.example.com:5432/app"),
+            Some(("pg.example.com".to_string(), 5432))
+        );
+        assert_eq!(
+            super::parse_jdbc_host_port("jdbcx:query:sqlserver://sql.example.com:1433;databaseName=app"),
+            Some(("sql.example.com".to_string(), 1433))
+        );
+    }
+
+    #[test]
     fn parse_jdbc_host_port_with_userinfo() {
         let (h, p) = super::parse_jdbc_host_port("jdbc:postgresql://user:pass@pghost:5433/db").unwrap();
         assert_eq!(h, "pghost");
@@ -2913,6 +3279,27 @@ mod tests {
         let url = "jdbc:postgresql://myhost:5432/mydb";
         let rewritten = super::rewrite_jdbc_url_host(url, "127.0.0.1", 54321);
         assert_eq!(rewritten, "jdbc:postgresql://127.0.0.1:54321/mydb");
+    }
+
+    #[test]
+    fn rewrite_jdbcx_url_preserves_extension() {
+        let url = "jdbcx:script:mysql://db.example.com:3306/app";
+        let rewritten = super::rewrite_jdbc_url_host(url, "127.0.0.1", 13306);
+        assert_eq!(rewritten, "jdbcx:script:mysql://127.0.0.1:13306/app");
+
+        let sqlserver = "jdbcx:query:sqlserver://sql.example.com:1433;databaseName=app";
+        let rewritten = super::rewrite_jdbc_url_host(sqlserver, "127.0.0.1", 11433);
+        assert_eq!(rewritten, "jdbcx:query:sqlserver://127.0.0.1:11433;databaseName=app");
+    }
+
+    #[test]
+    fn rewrite_jdbcx_oracle_descriptor() {
+        let url = "jdbcx:web:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=orahost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=orcl)))";
+        let rewritten = super::rewrite_jdbc_url_host(url, "127.0.0.1", 11521);
+        assert_eq!(
+            rewritten,
+            "jdbcx:web:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=127.0.0.1)(PORT=11521))(CONNECT_DATA=(SERVICE_NAME=orcl)))"
+        );
     }
 
     #[test]

@@ -4,15 +4,14 @@ use crate::models::connection::ConnectionConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Default)]
 pub enum NacosAuthConfig {
+    #[default]
     None,
-    UsernamePassword { username: String, password: String },
-}
-
-impl Default for NacosAuthConfig {
-    fn default() -> Self {
-        Self::None
-    }
+    UsernamePassword {
+        username: String,
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +138,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
@@ -169,6 +169,9 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: false,
+            is_production: false,
+            production_databases: vec![],
+            database_info: None,
         }
     }
 

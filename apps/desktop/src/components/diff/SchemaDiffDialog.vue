@@ -7,6 +7,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import { GitCompareArrows, ArrowLeft, Play, Loader2, Maximize2, Minimize2, AlertTriangle, CircleCheck } from "@lucide/vue";
 import * as api from "@/lib/backend/api";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { useSchemaDiffConfig } from "@/composables/useSchemaDiffConfig";
 import SchemaDiffConfigStep from "@/components/diff/SchemaDiffConfigStep.vue";
 import SchemaDiffObjectTree from "@/components/diff/SchemaDiffObjectTree.vue";
@@ -496,7 +497,14 @@ async function handleExecuteScript() {
 
   executing.value = true;
   try {
-    await api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value);
+    const result = await executeWithProductionSqlGuard({
+      connection: store.getConfig(targetConnectionId.value),
+      database: targetDatabase.value,
+      sql: deploySql.value,
+      source: t("production.sourceSchemaDiff"),
+      execute: () => api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value),
+    });
+    if (!result) return;
     toast(t("diff.executeSuccess"), 3000);
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
@@ -519,24 +527,24 @@ async function handleSelectObject(obj: SchemaDiffObject) {
   try {
     // For "create" objects: source has it, target doesn't → fetch source DDL
     if (obj.operationType === "create" && !obj.sourceDdl) {
-      const result = await api.getObjectSource(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, obj.name, objectType);
+      const result = await api.getObjectSource(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, obj.name, objectType, obj.arguments);
       if (result?.source) obj.sourceDdl = result.source;
     }
 
     // For "delete" objects: target has it, source doesn't → fetch target DDL
     if (obj.operationType === "delete" && !obj.targetDdl) {
-      const result = await api.getObjectSource(targetConnectionId.value, targetDatabase.value, targetSchema.value, obj.name, objectType);
+      const result = await api.getObjectSource(targetConnectionId.value, targetDatabase.value, targetSchema.value, obj.name, objectType, obj.arguments);
       if (result?.source) obj.targetDdl = result.source;
     }
 
     // For "modify" objects: fetch whichever side is missing
     if (obj.operationType === "modify") {
       if (!obj.sourceDdl) {
-        const result = await api.getObjectSource(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, obj.name, objectType);
+        const result = await api.getObjectSource(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, obj.name, objectType, obj.arguments);
         if (result?.source) obj.sourceDdl = result.source;
       }
       if (!obj.targetDdl) {
-        const result = await api.getObjectSource(targetConnectionId.value, targetDatabase.value, targetSchema.value, obj.name, objectType);
+        const result = await api.getObjectSource(targetConnectionId.value, targetDatabase.value, targetSchema.value, obj.name, objectType, obj.arguments);
         if (result?.source) obj.targetDdl = result.source;
       }
     }
@@ -621,7 +629,14 @@ async function onConfirmDeploy() {
   showConfirmDialog.value = false;
   executing.value = true;
   try {
-    const result = await api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value);
+    const result = await executeWithProductionSqlGuard({
+      connection: store.getConfig(targetConnectionId.value),
+      database: targetDatabase.value,
+      sql: deploySql.value,
+      source: t("production.sourceSchemaDiff"),
+      execute: () => api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value),
+    });
+    if (!result) return;
     deployResult.value = {
       success: true,
       message: t("diff.deploySuccess"),

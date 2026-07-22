@@ -1,6 +1,8 @@
 import { Cassandra, MariaSQL, MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardSQL } from "@codemirror/lang-sql";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { buildMongoCompletionItemsFromContext, type MongoCompletionItem } from "@/lib/mongo/mongoCompletion";
+import { CLOUDFLARE_D1_COMMON_FUNCTION_NAMES } from "@/lib/sql/cloudflareD1";
+import type { SqlObjectNavigationType } from "@/lib/sql/sqlNavigation";
 
 const SQL_KEYWORDS = [
   "SELECT",
@@ -464,13 +466,92 @@ const SQLSERVER_SQL_KEYWORDS = [
   "SHOWPLAN_XML",
 ];
 
+function sqlDialectCompletionWords(...sources: Array<string | undefined>): string[] {
+  return sources
+    .flatMap((source) => (source ?? "").split(/\s+/))
+    .filter((keyword) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(keyword))
+    .map((keyword) => keyword.toUpperCase());
+}
+
+const ORACLE_SQL_TYPES = [
+  "BFILE",
+  "BINARY_DOUBLE",
+  "BINARY_FLOAT",
+  "BLOB",
+  "CHAR",
+  "CLOB",
+  "DATE",
+  "DEC",
+  "DECIMAL",
+  "DOUBLE PRECISION",
+  "FLOAT",
+  "INT",
+  "INTEGER",
+  "INTERVAL DAY TO SECOND",
+  "INTERVAL YEAR TO MONTH",
+  "LONG",
+  "LONG RAW",
+  "NCHAR",
+  "NCLOB",
+  "NUMBER",
+  "NUMERIC",
+  "NVARCHAR2",
+  "RAW",
+  "REAL",
+  "ROWID",
+  "SMALLINT",
+  "TIMESTAMP",
+  "TIMESTAMP WITH LOCAL TIME ZONE",
+  "TIMESTAMP WITH TIME ZONE",
+  "UROWID",
+  "VARCHAR",
+  "VARCHAR2",
+  "XMLTYPE",
+];
+
+const ORACLE_SYSTEM_VALUE_NAMES = ["SYSDATE", "SYSTIMESTAMP", "CURRENT_DATE", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "SESSIONTIMEZONE", "DBTIMEZONE", "USER", "UID"] as const;
+
+const ORACLE_SYSTEM_VALUE_NAME_SET = new Set<string>(ORACLE_SYSTEM_VALUE_NAMES);
+
+export function isOracleSystemValueName(name: string, databaseType?: DatabaseType): boolean {
+  return isOracleLikeDatabase(databaseType) && ORACLE_SYSTEM_VALUE_NAME_SET.has(name.toUpperCase());
+}
+
+const NON_ORACLE_COMPLETION_WORDS = new Set(["BIGSERIAL", "BOOLEAN", "ELSEIF", "LIMIT", "LOCALTIME", "SERIAL", "STRING", "TEXT", "TIME", "USE"]);
+
+const ORACLE_SQL_KEYWORDS = Array.from(
+  new Set([
+    ...sqlDialectCompletionWords(PLSQL.spec.keywords).filter((keyword) => !NON_ORACLE_COMPLETION_WORDS.has(keyword)),
+    ...ORACLE_SQL_TYPES,
+    "BULK COLLECT",
+    "CONNECT BY",
+    "DATABASE LINK",
+    "EXECUTE IMMEDIATE",
+    "FLASHBACK",
+    "FOR UPDATE",
+    "MATERIALIZED VIEW",
+    "MERGE",
+    "ORDER SIBLINGS BY",
+    "OR REPLACE",
+    "PACKAGE BODY",
+    "PURGE",
+    "RETURNING INTO",
+    "SEQUENCE",
+    "START WITH",
+    "TYPE BODY",
+  ]),
+);
+
 const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   mysql: MYSQL_SQL_KEYWORDS,
   postgres: POSTGRES_SQL_KEYWORDS,
   sqlite: SQLITE_SQL_KEYWORDS,
   rqlite: SQLITE_SQL_KEYWORDS,
   turso: SQLITE_SQL_KEYWORDS,
+  "cloudflare-d1": SQLITE_SQL_KEYWORDS,
   sqlserver: SQLSERVER_SQL_KEYWORDS,
+  oracle: ORACLE_SQL_KEYWORDS,
+  "oceanbase-oracle": ORACLE_SQL_KEYWORDS,
   manticoresearch: MANTICORESEARCH_SQL_KEYWORDS,
 };
 
@@ -524,6 +605,7 @@ const EXCLUSIVE_TABLE_TRIGGER_KEYWORDS = new Set(["from", "join", "update", "int
 const JOIN_MODIFIERS = new Set(["left", "right", "inner", "outer", "cross", "full", "natural"]);
 const JOIN_MODIFIER_KEYWORD_PHRASES = ["LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "FULL JOIN", "CROSS JOIN", "NATURAL JOIN", "LEFT OUTER JOIN", "RIGHT OUTER JOIN", "FULL OUTER JOIN"];
 const MAX_TABLE_COMPLETION_ITEMS = 200;
+const EXACT_LABEL_MATCH_BOOST = 10000;
 
 // Keywords that only make sense in DDL / statement-start contexts (not inside SELECT/INSERT/UPDATE/DELETE)
 const DDL_ONLY_KEYWORDS = new Set([
@@ -611,6 +693,7 @@ const DATA_TYPE_KEYWORDS = new Set([
   "TINYBLOB",
   "MEDIUMBLOB",
   "LONGBLOB",
+  ...ORACLE_SQL_TYPES,
 ]);
 
 // Window functions that should use OVER() completion
@@ -879,7 +962,11 @@ const POSTGRES_FUNCTION_SIGNATURES = new Map<string, string[]>([
 ]);
 
 const MYSQL_FUNCTION_SIGNATURES = new Map<string, string[]>([
+  ["CONVERT", ["expression", "type"]],
   ["DATE_FORMAT", ["date", "format"]],
+  ["FROM_UNIXTIME", ["unix_timestamp"]],
+  ["UNIX_TIMESTAMP", []],
+  ["SYSDATE", []],
   ["JSON_EXTRACT", ["json", "path"]],
   ["JSON_UNQUOTE", ["json"]],
   ["GROUP_CONCAT", ["expression"]],
@@ -895,7 +982,10 @@ const SQLITE_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["NOW", []],
 ]);
 
+const CLOUDFLARE_D1_FUNCTION_SIGNATURES = new Map(Array.from(SQLITE_FUNCTION_SIGNATURES.entries()).filter(([name]) => name !== "NOW"));
+
 const SQLSERVER_FUNCTION_SIGNATURES = new Map<string, string[]>([
+  ["CONVERT", ["type", "expression"]],
   ["TRY_CAST", ["expression AS type"]],
   ["TRY_CONVERT", ["type", "expression"]],
   ["JSON_VALUE", ["expression", "path"]],
@@ -957,6 +1047,7 @@ const DATABASE_FUNCTION_SIGNATURES: Partial<Record<DatabaseType, Map<string, str
   sqlite: SQLITE_FUNCTION_SIGNATURES,
   rqlite: SQLITE_FUNCTION_SIGNATURES,
   turso: SQLITE_FUNCTION_SIGNATURES,
+  "cloudflare-d1": CLOUDFLARE_D1_FUNCTION_SIGNATURES,
   sqlserver: SQLSERVER_FUNCTION_SIGNATURES,
   manticoresearch: MANTICORESEARCH_FUNCTION_SIGNATURES,
 };
@@ -1077,7 +1168,10 @@ function sqlAliasKeywordWords(...sources: Array<string | undefined>): string[] {
 export interface SqlCompletionTable {
   name: string;
   schema?: string;
-  type?: "table" | "view";
+  type?: SqlObjectNavigationType;
+  detail?: string;
+  applyName?: string;
+  boost?: number;
 }
 
 export interface SqlCompletionObject {
@@ -1086,11 +1180,17 @@ export interface SqlCompletionObject {
   type: "procedure" | "function" | "trigger" | "package";
   parentSchema?: string;
   parentName?: string;
+  dataType?: string;
+  signature?: string;
+  comment?: string | null;
+  applyName?: string;
+  boost?: number;
 }
 
 export interface SqlCompletionColumn {
   name: string;
   table: string;
+  sourceAlias?: string;
   schema?: string;
   dataType?: string;
   isNullable?: boolean;
@@ -1112,6 +1212,12 @@ export interface SqlCompletionItem {
   info?: string;
   apply?: string;
   boost: number;
+  exactMatch?: boolean;
+  dedupeKey?: string;
+}
+
+export function shouldChainSqlCompletionAfterAccept(item: { type?: string; apply?: string }): boolean {
+  return item.type === "schema" && item.apply?.endsWith(".") === true;
 }
 
 export type SqlKeywordCase = "preserve" | "upper" | "lower";
@@ -1121,6 +1227,7 @@ export interface SqlCompletionReferencedTable {
   schema?: string;
   alias?: string;
   columns?: string[];
+  columnAliases?: string[];
 }
 
 export type SqlStatementKind = "select" | "insert" | "update" | "delete" | "create" | "alter" | "drop" | "unknown";
@@ -1156,6 +1263,7 @@ export interface SqlCompletionContext {
   deleteTarget?: { table: string; schema?: string };
   oracleTableFunctionContext?: boolean;
   autoAliasTableCompletions: boolean;
+  tableAliasAfterCursor?: boolean;
   contextKind: SqlCompletionContextKind;
 }
 
@@ -1187,6 +1295,7 @@ export interface SqlCompletionProviderInput {
   snippets?: SqlSnippet[];
   dialect?: "mysql" | "postgres" | "sqlserver";
   databaseType?: DatabaseType;
+  currentSchema?: string;
   keywordCase?: SqlKeywordCase;
   autoAliasTables?: boolean;
 }
@@ -1203,6 +1312,7 @@ export function buildSqlCompletionItems(
     translations?: SqlCompletionTranslations;
     dialect?: "mysql" | "postgres" | "sqlserver";
     databaseType?: DatabaseType;
+    currentSchema?: string;
     keywordCase?: SqlKeywordCase;
     autoAliasTables?: boolean;
   },
@@ -1240,10 +1350,18 @@ class SqlCompletionProvider {
     }
 
     const preferReferencedColumns = hasMatchingReferencedColumnPrefix(context, this.input.columnsByTable);
-    if (!pendingJoinKeyword && !preferReferencedColumns && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions && !context.exclusiveRoutineSuggestions) {
+    if (!pendingJoinKeyword && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions && !context.exclusiveRoutineSuggestions) {
       const snippets = this.databaseType === "manticoresearch" ? [...(this.input.snippets ?? DEFAULT_SQL_SNIPPETS), ...MANTICORESEARCH_SQL_SNIPPETS] : (this.input.snippets ?? DEFAULT_SQL_SNIPPETS);
-      this.items.push(...buildSnippetItems(context.prefix, snippets, this.input.keywordCase));
-      this.items.push(...buildFunctionSnippetItems(context.prefix, getFunctionDescriptions(this.t), this.databaseType));
+      if (!preferReferencedColumns) {
+        this.items.push(...buildSnippetItems(context.prefix, snippets, this.input.keywordCase));
+      }
+      if (!preferReferencedColumns || context.suggestRoutines) {
+        const functionItems = buildFunctionSnippetItems(context.prefix, getFunctionDescriptions(this.t), this.databaseType);
+        this.items.push(...(preferReferencedColumns ? functionItems.filter((item) => item.label.toLowerCase().startsWith(context.prefix.toLowerCase())) : functionItems));
+        if (isOracleLikeDatabase(this.databaseType)) {
+          this.items.push(...buildOracleSystemValueItems(context.prefix, this.input.keywordCase));
+        }
+      }
     }
 
     if (this.databaseType === "manticoresearch" && context.exclusiveRoutineSuggestions) {
@@ -1275,6 +1393,8 @@ class SqlCompletionProvider {
     if (context.suggestKeywords && !context.exclusiveRoutineSuggestions && !pendingJoinKeyword) {
       this.items.push(...buildJoinModifierKeywordItems(context.prefix, this.input.keywordCase));
       this.items.push(...buildKeywordItems(context.prefix, context, this.databaseType, this.input.keywordCase));
+    } else if (shouldOfferKeywordPrefixContinuations(context, pendingJoinKeyword)) {
+      this.items.push(...buildKeywordPrefixContinuationItems(context.prefix, context, this.databaseType, this.input.keywordCase));
     }
 
     if (!context.exclusiveTableSuggestions && context.suggestColumns) {
@@ -1284,13 +1404,13 @@ class SqlCompletionProvider {
     }
 
     const emptyTableNameCompletion = !context.prefix && (context.suggestTables || context.exclusiveTableSuggestions);
-    if (!pendingJoinKeyword && !emptyTableNameCompletion && context.referencedTables.length > 0 && !context.suggestColumns && !context.insertTable) {
+    if (!pendingJoinKeyword && !emptyTableNameCompletion && !context.tableAliasAfterCursor && context.referencedTables.length > 0 && !context.suggestColumns && !context.insertTable) {
       this.items.push(...buildAliasItems(context, this.databaseType));
     }
 
     if (!context.exclusiveColumnSuggestions && context.suggestTables) {
       this.items.push(...buildForeignKeyRelatedTableItems(context, this.input.tables, this.input.foreignKeysByTable, this.dialect));
-      this.items.push(...buildTableItems(context.prefix, this.input.tables, this.dialect, !!this.input.autoAliasTables && context.autoAliasTableCompletions, context.referencedTables, this.databaseType));
+      this.items.push(...buildTableItems(context, this.input.tables, this.dialect, !!this.input.autoAliasTables && context.autoAliasTableCompletions, context.referencedTables, this.databaseType, this.input.currentSchema));
       if (isOracleLikeDatabase(this.databaseType)) {
         this.items.push(...buildOracleTableFunctionItems(context.prefix));
       }
@@ -1300,7 +1420,7 @@ class SqlCompletionProvider {
     }
 
     if (context.suggestRoutines || context.exclusiveRoutineSuggestions || context.oracleTableFunctionContext) {
-      this.items.push(...buildObjectItems(context, this.input.objects ?? [], this.dialect));
+      this.items.push(...buildObjectItems(context, this.input.objects ?? [], this.dialect, this.databaseType, this.input.currentSchema));
     }
 
     if (context.comparisonLeftColumn && context.suggestKeywords) {
@@ -1310,6 +1430,17 @@ class SqlCompletionProvider {
     if (context.onStar) {
       const starItem = buildStarExpansionItem(context, this.input.columnsByTable, this.t, this.dialect);
       if (starItem) this.items.push(starItem);
+    }
+
+    if (context.prefix) {
+      for (const item of this.items) {
+        // Alias snippets reuse the prefix as a label while applying alias SQL, so they are not exact name matches.
+        const isAliasSnippet = item.type === "snippet" && item.apply === formatAliasCompletionApply(item.label, this.databaseType);
+        if (!isAliasSnippet && item.label.toLowerCase() === context.prefix.toLowerCase()) {
+          item.exactMatch = true;
+          item.boost += EXACT_LABEL_MATCH_BOOST;
+        }
+      }
     }
 
     return dedupeAndSort(this.items);
@@ -1512,7 +1643,7 @@ export function getSqlCompletionResultValidFor(sql: string, cursor: number): Reg
   return undefined;
 }
 
-export function getSqlFunctionSignatureHelp(sql: string, cursor: number): SqlFunctionSignatureHelp | null {
+export function getSqlFunctionSignatureHelp(sql: string, cursor: number, databaseType?: DatabaseType): SqlFunctionSignatureHelp | null {
   const beforeCursor = sql.slice(0, cursor);
   const openParenIndex = findActiveFunctionOpenParen(beforeCursor);
   if (openParenIndex == null) return null;
@@ -1521,7 +1652,7 @@ export function getSqlFunctionSignatureHelp(sql: string, cursor: number): SqlFun
   const name = /([A-Za-z_][\w$]*)$/.exec(beforeParen)?.[1]?.toUpperCase();
   if (!name) return null;
 
-  const parameters = SQL_FUNCTION_SIGNATURES.get(name);
+  const parameters = (databaseType ? DATABASE_FUNCTION_SIGNATURES[databaseType]?.get(name) : undefined) ?? SQL_FUNCTION_SIGNATURES.get(name);
   if (!parameters) return null;
 
   const activeParameter = countTopLevelCommas(beforeCursor.slice(openParenIndex + 1));
@@ -1604,6 +1735,50 @@ function isCallRoutineContext(beforeToken: string): boolean {
   return /\bcall\s+(?:[A-Za-z_][\w$]*\.)?$/i.test(beforeToken) || /\bcall\s+(?:[A-Za-z_][\w$]*\.)?[A-Za-z_][\w$]*$/i.test(beforeToken);
 }
 
+const SQL_IDENTIFIER_CONTINUE_CHAR = /[$_\u200c\u200d\p{ID_Continue}]/u;
+
+function hasTableAliasAfterCursor(sql: string, cursor: number): boolean {
+  if (hasAliasMarkerAt(sql, cursor, false)) return true;
+  let pos = cursor;
+  while (pos < sql.length) {
+    const codePoint = sql.codePointAt(pos);
+    if (codePoint === undefined) break;
+    const char = String.fromCodePoint(codePoint);
+    if (char !== "." && !SQL_IDENTIFIER_CONTINUE_CHAR.test(char)) break;
+    // Advance by the full code point so supplementary Unicode identifiers
+    // do not leave the scan between UTF-16 surrogate halves.
+    pos += char.length;
+  }
+  if (sql[pos] === '"' || sql[pos] === "`" || sql[pos] === "]") pos++;
+  return hasAliasMarkerAt(sql, pos, true);
+}
+
+function hasAliasMarkerAt(sql: string, pos: number, allowImplicitAlias: boolean): boolean {
+  const following = sql.slice(skipSqlWhitespaceAndComments(sql, pos));
+  if (/^as\b/i.test(following)) return true;
+  if (/^(?:"[^"]+"|`[^`]+`|\[[^\]]+\])/.test(following)) return true;
+  if (!allowImplicitAlias) return false;
+  const implicitAlias = /^([A-Za-z_][\w$]*)/.exec(following)?.[1]?.toLowerCase();
+  return !!implicitAlias && !isUnsafeSqlAlias(implicitAlias);
+}
+
+function skipSqlWhitespaceAndComments(sql: string, pos: number): number {
+  for (;;) {
+    while (pos < sql.length && /\s/.test(sql[pos])) pos++;
+    if (sql.startsWith("--", pos)) {
+      const newline = sql.indexOf("\n", pos + 2);
+      if (newline === -1) return sql.length;
+      pos = newline + 1;
+    } else if (sql.startsWith("/*", pos)) {
+      const end = sql.indexOf("*/", pos + 2);
+      if (end === -1) return sql.length;
+      pos = end + 2;
+    } else {
+      return pos;
+    }
+  }
+}
+
 export function getSqlCompletionContext(sql: string, cursor: number): SqlCompletionContext {
   // Extract the full statement at cursor position for referenced tables
   const fullStatement = extractStatementAt(sql, cursor);
@@ -1651,7 +1826,8 @@ export function getSqlCompletionContext(sql: string, cursor: number): SqlComplet
 
   const afterTableTrigger = TABLE_TRIGGER_KEYWORDS.has(lastWord) || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || isInTableListContext(beforeToken);
   const exclusiveTableSuggestions = EXCLUSIVE_TABLE_TRIGGER_KEYWORDS.has(lastWord) || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || isInTableListContext(beforeToken);
-  const autoAliasTableCompletions = lastWord === "from" || lastWord === "join" || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || isInTableListContext(beforeToken);
+  const tableAliasAfterCursor = hasTableAliasAfterCursor(sql, cursor);
+  const autoAliasTableCompletions = (lastWord === "from" || lastWord === "join" || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || isInTableListContext(beforeToken)) && !tableAliasAfterCursor;
   const exclusiveColumnSuggestions = !!qualifier && !exclusiveTableSuggestions && !insertInfo;
   const activePrefixIsCte = cteDefs.some((cte) => normalizeIdentifierPart(cte.name) === normalizeIdentifierPart(prefix));
   if (exclusiveTableSuggestions && prefix && !activePrefixIsCte && referencedTables.length > 1) {
@@ -1664,10 +1840,9 @@ export function getSqlCompletionContext(sql: string, cursor: number): SqlComplet
   const inJoinConditionContext = isInJoinConditionContext(beforeCursor);
   const prioritizeSelectAliases = isInOrderOrGroupByContext(beforeCursor);
   const inCallRoutineContext = isCallRoutineContext(beforeCursor);
-  const inPotentialPackageMemberContext = !!qualifier && !exclusiveTableSuggestions && !insertInfo && !oracleTableFunctionContext;
+  const inPotentialPackageMemberContext = !!qualifier && !exclusiveTableSuggestions && !insertInfo && !updateInfo?.inSetClause && !oracleTableFunctionContext;
   const suggestColumns = !!qualifier || !!updateInfo?.inSetClause || !!insertInfo || (inColumnContext && referencedTables.length > 0);
-  const preferColumnsOverGlobalRoutines = suggestColumns && referencedTables.length > 0 && !qualifier;
-  const suggestRoutines = inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!preferColumnsOverGlobalRoutines && !exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && prefix.length >= 2);
+  const suggestRoutines = inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && !updateInfo?.inSetClause && prefix.length >= 2);
 
   const statementKind = detectStatementKind(beforeCursor || fullStatement);
   const preferredKeywords = qualifier ? [] : preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo);
@@ -1715,6 +1890,7 @@ export function getSqlCompletionContext(sql: string, cursor: number): SqlComplet
     deleteTarget: deleteInfo?.target,
     oracleTableFunctionContext,
     autoAliasTableCompletions,
+    tableAliasAfterCursor,
     contextKind,
   };
 }
@@ -1748,12 +1924,12 @@ function detectCompletionContextKind(options: {
   if (options.updateInfo?.inSetClause) return "column";
   if (options.inCallRoutineContext) return "exec";
   if (options.qualifier && options.exclusiveColumnSuggestions) return "alias_column";
+  if (options.suggestColumns) return options.qualifier ? "alias_column" : "column";
   if (options.oracleTableFunctionContext || options.suggestRoutines) return "routine";
   if (options.exclusiveTableSuggestions || options.afterTableTrigger) {
     if (options.statementKind === "insert" && options.lastWord === "into") return "insert_target";
     return options.lastWord === "join" ? "join" : "table";
   }
-  if (options.suggestColumns) return options.qualifier ? "alias_column" : "column";
   return "keyword";
 }
 
@@ -2035,7 +2211,7 @@ function detectInsertColumnListContext(beforeCursor: string): { table: string; s
 
 function detectUpdateCompletionContext(beforeCursor: string): { target: { table: string; schema?: string }; afterTarget: boolean; inSetClause: boolean; afterSetAssignments: boolean } | null {
   const cleaned = beforeCursor.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-  const match = /^\s*update\s+((?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*))?)(?:\s+(?:as\s+)?([A-Za-z_][\w$]*))?/i.exec(cleaned);
+  const match = /^\s*update\s+((?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*))?)(?:\s+(?:as\s+)?((?!set\b|where\b)[A-Za-z_][\w$]*))?/i.exec(cleaned);
   if (!match) return null;
   const [first, second] = splitQualifiedName(match[1] ?? "");
   if (!first) return null;
@@ -2205,6 +2381,7 @@ function extractReferencedTables(sql: string): SqlCompletionReferencedTable[] {
     "select",
     "from",
     "join",
+    "straight_join",
     "left",
     "right",
     "inner",
@@ -2287,11 +2464,16 @@ function extractReferencedTables(sql: string): SqlCompletionReferencedTable[] {
     "respect",
   ]);
 
-  const pattern = /\b(?:from|join|update|apply)\s+((?:"[^"]+"|`[^`]+`|[^\s,;()]+)(?:\.(?:"[^"]+"|`[^`]+`|[^\s,;()]+))?)(?:\s+(?:as\s+)?([A-Za-z_][\w$]*))?/gi;
+  // STRAIGHT_JOIN is a standalone MySQL table introducer, not a modifier followed by JOIN.
+  const pattern = /\b(?:from|join|straight_join|update|apply)\s+((?:"[^"]+"|`[^`]+`|[^\s,;()]+)(?:\.(?:"[^"]+"|`[^`]+`|[^\s,;()]+))?)(?:\s+(?:as\s+)?([A-Za-z_][\w$]*))?/gi;
   const referenced: SqlCompletionReferencedTable[] = [];
-  for (const match of sql.matchAll(pattern)) {
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(sql)) !== null) {
     const rawName = match[1];
     const alias = match[2];
+    if (alias && ALIAS_BLACKLIST.has(alias.toLowerCase())) {
+      pattern.lastIndex = match.index + match[0].length - alias.length;
+    }
     const quotedName = !!rawName && (rawName.startsWith('"') || rawName.startsWith("`"));
     if (!quotedName && rawName && ALIAS_BLACKLIST.has(rawName.toLowerCase())) continue;
     // Filter out SQL keywords that accidentally matched as aliases
@@ -2595,7 +2777,7 @@ function unquoteIdentifier(value: string): string {
   return value;
 }
 
-function quoteSqlIdentifier(identifier: string, dialect?: "mysql" | "postgres" | "sqlserver"): string {
+export function quoteSqlIdentifier(identifier: string, dialect?: "mysql" | "postgres" | "sqlserver"): string {
   if (dialect !== "postgres" || !requiresPostgresIdentifierQuote(identifier)) return identifier;
   return `"${identifier.replaceAll('"', '""')}"`;
 }
@@ -2605,21 +2787,143 @@ function requiresPostgresIdentifierQuote(identifier: string): boolean {
   return POSTGRES_IDENTIFIER_KEYWORDS.has(identifier);
 }
 
-const POSTGRES_IDENTIFIER_KEYWORDS = new Set(SQL_KEYWORDS.map((keyword) => keyword.toLowerCase()).concat(["current_user", "session_user", "user"]));
+// PostgreSQL reserved_keyword + type_func_name_keyword categories (pg_get_keywords()
+// catcodes R and T) — identifiers matching these cannot appear as a bare column
+// reference and must be quoted. SQL_KEYWORDS alone misses most of them because it is
+// a completion phrase list ("ORDER BY", not "order").
+const POSTGRES_RESERVED_KEYWORDS = [
+  "all",
+  "analyse",
+  "analyze",
+  "and",
+  "any",
+  "array",
+  "as",
+  "asc",
+  "asymmetric",
+  "authorization",
+  "binary",
+  "both",
+  "case",
+  "cast",
+  "check",
+  "collate",
+  "collation",
+  "column",
+  "concurrently",
+  "constraint",
+  "create",
+  "cross",
+  "current_catalog",
+  "current_date",
+  "current_role",
+  "current_schema",
+  "current_time",
+  "current_timestamp",
+  "current_user",
+  "default",
+  "deferrable",
+  "desc",
+  "distinct",
+  "do",
+  "else",
+  "end",
+  "except",
+  "false",
+  "fetch",
+  "for",
+  "foreign",
+  "freeze",
+  "from",
+  "full",
+  "grant",
+  "group",
+  "having",
+  "ilike",
+  "in",
+  "initially",
+  "inner",
+  "intersect",
+  "into",
+  "is",
+  "isnull",
+  "join",
+  "lateral",
+  "leading",
+  "left",
+  "like",
+  "limit",
+  "localtime",
+  "localtimestamp",
+  "natural",
+  "not",
+  "notnull",
+  "null",
+  "offset",
+  "on",
+  "only",
+  "or",
+  "order",
+  "outer",
+  "overlaps",
+  "placing",
+  "primary",
+  "references",
+  "returning",
+  "right",
+  "select",
+  "session_user",
+  "similar",
+  "some",
+  "symmetric",
+  "system_user",
+  "table",
+  "tablesample",
+  "then",
+  "to",
+  "trailing",
+  "true",
+  "union",
+  "unique",
+  "user",
+  "using",
+  "variadic",
+  "verbose",
+  "when",
+  "where",
+  "window",
+  "with",
+];
 
-function buildTableItems(prefix: string, tables: SqlCompletionTable[], dialect?: "mysql" | "postgres" | "sqlserver", autoAliasTables = false, referencedTables: SqlCompletionReferencedTable[] = [], databaseType?: DatabaseType): SqlCompletionItem[] {
+const POSTGRES_IDENTIFIER_KEYWORDS = new Set(SQL_KEYWORDS.map((keyword) => keyword.toLowerCase()).concat(POSTGRES_RESERVED_KEYWORDS));
+
+function buildTableItems(
+  context: Pick<SqlCompletionContext, "prefix" | "qualifier">,
+  tables: SqlCompletionTable[],
+  dialect?: "mysql" | "postgres" | "sqlserver",
+  autoAliasTables = false,
+  referencedTables: SqlCompletionReferencedTable[] = [],
+  databaseType?: DatabaseType,
+  currentSchema?: string,
+): SqlCompletionItem[] {
+  const { prefix } = context;
+  const qualifierSchema = context.qualifier?.split(".").filter(Boolean).pop();
   const existingAliases = new Set(referencedTables.map((ref) => ref.alias?.toLowerCase()).filter((alias): alias is string => !!alias));
   return tables
     .filter((table) => matchesPrefix(table.name, prefix))
     .map((table) => {
-      const applyName = quoteSqlIdentifier(table.name, dialect);
+      const qualifiedByContext = !!qualifierSchema && !!table.schema && normalizeIdentifierPart(qualifierSchema) === normalizeIdentifierPart(table.schema);
+      const oracleSchemaQualification = databaseType === "oracle" && table.schema && table.schema.toUpperCase() !== "PUBLIC" && (!currentSchema || normalizeIdentifierPart(table.schema) !== normalizeIdentifierPart(currentSchema));
+      const defaultApplyName = oracleSchemaQualification ? `${quoteSqlIdentifier(table.schema!, dialect)}.${quoteSqlIdentifier(table.name, dialect)}` : quoteSqlIdentifier(table.name, dialect);
+      const applyName = qualifiedByContext ? quoteSqlIdentifier(table.name, dialect) : (table.applyName ?? defaultApplyName);
       const alias = autoAliasTables ? generateTableCompletionAlias(table.name, existingAliases) : "";
       return {
         label: table.name,
         type: "table" as const,
-        detail: table.schema ? `${table.schema}.${table.name}` : table.type,
+        detail: table.detail ?? (table.schema ? `${table.schema}.${table.name}` : table.type),
         apply: formatTableAliasApply(applyName, alias, databaseType),
-        boost: computeBoost(table.name, prefix) + 1000,
+        boost: computeBoost(table.name, prefix) + 1000 + (table.boost ?? 0),
+        dedupeKey: table.applyName || (databaseType === "oracle" && table.schema) ? applyName : undefined,
       };
     })
     .sort(compareCompletionItems)
@@ -2689,29 +2993,58 @@ function buildSchemaItems(prefix: string, schemas: string[], dialect?: "mysql" |
     }));
 }
 
-function buildObjectItems(context: SqlCompletionContext, objects: SqlCompletionObject[], dialect?: "mysql" | "postgres" | "sqlserver"): SqlCompletionItem[] {
-  const onlyProcedures = context.exclusiveRoutineSuggestions;
+function buildObjectItems(context: SqlCompletionContext, objects: SqlCompletionObject[], dialect?: "mysql" | "postgres" | "sqlserver", databaseType?: DatabaseType, currentSchema?: string): SqlCompletionItem[] {
+  if (completionQualifierIsReferencedTable(context)) return [];
+  const onlyProcedures = context.contextKind === "exec";
+  const onlyFunctions = context.suggestColumns && context.referencedTables.length > 0 && !context.qualifier;
+  const prioritizeOracleFunctions = databaseType === "oracle" && context.statementKind === "select";
   return objects
-    .filter((object) => (!onlyProcedures || object.type === "procedure") && objectMatchesCompletionContext(object, context))
+    .filter((object) => (!onlyProcedures || object.type === "procedure") && (!onlyFunctions || (object.type === "function" && object.name.toLowerCase().startsWith(context.prefix.toLowerCase()))) && objectMatchesCompletionContext(object, context))
     .map((object) => {
       const qualifiedByContext = objectIsQualifiedByContext(object, context);
+      const objectInCurrentSchema = !!currentSchema && !!object.schema && normalizeIdentifierPart(object.schema) === normalizeIdentifierPart(currentSchema);
       const applyName =
         qualifiedByContext || (context.qualifier && object.schema?.toLowerCase() === context.qualifier.toLowerCase())
           ? quoteSqlIdentifier(object.name, dialect)
-          : object.schema
-            ? `${quoteSqlIdentifier(object.schema, dialect)}.${quoteSqlIdentifier(object.name, dialect)}`
-            : quoteSqlIdentifier(object.name, dialect);
-      const detail = object.type === "trigger" && object.parentName ? `trigger on ${object.parentName}` : object.parentName ? `${object.type} in ${object.parentName}` : object.schema ? `${object.type} in ${object.schema}` : object.type;
+          : (object.applyName ?? (object.schema && !objectInCurrentSchema ? `${quoteSqlIdentifier(object.schema, dialect)}.${quoteSqlIdentifier(object.name, dialect)}` : quoteSqlIdentifier(object.name, dialect)));
+      const locationDetail = object.type === "trigger" && object.parentName ? `trigger on ${object.parentName}` : object.parentName ? `${object.type} in ${object.parentName}` : object.schema ? `${object.type} in ${object.schema}` : object.type;
+      const detail = object.dataType ? `${locationDetail}  [${object.dataType}]` : locationDetail;
+      const schemaBoost = onlyFunctions ? Math.min(object.boost ?? 0, 1000) : (object.boost ?? 0);
+      const typeBoost = routineTypeBoost(object.type, prioritizeOracleFunctions && !onlyFunctions);
       return {
         label: object.name,
         type: "function" as const,
         detail,
+        info: buildRoutineInfo(object),
         apply: object.type === "trigger" || object.type === "package" ? applyName : `${applyName}()`,
-        boost: computeBoost(object.name, context.prefix) + (object.type === "procedure" ? 1800 : object.type === "package" ? 1600 : 900),
+        boost: computeBoost(object.name, context.prefix) + typeBoost + schemaBoost,
+        dedupeKey: object.applyName || (databaseType === "oracle" && object.schema) ? applyName : undefined,
+        // Preserve exact routine matches before the capped candidate list is truncated.
+        exactMatch: !!context.prefix && object.name.toLowerCase() === context.prefix.toLowerCase(),
       };
     })
     .sort(compareCompletionItems)
     .slice(0, MAX_TABLE_COMPLETION_ITEMS);
+}
+
+function buildRoutineInfo(object: SqlCompletionObject): string | undefined {
+  const qualifiedName = object.parentName ? [object.parentSchema ?? object.schema, object.parentName, object.name].filter(Boolean).join(".") : [object.schema, object.name].filter(Boolean).join(".");
+  const parts = [qualifiedName || object.name, object.signature?.trim(), object.comment?.trim()].filter((part): part is string => !!part);
+  return parts.length > 1 ? parts.join("\n") : undefined;
+}
+
+function routineTypeBoost(type: SqlCompletionObject["type"], prioritizeFunctions: boolean): number {
+  if (type === "package") return 1600;
+  if (type === "function") return prioritizeFunctions ? 1800 : 900;
+  return prioritizeFunctions ? 900 : 1800;
+}
+
+function completionQualifierIsReferencedTable(context: SqlCompletionContext): boolean {
+  if (!context.qualifier) return false;
+  const qualifier = context.qualifier;
+  const qualifierLower = qualifier.toLowerCase();
+  const qualifiedTarget = qualifiedTableTargetFromContext(context);
+  return context.referencedTables.some((table) => referencedTableMatchesColumnQualifier(table, qualifier, qualifierLower, qualifiedTarget));
 }
 
 function objectIsQualifiedByContext(object: SqlCompletionObject, context: SqlCompletionContext): boolean {
@@ -3072,8 +3405,7 @@ function buildAliasCandidates(tableName: string): string[] {
 
   if (parts.length > 1) {
     const initials = parts.map((part) => part[0]).join("");
-    if (initials.length >= 2) candidates.push(initials.slice(0, 2));
-    if (initials.length >= 3) candidates.push(initials.slice(0, 3));
+    if (initials.length >= 2) candidates.push(initials);
     candidates.push(parts[0].slice(0, 2), parts[0].slice(0, 3));
   } else {
     const name = parts[0] ?? tableName.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -3164,9 +3496,10 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
     const qLower = q.toLowerCase();
     const qualifiedTarget = qualifiedTableTargetFromContext(context);
     const relatedTables = context.referencedTables.filter((table) => referencedTableMatchesColumnQualifier(table, q, qLower, qualifiedTarget));
-    relevantCols = allColumns.filter((column) => relatedTables.some((table) => columnMatchesReferencedTable(column, table)) || (!!qualifiedTarget && columnMatchesQualifiedTable(column, qualifiedTarget)));
+    relevantCols = relatedTables.flatMap((table) => completionColumnsForReferencedTable(table, allColumns));
+    if (relatedTables.length === 0 && qualifiedTarget) relevantCols = allColumns.filter((column) => columnMatchesQualifiedTable(column, qualifiedTarget));
   } else if (context.referencedTables.length > 0) {
-    relevantCols = allColumns.filter((column) => context.referencedTables.some((table) => columnMatchesReferencedTable(column, table)));
+    relevantCols = context.referencedTables.flatMap((table) => completionColumnsForReferencedTable(table, allColumns));
   }
 
   // Count name frequencies to detect duplicates across tables
@@ -3181,10 +3514,11 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
   for (const c of relevantCols) {
     const count = nameCount.get(c.name) || 0;
     if (count > 1) {
-      const qualifiedKey = `${c.table}.${c.name}`;
+      const qualifier = c.sourceAlias ?? c.table;
+      const qualifiedKey = `${qualifier}.${c.name}`;
       if (seen.has(qualifiedKey)) continue;
       seen.add(qualifiedKey);
-      uniqueColumns.push({ ...c, key: c.key, displayLabel: `${c.table}.${c.name}` });
+      uniqueColumns.push({ ...c, key: c.key, displayLabel: `${qualifier}.${c.name}` });
     } else {
       if (seen.has(c.name)) continue;
       seen.add(c.name);
@@ -3214,19 +3548,24 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
     .sort(compareCompletionItems);
 }
 
+function completionColumnsForReferencedTable<T extends SqlCompletionColumn & { key: string }>(table: SqlCompletionReferencedTable, columns: readonly T[]): T[] {
+  const matched = columns.filter((column) => columnMatchesReferencedTable(column, table));
+  const aliasedColumns = applyReferencedColumnAliases(table, matched);
+  if (!table.alias) return aliasedColumns;
+  return aliasedColumns.map((column) => ({ ...column, sourceAlias: table.alias }));
+}
+
+function applyReferencedColumnAliases<T extends SqlCompletionColumn>(table: SqlCompletionReferencedTable, columns: readonly T[]): T[] {
+  if (!table.columnAliases?.length) return [...columns];
+  return columns.map((column, index) => {
+    const alias = table.columnAliases?.[index];
+    return alias ? { ...column, name: alias } : column;
+  });
+}
+
 function hasMatchingReferencedColumnPrefix(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>): boolean {
   if (!context.suggestColumns || !context.prefix || context.referencedTables.length === 0) return false;
-
-  for (const [key, cols] of columnsByTable.entries()) {
-    for (const column of cols) {
-      if (!matchesPrefix(column.name, context.prefix)) continue;
-      if (context.referencedTables.some((table) => columnMatchesReferencedTable({ ...column, key }, table))) {
-        return true;
-      }
-    }
-  }
-
-  return false;
+  return context.referencedTables.some((table) => columnsForReferencedTable(table, columnsByTable).some((column) => matchesPrefix(column.name, context.prefix)));
 }
 
 function qualifiedTableTargetFromContext(context: SqlCompletionContext): { schema: string; table: string } | null {
@@ -3270,7 +3609,7 @@ function buildColumnApply(column: SqlCompletionColumn & { displayLabel: string }
   if (context.qualifier || column.displayLabel === column.name || !column.displayLabel.includes(".")) {
     return quoteSqlIdentifier(column.name, dialect);
   }
-  return `${quoteSqlIdentifier(column.table, dialect)}.${quoteSqlIdentifier(column.name, dialect)}`;
+  return `${quoteSqlIdentifier(column.sourceAlias ?? column.table, dialect)}.${quoteSqlIdentifier(column.name, dialect)}`;
 }
 
 function isKeyColumn(name: string): boolean {
@@ -3322,7 +3661,7 @@ function columnsForReferencedTable(table: SqlCompletionReferencedTable, columnsB
   const keys = table.schema ? [`${table.schema}.${table.name}`, table.name] : [table.name];
   for (const key of keys) {
     const columns = columnsByTable.get(key);
-    if (columns) return columns;
+    if (columns) return applyReferencedColumnAliases(table, columns);
   }
   return [];
 }
@@ -3659,7 +3998,8 @@ function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?:
 }
 
 function activeFunctionSignatures(databaseType?: DatabaseType): Map<string, string[]> {
-  const signatures = databaseType ? new Map(Array.from(SQL_FUNCTION_SIGNATURES.entries()).filter(([name]) => COMMON_SQL_FUNCTION_NAMES.has(name))) : new Map(SQL_FUNCTION_SIGNATURES);
+  const commonFunctionNames = databaseType === "cloudflare-d1" ? CLOUDFLARE_D1_COMMON_FUNCTION_NAMES : COMMON_SQL_FUNCTION_NAMES;
+  const signatures = databaseType ? new Map(Array.from(SQL_FUNCTION_SIGNATURES.entries()).filter(([name]) => commonFunctionNames.has(name))) : new Map(SQL_FUNCTION_SIGNATURES);
   const databaseSignatures = databaseType ? DATABASE_FUNCTION_SIGNATURES[databaseType] : undefined;
   if (databaseSignatures) {
     for (const [name, parameters] of databaseSignatures) signatures.set(name, parameters);
@@ -3695,6 +4035,19 @@ function buildFunctionSnippetItems(prefix: string, functionDescriptions: Map<str
   }
 
   return items;
+}
+
+function buildOracleSystemValueItems(prefix: string, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+  return ORACLE_SYSTEM_VALUE_NAMES.filter((name) => matchesPrefix(name, prefix)).map((name) => {
+    const label = applySqlKeywordCase(name, keywordCase);
+    return {
+      label,
+      type: "function" as const,
+      detail: "Oracle system value",
+      apply: label,
+      boost: computeBoost(name, prefix) + 300,
+    };
+  });
 }
 
 function mongoCompletionItemToSqlCompletionItem(item: MongoCompletionItem): SqlCompletionItem {
@@ -3746,7 +4099,8 @@ function buildNonAggregatedColumnItems(context: SqlCompletionContext, columnsByT
 function activeSqlKeywords(databaseType?: DatabaseType): string[] {
   if (databaseType === "mongodb") return [];
   const databaseKeywords = databaseType ? DATABASE_SQL_KEYWORDS[databaseType] : undefined;
-  return databaseType ? Array.from(new Set([...COMMON_SQL_KEYWORDS, ...(databaseKeywords ?? [])])) : Array.from(new Set(SQL_KEYWORDS));
+  const keywords = databaseType ? Array.from(new Set([...COMMON_SQL_KEYWORDS, ...(databaseKeywords ?? [])])) : Array.from(new Set(SQL_KEYWORDS));
+  return isOracleLikeDatabase(databaseType) ? keywords.filter((keyword) => !NON_ORACLE_COMPLETION_WORDS.has(keyword)) : keywords;
 }
 
 function isOracleLikeDatabase(databaseType?: DatabaseType): boolean {
@@ -3774,11 +4128,11 @@ function isPendingJoinKeywordContext(context: SqlCompletionContext): boolean {
 function buildKeywordItems(prefix: string, context: SqlCompletionContext, databaseType?: DatabaseType, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
   const isDml = context.statementKind === "select" || context.statementKind === "insert" || context.statementKind === "update" || context.statementKind === "delete";
   const showDdl = !isDml || context.suggestTables;
+  const functionSignatures = activeFunctionSignatures(databaseType);
 
   return activeSqlKeywords(databaseType)
     .filter((keyword) => {
-      if (SQL_FUNCTION_SIGNATURES.has(keyword)) return false;
-      if (databaseType && DATABASE_FUNCTION_SIGNATURES[databaseType]?.has(keyword)) return false;
+      if (functionSignatures.has(keyword)) return false;
       if (WINDOW_FUNCTIONS.has(keyword)) return false;
       if (!matchesPrefix(keyword, prefix)) return false;
       if (!showDdl && isDml && (DDL_ONLY_KEYWORDS.has(keyword) || DATA_TYPE_KEYWORDS.has(keyword))) return false;
@@ -3793,6 +4147,18 @@ function buildKeywordItems(prefix: string, context: SqlCompletionContext, databa
         boost: base + freqBoost,
       };
     });
+}
+
+function shouldOfferKeywordPrefixContinuations(context: SqlCompletionContext, pendingJoinKeyword: boolean): boolean {
+  return !!context.prefix && !pendingJoinKeyword && !context.qualifier && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions;
+}
+
+function buildKeywordPrefixContinuationItems(prefix: string, context: SqlCompletionContext, databaseType?: DatabaseType, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+  const normalizedPrefix = prefix.toLowerCase();
+  return buildKeywordItems(prefix, context, databaseType, keywordCase).filter((item) => {
+    const normalizedLabel = item.label.toLowerCase();
+    return normalizedLabel.length > normalizedPrefix.length && normalizedLabel.startsWith(normalizedPrefix);
+  });
 }
 
 function matchesPrefix(candidate: string, prefix: string): boolean {
@@ -3907,7 +4273,7 @@ function getHistoryBoost(label: string, type: string): number {
 function dedupeAndSort(items: SqlCompletionItem[]): SqlCompletionItem[] {
   const seen = new Set<string>();
   return items.sort(compareCompletionItems).filter((item) => {
-    const key = `${item.type}:${item.label}`;
+    const key = `${item.type}:${item.dedupeKey ?? item.label}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -3915,6 +4281,7 @@ function dedupeAndSort(items: SqlCompletionItem[]): SqlCompletionItem[] {
 }
 
 function compareCompletionItems(left: SqlCompletionItem, right: SqlCompletionItem): number {
+  if (!left.exactMatch !== !right.exactMatch) return left.exactMatch ? -1 : 1;
   const leftBonus = getHistoryBoost(left.label, left.type);
   const rightBonus = getHistoryBoost(right.label, right.type);
   return right.boost + rightBonus + getTypePriorityBoost(right.type) - (left.boost + leftBonus + getTypePriorityBoost(left.type));

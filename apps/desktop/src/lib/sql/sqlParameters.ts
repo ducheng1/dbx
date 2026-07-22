@@ -21,8 +21,12 @@ interface ParameterOccurrence extends SqlParameterDescriptor {
   end: number;
 }
 
+type ComplexTypeDeclarationKind = "struct" | "variant";
+
 export interface SqlParameterOptions {
   databaseType?: DatabaseType;
+  // Which placeholder syntaxes are recognized. Undefined enables all of them.
+  enabledSyntaxes?: readonly SqlParameterSyntax[];
 }
 
 const PARAMETER_NAME_RE = /^[\p{L}_][\p{L}\p{N}_]*$/u;
@@ -78,6 +82,9 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
   const occurrences: ParameterOccurrence[] = [];
   const nativeSqlServerParameters = collectNativeSqlServerParameters(sql);
   const supportsNamedParameters = options?.databaseType !== "saphana";
+  const enabledSyntaxes = options?.enabledSyntaxes ? new Set(options.enabledSyntaxes) : null;
+  const isSyntaxEnabled = (syntax: SqlParameterSyntax) => !enabledSyntaxes || enabledSyntaxes.has(syntax);
+  const complexTypeFieldSeparators = supportsNamedParameters && isSyntaxEnabled("named") ? collectComplexTypeFieldSeparators(sql) : new Set<number>();
   let i = 0;
   let dollarQuoteEnd = "";
   let positionalIndex = 0;
@@ -94,7 +101,20 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
     const ch = sql[i];
     const next = sql[i + 1];
 
-    if (ch === "'" || ch === '"' || ch === "`") {
+    if (ch === "'" || ch === '"') {
+      // Exact quoted braced placeholders only (`'${name}'` / `"#{name}"`).
+      // Do not scan inside arbitrary quoted text — that path needs dialect-specific
+      // escaping contracts (see PR #3666) and must not change skipQuoted semantics.
+      const quoted = tryReadQuotedBracedPlaceholder(sql, i, ch as "'" | '"', isSyntaxEnabled);
+      if (quoted) {
+        occurrences.push(quoted);
+        i = quoted.end;
+        continue;
+      }
+      i = skipQuoted(sql, i, ch);
+      continue;
+    }
+    if (ch === "`") {
       i = skipQuoted(sql, i, ch);
       continue;
     }
@@ -110,16 +130,16 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
       i = skipBlockComment(sql, i + 2);
       continue;
     }
-    if (ch === "?") {
+    if (ch === "?" && isSyntaxEnabled("positional")) {
       positionalIndex += 1;
       const key = `?${positionalIndex}`;
       occurrences.push({ key, name: key, syntax: "positional", token: "?", start: i, end: i + 1 });
       i += 1;
       continue;
     }
-    if (ch === ":" && supportsNamedParameters) {
+    if (ch === ":" && supportsNamedParameters && isSyntaxEnabled("named")) {
       const name = readParameterName(sql, i + 1);
-      if (name && sql[i - 1] !== ":" && sql[i + 1] !== "=") {
+      if (name && sql[i - 1] !== ":" && sql[i + 1] !== "=" && !complexTypeFieldSeparators.has(i)) {
         occurrences.push({
           key: name,
           name,
@@ -132,7 +152,7 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
         continue;
       }
     }
-    if (ch === "$" && next === "{") {
+    if (ch === "$" && next === "{" && isSyntaxEnabled("shell")) {
       const end = sql.indexOf("}", i + 2);
       if (end !== -1) {
         const name = sql.slice(i + 2, end).trim();
@@ -143,7 +163,7 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
         }
       }
     }
-    if (ch === "#" && next === "{") {
+    if (ch === "#" && next === "{" && isSyntaxEnabled("mybatis")) {
       const end = sql.indexOf("}", i + 2);
       if (end !== -1) {
         const name = sql.slice(i + 2, end).trim();
@@ -158,9 +178,9 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
       i = skipLine(sql, i + 1);
       continue;
     }
-    if (ch === "@") {
+    if (ch === "@" && isSyntaxEnabled("sqlserver")) {
       const name = readParameterName(sql, i + 1);
-      if (name && next !== "@" && sql[i - 1] !== "@" && !nativeSqlServerParameters.declared.has(name.toLowerCase()) && !nativeSqlServerParameters.ignoredStarts.has(i)) {
+      if (name && next !== "@" && sql[i - 1] !== "@" && !isJdbcxMcpScopedPackage(sql, i, i + 1 + name.length) && !nativeSqlServerParameters.declared.has(name.toLowerCase()) && !nativeSqlServerParameters.ignoredStarts.has(i)) {
         occurrences.push({
           key: name,
           name,
@@ -185,6 +205,211 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
   }
 
   return occurrences;
+}
+
+// JDBCX MCP commands accept npm scoped packages in their unquoted args value,
+// for example `args=-y @modelcontextprotocol/server-everything`. The `@scope`
+// prefix is command data, not a SQL Server-style template parameter.
+function isJdbcxMcpScopedPackage(sql: string, start: number, nameEnd: number): boolean {
+  if (sql[nameEnd] !== "/" || !/[\p{L}\p{N}_.-]/u.test(sql[nameEnd + 1] ?? "")) return false;
+
+  const blockStart = sql.lastIndexOf("{{", start);
+  if (blockStart === -1 || sql.lastIndexOf("}}", start) > blockStart) return false;
+
+  const extensionPrefix = sql.slice(blockStart + 2, start);
+  return /^\s*mcp\s*\(/i.test(extensionPrefix) && /(?:^|[,\s])args\s*=[^,]*$/i.test(extensionPrefix);
+}
+
+// Doris-style complex types use colons between field names and types; those are not bind parameters.
+function collectComplexTypeFieldSeparators(sql: string): Set<number> {
+  const separators = new Set<number>();
+  let i = 0;
+  let dollarQuoteEnd = "";
+
+  while (i < sql.length) {
+    if (dollarQuoteEnd) {
+      const end = sql.indexOf(dollarQuoteEnd, i);
+      if (end === -1) break;
+      i = end + dollarQuoteEnd.length;
+      dollarQuoteEnd = "";
+      continue;
+    }
+
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === "'" || ch === '"' || ch === "`") {
+      i = skipQuoted(sql, i, ch);
+      continue;
+    }
+    if (ch === "[") {
+      i = skipBracketIdentifier(sql, i);
+      continue;
+    }
+    if (ch === "-" && next === "-") {
+      i = skipLine(sql, i + 2);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i = skipBlockComment(sql, i + 2);
+      continue;
+    }
+    if (isHashLineComment(sql, i)) {
+      i = skipLine(sql, i + 1);
+      continue;
+    }
+    if (ch === "$") {
+      const marker = readDollarQuoteMarker(sql, i);
+      if (marker) {
+        dollarQuoteEnd = marker;
+        i += marker.length;
+        continue;
+      }
+    }
+    const declaration = readComplexTypeDeclaration(sql, i);
+    if (declaration) {
+      i = collectComplexTypeFieldSeparatorsInDeclaration(sql, declaration.openingBracket + 1, declaration.kind, separators) + 1;
+      continue;
+    }
+    i += 1;
+  }
+
+  return separators;
+}
+
+function collectComplexTypeFieldSeparatorsInDeclaration(sql: string, start: number, kind: ComplexTypeDeclarationKind, separators: Set<number>): number {
+  let i = start;
+  let genericDepth = 0;
+  let parenthesisDepth = 0;
+  let expectsFieldName = true;
+
+  while (i < sql.length) {
+    if (expectsFieldName && genericDepth === 0 && parenthesisDepth === 0) {
+      const fieldStart = skipSqlWhitespaceAndComments(sql, i);
+      if (fieldStart !== i) {
+        i = fieldStart;
+        continue;
+      }
+      if (isLineStatementStart(sql, i) && isSqlStatementKeyword(sql, i)) return i;
+      const fieldNameEnd = readComplexTypeFieldNameEnd(sql, i, kind);
+      if (fieldNameEnd > i) {
+        const separator = skipSqlWhitespaceAndComments(sql, fieldNameEnd);
+        if (sql[separator] === ":") {
+          separators.add(separator);
+          i = separator + 1;
+          expectsFieldName = false;
+          continue;
+        }
+        i = fieldNameEnd;
+        expectsFieldName = false;
+        continue;
+      }
+    }
+
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === "'" || ch === '"' || ch === "`") {
+      i = skipQuoted(sql, i, ch);
+      continue;
+    }
+    if (ch === "[") {
+      i = skipBracketIdentifier(sql, i);
+      continue;
+    }
+    if (ch === "-" && next === "-") {
+      i = skipLine(sql, i + 2);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i = skipBlockComment(sql, i + 2);
+      continue;
+    }
+    if (isHashLineComment(sql, i)) {
+      i = skipLine(sql, i + 1);
+      continue;
+    }
+    const declaration = readComplexTypeDeclaration(sql, i);
+    if (declaration) {
+      i = collectComplexTypeFieldSeparatorsInDeclaration(sql, declaration.openingBracket + 1, declaration.kind, separators) + 1;
+      continue;
+    }
+    if (ch === ";" && genericDepth === 0 && parenthesisDepth === 0) return i;
+    if (ch === "<") {
+      genericDepth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === ">") {
+      if (genericDepth === 0 && parenthesisDepth === 0) return i;
+      if (genericDepth > 0) genericDepth -= 1;
+      i += 1;
+      continue;
+    }
+    if (ch === "(") {
+      parenthesisDepth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === ")") {
+      if (parenthesisDepth > 0) parenthesisDepth -= 1;
+      i += 1;
+      continue;
+    }
+    if (ch === "," && genericDepth === 0 && parenthesisDepth === 0) {
+      expectsFieldName = true;
+    }
+    i += 1;
+  }
+
+  return sql.length;
+}
+
+function readComplexTypeDeclaration(sql: string, start: number): { kind: ComplexTypeDeclarationKind; openingBracket: number } | null {
+  const kind: ComplexTypeDeclarationKind | null = matchesWord(sql, start, "struct") ? "struct" : matchesWord(sql, start, "variant") ? "variant" : null;
+  if (!kind) return null;
+
+  const openingBracket = skipSqlWhitespaceAndComments(sql, start + kind.length);
+  return sql[openingBracket] === "<" ? { kind, openingBracket } : null;
+}
+
+function readComplexTypeFieldNameEnd(sql: string, start: number, kind: ComplexTypeDeclarationKind): number {
+  if (kind === "variant") return readVariantFieldNameEnd(sql, start);
+
+  const ch = sql[start];
+  if (ch === '"' || ch === "`") return skipQuoted(sql, start, ch);
+  if (ch === "[") return skipBracketIdentifier(sql, start);
+  if (!PARAMETER_NAME_START_RE.test(ch ?? "")) return start;
+
+  let i = start + 1;
+  while (i < sql.length && PARAMETER_NAME_CHAR_RE.test(sql[i])) i += 1;
+  return i;
+}
+
+function readVariantFieldNameEnd(sql: string, start: number): number {
+  let i = start;
+  const modifier = matchesWord(sql, i, "match_name") ? "match_name" : matchesWord(sql, i, "match_name_glob") ? "match_name_glob" : "";
+  if (modifier) i = skipSqlWhitespaceAndComments(sql, i + modifier.length);
+  return sql[i] === "'" ? skipQuoted(sql, i, "'") : start;
+}
+
+function skipSqlWhitespaceAndComments(sql: string, start: number): number {
+  let i = start;
+  while (i < sql.length) {
+    while (i < sql.length && /\s/.test(sql[i])) i += 1;
+    if (sql[i] === "-" && sql[i + 1] === "-") {
+      i = skipLine(sql, i + 2);
+      continue;
+    }
+    if (sql[i] === "/" && sql[i + 1] === "*") {
+      i = skipBlockComment(sql, i + 2);
+      continue;
+    }
+    if (isHashLineComment(sql, i)) {
+      i = skipLine(sql, i + 1);
+      continue;
+    }
+    break;
+  }
+  return i;
 }
 
 function collectNativeSqlServerParameters(sql: string): { declared: Set<string>; ignoredStarts: Set<number> } {
@@ -521,6 +746,56 @@ function readParameterName(sql: string, start: number): string {
   let i = start + 1;
   while (i < sql.length && PARAMETER_NAME_CHAR_RE.test(sql[i])) i += 1;
   return sql.slice(start, i);
+}
+
+/** Match only unprefixed quote + exact `${name}`/`#{name}` + same quote. Leaves skipQuoted unchanged. */
+function tryReadQuotedBracedPlaceholder(sql: string, start: number, quote: "'" | '"', isSyntaxEnabled: (syntax: SqlParameterSyntax) => boolean): ParameterOccurrence | null {
+  if (sql[start] !== quote) return null;
+  // Reject E'...', U&'...', B'...', X'...', N'...' — replacing the quoted span would leave the
+  // prefix attached to a typed literal (e.g. E'${path}' → E'C:\new', B'${flag}' → BTRUE).
+  if (hasSqlStringLiteralPrefix(sql, start)) return null;
+
+  const open = sql.slice(start + 1, start + 3);
+  let syntax: SqlParameterSyntax | null = null;
+  if (open === "${") syntax = "shell";
+  else if (open === "#{") syntax = "mybatis";
+  else return null;
+  if (!isSyntaxEnabled(syntax)) return null;
+
+  const nameStart = start + 3;
+  const closeBrace = sql.indexOf("}", nameStart);
+  if (closeBrace === -1 || sql[closeBrace + 1] !== quote) return null;
+
+  const name = sql.slice(nameStart, closeBrace).trim();
+  if (!PARAMETER_NAME_RE.test(name)) return null;
+
+  const end = closeBrace + 2;
+  // The closing quote must be a real string terminator under the same rules as skipQuoted
+  // (doubled quotes / backslash escapes). Otherwise '${value}''suffix' would match '${value}'.
+  if (skipQuoted(sql, start, quote) !== end) return null;
+
+  return {
+    key: name,
+    name,
+    syntax,
+    token: sql.slice(start, end),
+    start,
+    end,
+  };
+}
+
+/** True when `quoteStart` opens a prefixed literal such as E'...', U&'...', or MySQL _charset'...'. */
+function hasSqlStringLiteralPrefix(sql: string, quoteStart: number): boolean {
+  if (quoteStart <= 0) return false;
+
+  if (quoteStart >= 2 && sql[quoteStart - 1] === "&" && (sql[quoteStart - 2] === "U" || sql[quoteStart - 2] === "u") && !PARAMETER_NAME_CHAR_RE.test(sql[quoteStart - 3] ?? "")) {
+    return true;
+  }
+
+  // SQL dialects attach word-like introducers directly to the quote. Reject the
+  // whole category so typed replacement cannot leave invalid prefixes such as
+  // `_utf8mb4TRUE`, and so future introducers do not require another allowlist.
+  return PARAMETER_NAME_CHAR_RE.test(sql[quoteStart - 1]);
 }
 
 function skipQuoted(sql: string, start: number, quote: string): number {

@@ -1,5 +1,7 @@
 import type {
   ConnectionConfig,
+  ConnectionTestResult,
+  DatabaseConnectionInfo,
   DatabaseInfo,
   SchemaInfo,
   LinkedServerInfo,
@@ -12,6 +14,7 @@ import type {
   ObjectSource,
   ObjectSourceKind,
   ColumnInfo,
+  SqlServerColumnMetadata,
   IndexInfo,
   ForeignKeyInfo,
   TriggerInfo,
@@ -25,6 +28,7 @@ import type {
   DatabaseType,
   InstalledPlugin,
   JdbcDriverInfo,
+  JdbcLocalBundleInfo,
   JdbcMavenBundleInfo,
   JdbcPluginStatus,
   SidebarLayout,
@@ -32,7 +36,9 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
+  TunnelProfile,
 } from "@/types/database";
+import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
@@ -48,6 +54,7 @@ import type {
   UpgradeAllAgentDriversResult,
   AgentUpdateBlocker,
   DesktopSettings,
+  McpGlobalPolicy,
   SavedSqlSyncRequest,
   DriverInstallProgress,
   JavaRuntimeConfig,
@@ -82,6 +89,7 @@ import type {
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,
+  DatabaseBackupSnapshot,
   DatabaseExportRequest,
   ExportProgress,
   TableExportRequest,
@@ -97,8 +105,10 @@ import type {
   ExplainSqlBuildResult,
   DroppedFilePreviewSqlOptions,
   MongoGridFsFileInfo,
+  AppSupportInfo,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
+import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
   DataGridColumnValueFilterConditionOptions,
@@ -110,7 +120,7 @@ import type {
   DataGridSaveStatementOptions,
   HiveTablePropertiesSqlOptions,
 } from "@/lib/dataGrid/dataGridSql";
-import type { BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
+import type { BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/table/objectSourceEditor";
@@ -146,6 +156,7 @@ import type {
   NacosServiceQuery,
 } from "@/types/nacos";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
+import { normalizeConnectionTestResult } from "@/lib/connection/connectionDatabaseInfo";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -205,8 +216,30 @@ export async function testConnection(config: ConnectionConfig): Promise<string> 
   return post("/api/connection/test", { config });
 }
 
+export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
+  const response = await fetch(apiUrl("/api/connection/test-info"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+  if (response.status === 404) {
+    return normalizeConnectionTestResult(await testConnection(config), config);
+  }
+  if (!response.ok) throw new Error(await response.text());
+  return normalizeConnectionTestResult(await response.json(), config);
+}
+
 export async function connectDb(config: ConnectionConfig, clientAttempt?: number): Promise<string> {
   return post("/api/connection/connect", { config, clientAttempt });
+}
+
+export async function connectionDatabaseInfo(connectionId: string, database?: string): Promise<DatabaseConnectionInfo | undefined> {
+  const info = await post<DatabaseConnectionInfo | null>("/api/connection/database-info", { connectionId, database });
+  return info ?? undefined;
+}
+
+export async function saveConnectionDatabaseInfo(connectionId: string, databaseInfo: DatabaseConnectionInfo): Promise<void> {
+  return post("/api/connection/database-info/save", { connectionId, databaseInfo });
 }
 
 export async function connectionFinalProxyPort(config: ConnectionConfig): Promise<number> {
@@ -221,6 +254,11 @@ export async function checkConnectionHealth(connectionId: string): Promise<void>
   return post("/api/connection/check-health", { connectionId });
 }
 
+export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {
+  const quote = await post<string | null>("/api/connection/identifier-quote", { connectionId, database });
+  return quote ?? undefined;
+}
+
 export async function closeDatabaseConnection(connectionId: string, database: string): Promise<boolean> {
   return post("/api/connection/close-database", { connectionId, database });
 }
@@ -231,6 +269,18 @@ export async function saveConnections(configs: ConnectionConfig[]): Promise<void
 
 export async function loadConnections(): Promise<ConnectionConfig[]> {
   return get("/api/connection/list");
+}
+
+export async function loadTunnelProfiles(): Promise<TunnelProfile[]> {
+  return get("/api/tunnel-profiles/list");
+}
+
+export async function saveTunnelProfiles(profiles: TunnelProfile[]): Promise<void> {
+  return post("/api/tunnel-profiles/save", { profiles });
+}
+
+export async function testTunnelProfile(profile: TunnelProfile): Promise<string> {
+  return post("/api/tunnel-profiles/test", profile);
 }
 
 export async function readKeychainPassword(_service: string): Promise<string> {
@@ -263,6 +313,10 @@ export async function listJdbcDrivers(): Promise<JdbcDriverInfo[]> {
 
 export async function listJdbcMavenBundles(): Promise<JdbcMavenBundleInfo[]> {
   return get("/api/jdbc/drivers/maven");
+}
+
+export async function listJdbcLocalBundles(): Promise<JdbcLocalBundleInfo[]> {
+  return get("/api/jdbc/drivers/local");
 }
 
 export async function importJdbcDrivers(pathsOrFiles: (string | File)[]): Promise<JdbcDriverInfo[]> {
@@ -298,6 +352,10 @@ export async function deleteJdbcMavenBundle(bundleId: string): Promise<JdbcDrive
   return del(`/api/jdbc/drivers/maven/${encodeURIComponent(bundleId)}`);
 }
 
+export async function deleteJdbcLocalBundle(bundleId: string): Promise<JdbcDriverInfo[]> {
+  return del(`/api/jdbc/drivers/local/${encodeURIComponent(bundleId)}`);
+}
+
 export async function jdbcPluginStatus(): Promise<JdbcPluginStatus> {
   return get("/api/jdbc/plugin/status");
 }
@@ -331,8 +389,12 @@ export async function listInstalledAgentsLocal(): Promise<AgentDriverInfo[]> {
   return get("/api/agents/installed-local");
 }
 
-export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
+export async function listInstalledAgents(_source?: UpdateDownloadSource): Promise<AgentDriverInfo[]> {
   return get("/api/agents/installed");
+}
+
+export async function isAgentInstalled(dbType: string): Promise<boolean> {
+  return get(`/api/agents/installed/${encodeURIComponent(dbType)}`);
 }
 
 export async function getDriverStoreUsage(): Promise<DriverStoreUsage> {
@@ -355,11 +417,11 @@ export async function restartDriverRuntime(runtimeId: string): Promise<void> {
   await post("/api/agents/runtime/restart", { runtimeId });
 }
 
-export async function installAgent(dbType: string): Promise<void> {
+export async function installAgent(dbType: string, _source?: UpdateDownloadSource): Promise<void> {
   await post("/api/agents/install", { dbType });
 }
 
-export async function upgradeAllAgents(): Promise<UpgradeAllAgentDriversResult> {
+export async function upgradeAllAgents(_source?: UpdateDownloadSource): Promise<UpgradeAllAgentDriversResult> {
   return post("/api/agents/upgrade-all", {});
 }
 
@@ -395,24 +457,26 @@ export async function importAgentsFromZip(fileOrPath: string | File): Promise<nu
   return result.count;
 }
 
-export async function importAgentJar(dbType: string, pathOrFile: string | File): Promise<void> {
+export async function importAgentDriver(dbType: string, pathOrFile: string | File): Promise<void> {
   let blob: Blob;
   let fileName: string;
   if (pathOrFile instanceof File) {
     blob = pathOrFile;
     fileName = pathOrFile.name;
   } else {
-    fileName = pathOrFile.split("/").pop() || "driver.jar";
+    fileName = pathOrFile.split("/").pop() || "agent";
     blob = await (await fetch(pathOrFile)).blob();
   }
   const formData = new FormData();
   formData.append("dbType", dbType);
   formData.append("file", blob, fileName);
-  const uploadRes = await fetch(apiUrl("/api/agents/import-jar"), { method: "POST", body: formData });
+  const uploadRes = await fetch(apiUrl("/api/agents/import-driver"), { method: "POST", body: formData });
   if (!uploadRes.ok) throw new Error(await uploadRes.text());
 }
 
-export async function reinstallJre(jreKey?: string): Promise<void> {
+export const importAgentJar = importAgentDriver;
+
+export async function reinstallJre(jreKey?: string, _source?: UpdateDownloadSource): Promise<void> {
   await post("/api/agents/reinstall-jre", { jreKey });
 }
 
@@ -466,6 +530,10 @@ export async function openSavedSqlStorageDir(_dir?: string | null): Promise<void
 
 export async function revealPathInFileManager(_path: string): Promise<void> {
   throw new Error("Reveal in file manager is only available in the desktop app.");
+}
+
+export async function deleteDatabaseBackupFiles(_paths: string[]): Promise<number> {
+  throw new Error("Database backup file management is only available in the desktop app.");
 }
 
 export async function isSqliteDatabaseFile(_path: string): Promise<boolean> {
@@ -568,12 +636,16 @@ export async function completionAssistantSearch(request: CompletionAssistantRequ
   return post("/api/schema/completion-assistant", request);
 }
 
-export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind): Promise<ObjectSource> {
-  return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType })}`);
+export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string): Promise<ObjectSource> {
+  return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature })}`);
 }
 
-export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ColumnInfo[]> {
-  return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
+export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string, clientSessionId?: string): Promise<ColumnInfo[]> {
+  return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog, client_session_id: clientSessionId })}`);
+}
+
+export async function getSqlServerColumnMetadata(connectionId: string, database: string, schema: string, table: string): Promise<SqlServerColumnMetadata[]> {
+  return get(`/api/schema/sqlserver/column-metadata?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
 
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
@@ -654,6 +726,7 @@ export async function executeQuery(
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
+    executionMode?: "simple";
   },
 ): Promise<QueryResult> {
   return post("/api/query/execute", { connectionId, database, sql, schema, executionId, ...options });
@@ -673,6 +746,8 @@ export async function executeMulti(
     clientSessionId?: string;
     timeoutSecs?: number;
     useTransaction?: boolean;
+    continueOnError?: boolean;
+    executionMode?: "simple";
   },
 ): Promise<QueryResult[]> {
   return post("/api/query/execute-multi", { connectionId, database, sql, schema, executionId, ...options });
@@ -744,12 +819,8 @@ export async function buildCreateUserSql(username: string, password: string, tab
 }
 
 export async function getExplainInfo(connectionId: string, database: string | undefined, schema: string | undefined, sql: string, mode: string): Promise<string | undefined> {
-  try {
-    const result = await post<string>("/api/query/get-explain-info", { connectionId, database, schema, sql, mode });
-    return result;
-  } catch {
-    return undefined;
-  }
+  // Match the Tauri path: transport and Agent failures must remain distinguishable from an empty plan.
+  return post<string>("/api/query/get-explain-info", { connectionId, database, schema, sql, mode });
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
@@ -779,6 +850,10 @@ export async function buildCreateDatabaseSql(options: CreateDatabaseSqlOptions):
 
 export async function buildDuckDbAttachDatabaseSql(path: string, name: string): Promise<string> {
   return post("/api/query/build-duckdb-attach-database-sql", { options: { path, name } });
+}
+
+export async function buildSqliteAttachDatabaseSql(path: string, name: string): Promise<string> {
+  return post("/api/query/build-sqlite-attach-database-sql", { options: { path, name } });
 }
 
 export async function buildDropObjectSql(options: DropObjectSqlOptions): Promise<string> {
@@ -847,6 +922,14 @@ export async function buildViewDdlSql(input: BuildViewDdlInput): Promise<string>
 
 export async function buildTableStructureChangeSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
   return post("/api/query/build-table-structure-change-sql", { options });
+}
+
+export async function previewSqliteTableStructureChange(connectionId: string, database: string, options: BuildTableStructureChangeSqlOptions): Promise<SqliteTableStructureChangePreview> {
+  return post("/api/query/preview-sqlite-table-structure-change", { connectionId, database, options });
+}
+
+export async function applySqliteTableStructureChange(connectionId: string, database: string, options: BuildTableStructureChangeSqlOptions, schemaRevision: string): Promise<QueryResult> {
+  return post("/api/query/apply-sqlite-table-structure-change", { connectionId, database, options, schemaRevision });
 }
 
 export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
@@ -992,11 +1075,11 @@ function isAgentEvent(v: unknown): v is import("@/lib/backend/tauri").AgentEvent
   return typeof v === "object" && v !== null && "type" in v && typeof (v as Record<string, unknown>).type === "string";
 }
 
-export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: import("@/lib/backend/tauri").AgentEvent) => void, mode?: string, signal?: AbortSignal): Promise<string> {
+export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: import("@/lib/backend/tauri").AgentEvent) => void, mode?: string, allowWriteSql = false, signal?: AbortSignal): Promise<string> {
   const res = await fetch(apiUrl("/api/ai/agent-stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId, request, connectionId, database, dbType, mode: mode || "ask" }),
+    body: JSON.stringify({ sessionId, request, connectionId, database, dbType, mode: mode || "ask", allowWriteSql }),
     signal,
   });
   if (!res.ok) throw new Error(await res.text());
@@ -1054,6 +1137,26 @@ export async function loadAiConfig(): Promise<AiConfig | null> {
   return get("/api/ai/config");
 }
 
+export async function saveAiConfigs(configs: import("@/types/ai").AiConfigItem[]): Promise<void> {
+  return post("/api/ai/configs", { configs });
+}
+
+export async function loadAiConfigs(): Promise<import("@/types/ai").AiConfigItem[]> {
+  return get("/api/ai/configs");
+}
+
+export async function setDefaultAiConfig(configId: string): Promise<void> {
+  return post("/api/ai/default-config", { configId });
+}
+
+export async function saveAiConfigItem(config: import("@/types/ai").AiConfigItem): Promise<void> {
+  return post("/api/ai/config-item", { config });
+}
+
+export async function deleteAiConfig(configId: string): Promise<void> {
+  return del(`/api/ai/config/${configId}`);
+}
+
 export async function loadDesktopSettings(): Promise<DesktopSettings> {
   try {
     const raw = safeLocalStorageGet(DESKTOP_SETTINGS_STORAGE_KEY);
@@ -1065,6 +1168,19 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   safeLocalStorageSet(DESKTOP_SETTINGS_STORAGE_KEY, JSON.stringify({ ...DEFAULT_DESKTOP_SETTINGS, ...settings }));
+}
+
+export async function loadMcpGlobalPolicy(): Promise<McpGlobalPolicy> {
+  return get("/api/app-settings/mcp-policy");
+}
+
+export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configured">): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/mcp-policy"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(policy),
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
 
 export interface OpenTabsStatePayload {
@@ -1175,6 +1291,33 @@ export interface WebDavSyncSecretsStatus {
   hasSavedPassphrase: boolean;
 }
 
+export type SnippetProvider = "github" | "gitee";
+
+export interface SnippetSyncConfig {
+  provider: SnippetProvider;
+  token?: string;
+  snippetId?: string;
+}
+
+export interface SnippetSyncSummary {
+  provider: SnippetProvider;
+  snippetId: string;
+  bytes: number;
+  exportedAt?: string;
+  appVersion?: string;
+}
+
+export interface SnippetDownloadResult {
+  summary: SnippetSyncSummary;
+  editorSettings?: unknown;
+  desktopSettings: DesktopSettings;
+  applySummary: WebDavDownloadResult["applySummary"];
+}
+
+export interface SnippetTokenStatus {
+  hasSavedToken: boolean;
+}
+
 export async function webdavSyncTest(config: WebDavConfig): Promise<void> {
   return post("/api/cloud-sync/webdav/test", { config });
 }
@@ -1209,6 +1352,30 @@ export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: un
 
 export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string): Promise<WebDavDownloadResult> {
   return post("/api/cloud-sync/webdav/download", { config, secretsPassphrase });
+}
+
+export async function snippetSyncTest(config: SnippetSyncConfig): Promise<void> {
+  await post("/api/cloud-sync/snippet/test", { config });
+}
+
+export async function snippetTokenStatus(config: SnippetSyncConfig): Promise<SnippetTokenStatus> {
+  return post("/api/cloud-sync/snippet/token-status", { config });
+}
+
+export async function saveSnippetSavedToken(config: SnippetSyncConfig, token: string): Promise<void> {
+  await post("/api/cloud-sync/snippet/save-token", { config, token });
+}
+
+export async function forgetSnippetSavedToken(config: SnippetSyncConfig): Promise<void> {
+  await post("/api/cloud-sync/snippet/forget-token", { config });
+}
+
+export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, secretsPassphrase?: string): Promise<SnippetSyncSummary> {
+  return post("/api/cloud-sync/snippet/upload", { config, editorSettings, secretsPassphrase });
+}
+
+export async function snippetSyncDownload(config: SnippetSyncConfig, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
+  return post("/api/cloud-sync/snippet/download", { config, secretsPassphrase });
 }
 
 export async function loadPinnedTreeNodeIds(): Promise<string[]> {
@@ -1285,6 +1452,10 @@ export async function writeExternalSqlFile(_path: string, _content: string): Pro
   throw new Error("Saving external SQL file paths is only available in the desktop app");
 }
 
+export async function saveExternalSqlFile(_defaultFileName: string, _content: string): Promise<string | null> {
+  throw new Error("Saving SQL files locally is only available in the desktop app");
+}
+
 export interface SqlFileEntry {
   name: string;
   path: string;
@@ -1315,7 +1486,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
     es.onmessage = (e) => {
       const progress: TransferProgress = JSON.parse(e.data);
       onProgress(progress);
-      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
+      if (isTerminalTransferProgress(progress)) {
         es.close();
         resolve();
       }
@@ -1420,6 +1591,10 @@ export async function cancelTableImport(importId: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 // Database Export
 // ---------------------------------------------------------------------------
+
+export async function beginDatabaseBackupSnapshot(_connectionId: string, _database: string): Promise<DatabaseBackupSnapshot> {
+  throw new Error("Consistent database backup snapshots are only available in the desktop app.");
+}
 
 export async function exportDatabaseSql(request: DatabaseExportRequest, onProgress: (progress: ExportProgress) => void): Promise<void> {
   // 1. POST to start the export
@@ -1608,11 +1783,12 @@ function downloadTextFile(filePath: string, fallbackFileName: string, content: s
   URL.revokeObjectURL(url);
 }
 
-export async function exportQueryResultXlsx(filePath: string, sheetName: string | undefined, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
+export async function exportQueryResultXlsx(filePath: string, sheetName: string | undefined, columns: string[], columnTypes: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
   const { buildXlsxWorkbook } = await import("@/lib/export/xlsxExport");
   const workbook = buildXlsxWorkbook({
     sheetName: sheetName || "Export",
     columns,
+    columnTypes,
     rows,
   });
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
@@ -1627,7 +1803,7 @@ export async function exportQueryResultXlsx(filePath: string, sheetName: string 
   URL.revokeObjectURL(url);
 }
 
-export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
+export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: readonly string[]; columnTypes?: readonly string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
   const { buildXlsxWorkbookMulti } = await import("@/lib/export/xlsxExport");
   const workbook = buildXlsxWorkbookMulti(worksheets);
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
@@ -1904,6 +2080,10 @@ export async function mongoDropCollection(connectionId: string, database: string
   await post("/api/mongo/drop-collection", { connectionId, database, collection });
 }
 
+export async function mongoRenameCollection(connectionId: string, database: string, collection: string, newName: string): Promise<void> {
+  await post("/api/mongo/rename-collection", { connectionId, database, collection, newName });
+}
+
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
   const collections = await documentListCollections(connectionId, "default");
   return collections.map((c) => c.name);
@@ -1921,8 +2101,21 @@ export async function mongoFindDocuments(connectionId: string, database: string,
   return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, executionId);
 }
 
+export async function mongoParseShellCommand(source: string): Promise<MongoCommand> {
+  const raw = await post<Record<string, unknown>>("/api/mongo/parse-shell-command", { source });
+  return normalizeRustMongoCommand(raw);
+}
+
+export async function mongoFindOne(connectionId: string, database: string, collection: string, filter?: string, projection?: string, options?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/find-one", { connectionId, database, collection, filter, projection, options, executionId });
+}
+
 export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
   return post("/api/document-store/find-documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+}
+
+export async function mongoCountDocuments(connectionId: string, database: string, collection: string, filter?: string, mode?: "accurate" | "legacy", executionId?: string): Promise<number> {
+  return post("/api/mongo/count-documents", { connectionId, database, collection, filter, mode, executionId });
 }
 
 export async function documentListGridFsFiles(connectionId: string, database: string, bucket: string, filter?: string, sort?: string): Promise<MongoGridFsFileInfo[]> {
@@ -1978,8 +2171,12 @@ export async function mongoServerVersion(connectionId: string, database: string,
   return post("/api/mongo/server-version", { connectionId, database, executionId });
 }
 
-export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number, executionId?: string): Promise<MongoDocumentResult> {
-  return post("/api/mongo/aggregate-documents", { connectionId, database, collection, pipelineJson, maxRows, executionId });
+export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number, optionsJson?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/aggregate-documents", { connectionId, database, collection, pipelineJson, maxRows, optionsJson, executionId });
+}
+
+export async function mongoDistinct(connectionId: string, database: string, collection: string, field: string, filter?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/distinct", { connectionId, database, collection, field, filter, executionId });
 }
 
 export async function mongoCollectionStats(connectionId: string, database: string, collection: string, scale?: number, executionId?: string): Promise<MongoCollectionStatsResult> {
@@ -1994,12 +2191,12 @@ export async function mongoDropIndexes(connectionId: string, database: string, c
   return post("/api/mongo/drop-indexes", { connectionId, database, collection, indexesJson, single });
 }
 
-export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
-  return documentInsertDocument(connectionId, database, collection, docJson);
+export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string, routing?: string): Promise<string> {
+  return documentInsertDocument(connectionId, database, collection, docJson, routing);
 }
 
-export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
-  return post("/api/document-store/insert-document", { connectionId, database, collection, docJson });
+export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string, routing?: string): Promise<string> {
+  return post("/api/document-store/insert-document", { connectionId, database, collection, docJson, routing });
 }
 
 export async function mongoInsertDocuments(connectionId: string, database: string, collection: string, docsJson: string): Promise<{ affected_rows: number }> {
@@ -2014,8 +2211,8 @@ export async function documentUpdateDocument(connectionId: string, database: str
   return post("/api/document-store/update-document", { connectionId, database, collection, id, docJson, routing });
 }
 
-export async function mongoUpdateDocuments(connectionId: string, database: string, collection: string, filterJson: string, updateJson: string, many: boolean): Promise<{ affected_rows: number }> {
-  return post("/api/mongo/update-documents", { connectionId, database, collection, filterJson, updateJson, many });
+export async function mongoUpdateDocuments(connectionId: string, database: string, collection: string, filterJson: string, updateJson: string, many: boolean, optionsJson?: string): Promise<{ affected_rows: number }> {
+  return post("/api/mongo/update-documents", { connectionId, database, collection, filterJson, updateJson, many, optionsJson });
 }
 
 export async function mongoDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
@@ -2028,6 +2225,18 @@ export async function documentDeleteDocument(connectionId: string, database: str
 
 export async function mongoDeleteDocuments(connectionId: string, database: string, collection: string, filterJson: string, many: boolean): Promise<{ affected_rows: number }> {
   return post("/api/mongo/delete-documents", { connectionId, database, collection, filterJson, many });
+}
+
+export async function mongoFindOneAndUpdate(connectionId: string, database: string, collection: string, filterJson: string, updateJson: string, optionsJson?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/find-one-and-update", { connectionId, database, collection, filterJson, updateJson, optionsJson });
+}
+
+export async function mongoFindOneAndReplace(connectionId: string, database: string, collection: string, filterJson: string, replacementJson: string, optionsJson?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/find-one-and-replace", { connectionId, database, collection, filterJson, replacementJson, optionsJson });
+}
+
+export async function mongoFindOneAndDelete(connectionId: string, database: string, collection: string, filterJson: string, optionsJson?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/find-one-and-delete", { connectionId, database, collection, filterJson, optionsJson });
 }
 
 // ---------------------------------------------------------------------------
@@ -2068,6 +2277,11 @@ export async function checkForUpdates(locale?: string): Promise<UpdateInfo> {
   return get(`/api/update/check${query}`);
 }
 
+export async function fetchChangelog(lang?: string): Promise<import("@/lib/app/changelog").ChangelogData> {
+  const query = lang ? `?lang=${encodeURIComponent(lang)}` : "";
+  return get(`/api/changelog${query}`);
+}
+
 export async function checkMcpServerStatus(): Promise<import("@/lib/backend/tauri").McpServerStatus> {
   return {
     installed: false,
@@ -2093,13 +2307,28 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
 }
 
-export async function downloadAndInstallUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+  throw new Error("In-app update downloads are only available in the desktop app.");
+}
+
+export async function installDownloadedUpdate(): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
 }
 
 export async function getAppVersion(): Promise<string> {
   const res: { version: string } = await get("/api/version");
   return res.version;
+}
+
+export async function getAppSupportInfo(): Promise<AppSupportInfo> {
+  const appVersion = await getAppVersion();
+  return {
+    appVersion,
+    runtime: "web",
+    osName: navigator.platform || "web",
+    osVersion: null,
+    arch: "",
+  };
 }
 
 // ---------------------------------------------------------------------------
