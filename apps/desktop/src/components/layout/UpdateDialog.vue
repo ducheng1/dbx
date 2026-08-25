@@ -18,22 +18,45 @@ const props = defineProps<{
   updateDownloaded: boolean;
   isInstallingUpdate: boolean;
   updateReady: boolean;
+  isIgnoringUpdate: boolean;
   activeTaskCount: number;
 }>();
 
 const emit = defineEmits<{
   "open-latest-release": [];
   "download-and-install": [];
+  "cancel-download": [];
   "install-downloaded": [];
   restart: [];
+  "ignore-version": [];
 }>();
 
 const { t } = useI18n();
 const isDesktop = isTauriRuntime();
 
 const renderedNotes = ref("");
-// Keep a downloaded package retryable after install errors; only active transitions must trap the dialog.
-const isCloseBlocked = computed(() => props.isDownloadingUpdate || props.isInstallingUpdate || props.updateReady);
+// Only active file replacement (installation) must trap the dialog.
+const isCloseBlocked = computed(() => props.isInstallingUpdate);
+// Accidental dismiss gestures (outside click, Escape) must not cancel a running download;
+// only the explicit close/cancel buttons should.
+const blocksImplicitDismiss = computed(() => props.isInstallingUpdate || props.isDownloadingUpdate);
+const canIgnoreVersion = computed(() => props.updateInfo?.update_available === true && !props.updateDownloaded && !props.isDownloadingUpdate && !props.isInstallingUpdate && !props.updateReady);
+
+function handleCancel() {
+  handleOpenChange(false);
+}
+
+function handleOpenChange(nextOpen: boolean) {
+  if (nextOpen) {
+    open.value = true;
+    return;
+  }
+  if (isCloseBlocked.value) return;
+  if (props.isDownloadingUpdate) {
+    emit("cancel-download");
+  }
+  open.value = false;
+}
 
 function handleReleaseNotesClick(event: MouseEvent) {
   const target = event.target as HTMLElement;
@@ -65,18 +88,18 @@ watch(
 </script>
 
 <template>
-  <Dialog v-model:open="open">
+  <Dialog :open="open" @update:open="handleOpenChange">
     <DialogContent
       class="sm:max-w-[520px]"
       :show-close-button="!isCloseBlocked"
       @interact-outside="
         (e: Event) => {
-          if (isCloseBlocked) e.preventDefault();
+          if (blocksImplicitDismiss) e.preventDefault();
         }
       "
       @escape-key-down="
         (e: Event) => {
-          if (isCloseBlocked) e.preventDefault();
+          if (blocksImplicitDismiss) e.preventDefault();
         }
       "
     >
@@ -106,8 +129,11 @@ watch(
           <code class="bg-muted px-1 py-0.5 rounded text-[11px]">docker compose pull && docker compose up -d</code>
           {{ t("updates.toUpdate") }}
         </p>
-        <p v-if="isDesktop && updateInfo?.update_available && updateInfo.portable_mode" class="text-xs text-muted-foreground">
-          {{ t("updates.portableManualUpdate") }}
+        <p v-if="isDesktop && updateInfo?.update_available && updateInfo.portable_mode && !updateInfo.manual_update_only" class="text-xs text-muted-foreground">
+          {{ t("updates.portableAutomaticUpdate") }}
+        </p>
+        <p v-if="isDesktop && updateInfo?.update_available && updateInfo.manual_update_only" class="text-xs text-muted-foreground">
+          {{ t("updates.windows7ManualUpdate") }}
         </p>
         <div v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop) && activeTaskCount > 0" role="alert" class="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
@@ -115,7 +141,11 @@ watch(
         </div>
       </div>
       <DialogFooter>
-        <Button v-if="!isCloseBlocked" variant="outline" @click="open = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button v-if="!isCloseBlocked" variant="outline" @click="handleCancel">{{ t("dangerDialog.cancel") }}</Button>
+        <Button v-if="canIgnoreVersion" variant="ghost" :disabled="isIgnoringUpdate" @click="emit('ignore-version')">
+          <Loader2 v-if="isIgnoringUpdate" class="h-4 w-4 animate-spin" />
+          {{ t("updates.ignoreVersion") }}
+        </Button>
         <template v-if="updateInfo?.update_available">
           <Button variant="outline" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
           <template v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop)">
@@ -124,7 +154,7 @@ watch(
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("updates.installing") }}
             </Button>
-            <Button v-else-if="isDownloadingUpdate" disabled>
+            <Button v-else-if="isDownloadingUpdate" class="w-52 tabular-nums" disabled>
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("updates.downloading", { progress: downloadProgress }) }}
             </Button>

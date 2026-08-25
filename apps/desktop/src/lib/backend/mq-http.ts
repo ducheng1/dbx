@@ -13,6 +13,7 @@ import type {
   ListTopicsOpts,
   TopicStats,
   SubscriptionInfo,
+  KafkaConsumerGroupSnapshot,
   ResetPosition,
   SkipCount,
   ConsumerInfo,
@@ -30,12 +31,27 @@ import type {
   MqIssuedToken,
   BacklogStats,
   RocketMqConsumerGroupConfig,
-  PeekedMessage,
+  PeekMessagesResult,
   PeekMessagesOptions,
   MqRawRequest,
   MqRawResponse,
   SendMessageRequest,
   SendMessageResponse,
+  MqExchangeInfo,
+  MqExchangeCreateRequest,
+  MqBindingInfo,
+  MqBindingListFilter,
+  MqClientConnectionInfo,
+  MqChannelInfo,
+  MqUserInfo,
+  MqVhostPermission,
+  MqUserPermissionListFilter,
+  MqUserPermissionPatterns,
+  MqPolicyInfo,
+  MqPolicyListFilter,
+  MqPolicyUpsertRequest,
+  MqOverviewInfo,
+  MqNodeInfo,
 } from "@/types/mq";
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -53,6 +69,89 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 
 export async function mqTestConnection(connectionId: string): Promise<MqClusterInfo> {
   return post("/api/mq/test-connection", { connectionId });
+}
+
+export async function mqListExchanges(connectionId: string, ns: NamespaceRef): Promise<MqExchangeInfo[]> {
+  return post("/api/mq/exchanges/list", { connectionId, ns });
+}
+
+export async function mqCreateExchange(connectionId: string, ns: NamespaceRef, exchange: MqExchangeCreateRequest): Promise<void> {
+  return post("/api/mq/exchanges/create", { connectionId, ns, name: exchange.name, exchangeType: exchange.type, durable: exchange.durable, autoDelete: exchange.autoDelete });
+}
+
+export async function mqDeleteExchange(connectionId: string, ns: NamespaceRef, name: string): Promise<void> {
+  return post("/api/mq/exchanges/delete", { connectionId, ns, name });
+}
+
+export async function mqListBindings(connectionId: string, ns: NamespaceRef, filter?: MqBindingListFilter): Promise<MqBindingInfo[]> {
+  return post("/api/mq/bindings/list", { connectionId, ns, exchange: filter?.exchange, queue: filter?.queue });
+}
+
+export async function mqBind(connectionId: string, ns: NamespaceRef, binding: MqBindingInfo): Promise<void> {
+  return post("/api/mq/bindings/bind", { connectionId, ns, binding });
+}
+
+export async function mqUnbind(connectionId: string, ns: NamespaceRef, binding: MqBindingInfo): Promise<void> {
+  return post("/api/mq/bindings/unbind", { connectionId, ns, binding });
+}
+
+export async function mqListClientConnections(connectionId: string, ns: NamespaceRef): Promise<MqClientConnectionInfo[]> {
+  return post("/api/mq/client-connections/list", { connectionId, ns });
+}
+
+export async function mqListClientChannels(connectionId: string, ns: NamespaceRef, connection?: string): Promise<MqChannelInfo[]> {
+  return post("/api/mq/channels/list", { connectionId, ns, connection });
+}
+
+export async function mqCloseClientConnection(connectionId: string, ns: NamespaceRef, name: string): Promise<void> {
+  return post("/api/mq/client-connections/close", { connectionId, ns, name });
+}
+
+// Users & vhost permissions (RabbitMQ)
+export async function mqListUsers(connectionId: string): Promise<MqUserInfo[]> {
+  return post("/api/mq/users/list", { connectionId });
+}
+
+export async function mqCreateUser(connectionId: string, name: string, password: string, tags?: string[]): Promise<void> {
+  return post("/api/mq/users/create", { connectionId, name, password, tags });
+}
+
+export async function mqDeleteUser(connectionId: string, name: string): Promise<void> {
+  return post("/api/mq/users/delete", { connectionId, name });
+}
+
+export async function mqListUserPermissions(connectionId: string, filter?: MqUserPermissionListFilter): Promise<MqVhostPermission[]> {
+  return post("/api/mq/user-permissions/list", { connectionId, virtualHost: filter?.virtualHost, user: filter?.user, allVhosts: filter?.allVhosts });
+}
+
+export async function mqGrantUserPermission(connectionId: string, user: string, virtualHost: string, patterns?: MqUserPermissionPatterns): Promise<void> {
+  return post("/api/mq/user-permissions/grant", { connectionId, user, virtualHost, configure: patterns?.configure, write: patterns?.write, read: patterns?.read });
+}
+
+export async function mqRevokeUserPermission(connectionId: string, user: string, virtualHost: string): Promise<void> {
+  return post("/api/mq/user-permissions/revoke", { connectionId, user, virtualHost });
+}
+
+// Policies (RabbitMQ)
+export async function mqListPolicies(connectionId: string, filter?: MqPolicyListFilter): Promise<MqPolicyInfo[]> {
+  return post("/api/mq/policies/list", { connectionId, virtualHost: filter?.virtualHost, allVhosts: filter?.allVhosts });
+}
+
+export async function mqSetPolicy(connectionId: string, virtualHost: string, policy: MqPolicyUpsertRequest): Promise<void> {
+  return post("/api/mq/policies/set", { connectionId, virtualHost, name: policy.name, pattern: policy.pattern, applyTo: policy.applyTo, priority: policy.priority, definition: policy.definition });
+}
+
+export async function mqDeletePolicy(connectionId: string, virtualHost: string, name: string): Promise<void> {
+  return post("/api/mq/policies/delete", { connectionId, virtualHost, name });
+}
+
+// Cluster overview & nodes (RabbitMQ)
+export async function mqGetOverview(connectionId: string): Promise<MqOverviewInfo> {
+  return post("/api/mq/overview", { connectionId });
+}
+
+export async function mqListNodes(connectionId: string): Promise<MqNodeInfo[]> {
+  return post("/api/mq/nodes", { connectionId });
 }
 
 export async function mqListTenants(connectionId: string): Promise<TenantInfo[]> {
@@ -119,6 +218,14 @@ export async function mqListSubscriptions(connectionId: string, topic: TopicRef)
   return post("/api/mq/subscriptions/list", { connectionId, topic });
 }
 
+export async function mqEnrichSubscriptions(connectionId: string, topic: TopicRef): Promise<SubscriptionInfo[]> {
+  return post("/api/mq/subscriptions/enrich", { connectionId, topic });
+}
+
+export async function mqGetKafkaConsumerGroupSnapshot(connectionId: string): Promise<KafkaConsumerGroupSnapshot> {
+  return post("/api/mq/kafka/consumer-groups", { connectionId });
+}
+
 export async function mqCreateSubscription(connectionId: string, topic: TopicRef, sub: string, pos: ResetPosition): Promise<void> {
   return post("/api/mq/subscriptions/create", { connectionId, topic, sub, pos });
 }
@@ -139,7 +246,7 @@ export async function mqClearBacklog(connectionId: string, topic: TopicRef, sub:
   return post("/api/mq/subscriptions/clear-backlog", { connectionId, topic, sub });
 }
 
-export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number, options?: PeekMessagesOptions): Promise<PeekedMessage[]> {
+export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number, options?: PeekMessagesOptions): Promise<PeekMessagesResult> {
   return post("/api/mq/subscriptions/peek-messages", { connectionId, topic, sub, count, options });
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { appendVisibleDatabaseSelection, buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, visibleDatabaseSelectionIsStale, initialVisibleDatabaseSelection } from "../../apps/desktop/src/lib/connection/connectionVisibleDatabases.ts";
-import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterDatabaseNamesForVisiblePicker, filterSchemaNamesForConnection, normalizeVisibleSchemaSelection } from "../../apps/desktop/src/lib/database/visibleDatabases.ts";
+import { appendVisibleDatabaseSelection, buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, visibleDatabaseSelectionIsStale, visibleObjectFiltersNeedReset, initialVisibleDatabaseSelection } from "../../apps/desktop/src/lib/connection/connectionVisibleDatabases.ts";
+import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterDatabaseNamesForVisiblePicker, filterSchemaNamesForConnection, filterSchemaNamesForVisiblePicker, normalizeVisibleSchemaSelection } from "../../apps/desktop/src/lib/database/visibleDatabases.ts";
 import type { ConnectionConfig } from "../../apps/desktop/src/types/database.ts";
 
 function config(overrides: Partial<ConnectionConfig> = {}): ConnectionConfig {
@@ -90,9 +90,35 @@ test("Turso does not offer a visible database filter for its fixed main namespac
   assert.equal(connectionCanChooseVisibleDatabases(config({ db_type: "turso" })), false);
 });
 
+test("non-database connection types do not offer visible database selection", () => {
+  assert.equal(connectionCanChooseVisibleDatabases(config({ db_type: "mq" })), false);
+  assert.equal(connectionCanChooseVisibleDatabases(config({ db_type: "nacos" })), false);
+});
+
 test("OceanBase Oracle uses schema filtering for visible object selection", () => {
   assert.equal(connectionUsesVisibleSchemaFilter(config({ db_type: "oceanbase-oracle" })), true);
   assert.equal(connectionUsesVisibleSchemaFilter(config({ db_type: "mysql", driver_profile: "oceanbase" })), false);
+});
+
+test("OceanBase Oracle applies Oracle system schema visibility rules", () => {
+  const schemas = ["APP", "SYS", "SYSTEM", "APEX_240100", "FLOWS_240100", "APP$USER"];
+
+  assert.deepEqual(filterSchemaNamesForVisiblePicker(schemas, config({ db_type: "oceanbase-oracle", username: "APP" })), ["APP"]);
+  assert.deepEqual(filterSchemaNamesForVisiblePicker(schemas, config({ db_type: "oceanbase-oracle", username: "SYS" })), ["APP", "SYS"]);
+  assert.deepEqual(filterSchemaNamesForConnection(schemas, config({ db_type: "oceanbase-oracle", show_system_schemas: true }), ""), schemas);
+  assert.deepEqual(filterSchemaNamesForConnection(schemas, config({ db_type: "oceanbase-oracle", visible_schemas: { "": ["SYS", "APEX_240100", "FLOWS_240100", "APP$USER"] } }), ""), ["SYS", "APEX_240100", "FLOWS_240100", "APP$USER"]);
+});
+
+test("Oracle JDBC uses schema filtering for visible object selection", () => {
+  const connection = config({
+    db_type: "jdbc",
+    driver_profile: "jdbc",
+    connection_string: "jdbc:oracle:thin:@//127.0.0.1:1521/XE",
+    username: "DBX_TEST",
+  });
+
+  assert.equal(connectionUsesVisibleSchemaFilter(connection), true);
+  assert.deepEqual(filterSchemaNamesForConnection(["ANONYMOUS", "DBX_TEST", "SYS", "SYSTEM"], connection, ""), ["DBX_TEST"]);
 });
 
 test("Vastbase schema filters preserve ordinary schemas and explicit empty selections", () => {
@@ -103,8 +129,16 @@ test("Vastbase schema filters preserve ordinary schemas and explicit empty selec
   assert.deepEqual(normalizeVisibleSchemaSelection(["app", "missing", "app", "public"], schemas), ["app", "public"]);
 });
 
-test("Dameng default SYSDBA user remains selectable", () => {
-  assert.deepEqual(filterDatabaseNamesForConnection(["SYS", "SYSDBA", "SYSAUDITOR"], config({ db_type: "dameng" })), ["SYSDBA"]);
+test("Dameng hides system schemas by default but keeps the login schema visible", () => {
+  const schemas = ["APP", "SYS", "SYSDBA", "SYSDBO", "SYSAUDITOR"];
+  assert.deepEqual(filterSchemaNamesForVisiblePicker(schemas, config({ db_type: "dameng", username: "APP" })), ["APP"]);
+  assert.deepEqual(filterSchemaNamesForConnection(schemas, config({ db_type: "dameng", username: "SYSDBA" }), ""), ["APP", "SYSDBA"]);
+  assert.deepEqual(filterSchemaNamesForConnection(schemas, config({ db_type: "dameng", username: "SYSDBO" }), ""), ["APP", "SYSDBO"]);
+});
+
+test("Dameng explicit schema filters can keep SYSDBA visible", () => {
+  const connection = config({ db_type: "dameng", username: "APP", visible_schemas: { "": ["APP", "SYSDBA"] } });
+  assert.deepEqual(filterSchemaNamesForConnection(["APP", "SYS", "SYSDBA"], connection, ""), ["APP", "SYSDBA"]);
 });
 
 test("Oracle keeps an existing DIP user visible", () => {
@@ -117,4 +151,11 @@ test("visible database selection is stale when connection target changes", () =>
   assert.equal(visibleDatabaseSelectionIsStale(previous, config({ host: "db2.internal" })), true);
   assert.equal(visibleDatabaseSelectionIsStale(previous, config({ username: "readonly" })), true);
   assert.equal(visibleDatabaseSelectionIsStale(previous, config({ database: "admin" })), true);
+});
+
+test("visible schema filters reset when the connection target changes", () => {
+  const previous = config({ host: "db.internal", visible_schemas: { "": ["APP"] } });
+  assert.equal(visibleObjectFiltersNeedReset(previous, config({ host: "db.internal", visible_schemas: { "": ["APP"] } })), false);
+  assert.equal(visibleObjectFiltersNeedReset(previous, config({ host: "db2.internal", visible_schemas: { "": ["APP"] } })), true);
+  assert.equal(visibleObjectFiltersNeedReset(previous, config({ host: "db2.internal" })), false);
 });

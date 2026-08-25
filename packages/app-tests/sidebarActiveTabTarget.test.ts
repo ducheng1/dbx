@@ -1,12 +1,71 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { activeTabSidebarTarget, findNodePathForTarget, findSidebarNodeForActiveTab, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection } from "../../apps/desktop/src/lib/sidebar/sidebarActiveTabTarget.ts";
+import { activeTabSidebarTarget, findNodePathForTarget, findSidebarConnectionNode, findSidebarNodeForActiveTab, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection } from "../../apps/desktop/src/lib/sidebar/sidebarActiveTabTarget.ts";
 import type { FlatTreeNode } from "../../apps/desktop/src/composables/useFlatTree.ts";
 import type { QueryTab, TreeNode } from "../../apps/desktop/src/types/database.ts";
 
 function flat(node: TreeNode, depth = 0): FlatTreeNode {
   return { id: node.id, node, depth, type: node.type };
 }
+
+test("findSidebarConnectionNode resolves grouped roots without scanning descendants", () => {
+  const groupedConnection: TreeNode = {
+    id: "conn-grouped",
+    label: "Grouped",
+    type: "connection",
+    connectionId: "conn-grouped",
+    children: [
+      {
+        id: "conn-grouped:app",
+        label: "app",
+        type: "database",
+        connectionId: "conn-grouped",
+        database: "app",
+      },
+    ],
+  };
+  const nestedGroups: TreeNode[] = [
+    {
+      id: "group-outer",
+      label: "Outer",
+      type: "connection-group",
+      children: [
+        {
+          id: "group-inner",
+          label: "Inner",
+          type: "connection-group",
+          children: [groupedConnection],
+        },
+      ],
+    },
+  ];
+
+  assert.equal(findSidebarConnectionNode(nestedGroups, "conn-grouped"), groupedConnection);
+  assert.equal(findSidebarConnectionNode(nestedGroups, "missing"), null);
+  assert.equal(
+    findSidebarConnectionNode(
+      [
+        {
+          id: "conn-root",
+          label: "Root",
+          type: "connection",
+          connectionId: "conn-root",
+          children: [
+            {
+              id: "conn-nested-decoy",
+              label: "Decoy",
+              type: "connection",
+              connectionId: "conn-grouped",
+            },
+          ],
+        },
+        ...nestedGroups,
+      ],
+      "conn-grouped",
+    ),
+    groupedConnection,
+  );
+});
 
 test("findNodePathForTarget handles loaded, unloaded, and MySQL schema fallback trees", () => {
   const cases = [
@@ -154,12 +213,7 @@ test("findNodePathForTarget handles loaded, unloaded, and MySQL schema fallback 
         schema: "app_dev",
         tableName: "enum_info",
       },
-      expectedPath: [
-        "mysql-conn-1",
-        "mysql-conn-1:app_dev",
-        "mysql-conn-1:app_dev:__tables",
-        "mysql-conn-1:app_dev:__tables:enum_info",
-      ],
+      expectedPath: ["mysql-conn-1", "mysql-conn-1:app_dev", "mysql-conn-1:app_dev:__tables", "mysql-conn-1:app_dev:__tables:enum_info"],
     },
   ] satisfies Array<{
     name: string;
@@ -223,6 +277,33 @@ test("mongo tabs target the matching visible collection node", () => {
   };
 
   assert.equal(findSidebarNodeForActiveTab(tab, [flat(collection)])?.id, "events-node");
+});
+
+test("HBase tabs target the matching table in their namespace", () => {
+  const tab: QueryTab = {
+    id: "tab-hbase",
+    title: "events",
+    connectionId: "conn-hbase",
+    database: "analytics",
+    sql: "events",
+    isExecuting: false,
+    mode: "hbase",
+  };
+  const table: TreeNode = {
+    id: "hbase-events",
+    label: "events",
+    type: "table",
+    connectionId: "conn-hbase",
+    database: "analytics",
+  };
+
+  assert.deepEqual(activeTabSidebarTarget(tab), {
+    type: "hbase-table",
+    connectionId: "conn-hbase",
+    namespace: "analytics",
+    tableName: "events",
+  });
+  assert.equal(findSidebarNodeForActiveTab(tab, [flat(table)])?.id, "hbase-events");
 });
 
 test("GridFS tabs target the shared GridFS sidebar entry", () => {
@@ -359,10 +440,37 @@ test("saved SQL tabs target the matching visible saved SQL file node", () => {
     isExecuting: false,
     mode: "query",
   };
-  const file: TreeNode = { id: "file-node", label: "report.sql", type: "saved-sql-file", savedSqlId: "sql-1" };
+  const file: TreeNode = { id: "file-node", label: "report.sql", type: "saved-sql-file", connectionId: "conn-1", database: "app", savedSqlId: "sql-1" };
+  const queries: TreeNode = {
+    id: "queries-node",
+    label: "tree.queries",
+    type: "saved-sql-root",
+    connectionId: "conn-1",
+    database: "app",
+    children: [file],
+  };
+  const database: TreeNode = {
+    id: "database-node",
+    label: "app",
+    type: "database",
+    connectionId: "conn-1",
+    database: "app",
+    children: [queries],
+  };
+  const connection: TreeNode = {
+    id: "conn-1",
+    label: "Local",
+    type: "connection",
+    connectionId: "conn-1",
+    children: [database],
+  };
 
   assert.deepEqual(activeTabSidebarTarget(tab), { type: "saved-sql-file", savedSqlId: "sql-1" });
   assert.equal(findSidebarNodeForActiveTab(tab, [flat(file)])?.id, "file-node");
+  assert.deepEqual(
+    findNodePathForTarget(activeTabSidebarTarget(tab)!, [connection])?.map((node) => node.id),
+    ["conn-1", "database-node", "queries-node", "file-node"],
+  );
 });
 
 test("query tabs target their database node in the sidebar", () => {
@@ -379,6 +487,7 @@ test("query tabs target their database node in the sidebar", () => {
   assert.deepEqual(activeTabSidebarTarget(tab), {
     type: "query-context",
     connectionId: "conn-1",
+    catalog: undefined,
     database: "app",
     schema: undefined,
   });
@@ -431,6 +540,13 @@ test("sidebar node scrolling supports top and smart locate alignment", () => {
   assert.equal(scrollTopForSidebarNode({ index: 20, currentScrollTop: 0, viewportHeight: 140, align: "smart" }), 523);
   assert.equal(scrollTopForSidebarNode({ index: 11, currentScrollTop: 300, viewportHeight: 140, topOcclusionHeight: 28, align: "smart" }), 252);
   assert.equal(scrollTopForSidebarNode({ index: 0, currentScrollTop: 300, viewportHeight: 140, topOcclusionHeight: 28, align: "smart" }), 0);
+});
+
+test("sidebar node scrolling centers explicit tab locate with sticky and boundary clamping", () => {
+  assert.equal(scrollTopForSidebarNode({ index: 20, currentScrollTop: 0, viewportHeight: 140, align: "center" }), 504);
+  assert.equal(scrollTopForSidebarNode({ index: 11, currentScrollTop: 0, viewportHeight: 140, topOcclusionHeight: 28, align: "center" }), 238);
+  assert.equal(scrollTopForSidebarNode({ index: 0, currentScrollTop: 300, viewportHeight: 140, topOcclusionHeight: 28, align: "center" }), 0);
+  assert.equal(scrollTopForSidebarNode({ index: 20, currentScrollTop: 0, viewportHeight: 140, scrollHeight: 588, align: "center" }), 448);
 });
 
 test("active sidebar selection only scrolls on tab or setting changes", () => {

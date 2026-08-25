@@ -679,12 +679,16 @@ fn execute_change_transaction(
             columns: Vec::new(),
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: Vec::new(),
             affected_rows: 0,
             execution_time_ms: started_at.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
         }),
     }
 }
@@ -1512,6 +1516,8 @@ mod tests {
             triggers: Vec::new(),
             table_comment: None,
             original_table_comment: None,
+            partitioned: false,
+            is_gaussdb_m_mode: false,
         }
     }
 
@@ -1687,6 +1693,7 @@ mod tests {
             index_type: String::new(),
             included_columns: Vec::new(),
             comment: String::new(),
+            concurrently: false,
             original: None,
             marked_for_drop: false,
         });
@@ -2005,6 +2012,7 @@ mod tests {
             index_type: String::new(),
             included_columns: Vec::new(),
             comment: String::new(),
+            concurrently: false,
             original: Some(IndexInfo {
                 name: "uq_items_value".to_string(),
                 columns: vec!["value".to_string()],
@@ -2014,6 +2022,7 @@ mod tests {
                 index_type: None,
                 included_columns: None,
                 comment: None,
+                key_is_expression: Vec::new(),
             }),
             marked_for_drop: true,
         });

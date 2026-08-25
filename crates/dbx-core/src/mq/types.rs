@@ -14,6 +14,8 @@ pub enum MqSystemKind {
     Kafka,
     #[serde(rename = "rocketmq")]
     RocketMq,
+    #[serde(rename = "rabbitmq")]
+    RabbitMq,
 }
 
 impl MqSystemKind {
@@ -22,6 +24,7 @@ impl MqSystemKind {
             MqSystemKind::Pulsar => "pulsar",
             MqSystemKind::Kafka => "kafka",
             MqSystemKind::RocketMq => "rocketmq",
+            MqSystemKind::RabbitMq => "rabbitmq",
         }
     }
 }
@@ -61,6 +64,21 @@ pub struct MqCapabilities {
     /// RocketMQ: message trace lookup (requires broker trace topic).
     #[serde(default)]
     pub supports_message_trace: bool,
+    /// RabbitMQ: exchange & binding management.
+    #[serde(default)]
+    pub supports_exchanges: bool,
+    /// RabbitMQ: client connection & channel management (list/close).
+    #[serde(default)]
+    pub supports_client_connections: bool,
+    /// RabbitMQ: user & virtual-host permission management.
+    #[serde(default)]
+    pub supports_user_permissions: bool,
+    /// RabbitMQ: policy management (list/set/delete policies per vhost).
+    #[serde(default)]
+    pub supports_policies: bool,
+    /// RabbitMQ: cluster overview & node monitoring via the management API.
+    #[serde(default)]
+    pub supports_cluster_monitoring: bool,
 }
 
 /// Result of a connectivity test, including the detected server version and how
@@ -309,6 +327,49 @@ pub struct TopicInfo {
     /// RocketMQ message type from broker topic config (NORMAL, DELAY, FIFO, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_type: Option<String>,
+    /// Namespace (RabbitMQ: virtual host) this item belongs to; set on
+    /// cross-namespace listings such as the RabbitMQ "all vhosts" mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// RabbitMQ total queue messages, including ready and unacknowledged messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<i64>,
+    /// RabbitMQ messages ready for delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_ready: Option<i64>,
+    /// RabbitMQ messages delivered but not yet acknowledged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_unacked: Option<i64>,
+    /// RabbitMQ queue: auto-delete flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_delete: Option<bool>,
+    /// RabbitMQ queue: exclusive flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive: Option<bool>,
+    /// RabbitMQ queue: state (running / idle / flow / blocked ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// RabbitMQ queue: type (classic / quorum / stream), from the management
+    /// API `type` field or the x-queue-type argument on older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_type: Option<String>,
+    /// RabbitMQ queue: x-arguments, preserving the original JSON value types
+    /// (numbers, booleans, nested objects/arrays) returned by the management API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
+    /// RabbitMQ queue: consumer count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_count: Option<i64>,
+    /// RabbitMQ queue: publish rate (msg/s). Absent when the management API
+    /// sampled no message_stats data for this queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_rate: Option<f64>,
+    /// RabbitMQ queue: deliver/get rate (msg/s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_rate: Option<f64>,
+    /// RabbitMQ queue: ack rate (msg/s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -334,6 +395,12 @@ pub struct TopicStats {
     pub msg_out_counter: i64,
     pub subscription_count: u32,
     pub producer_count: u32,
+    /// RabbitMQ: true when the management API exposed no `message_stats`
+    /// sample for the queue, so the msg_rate_* / counter fields are NOT
+    /// meaningful — consumers must render them as "no data" instead of
+    /// presenting the zero placeholder as a real rate of 0.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rates_unavailable: bool,
     /// Original raw stats JSON, for the detail view / advanced inspection.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub raw: serde_json::Value,
@@ -393,6 +460,53 @@ pub struct SubscriptionInfo {
     /// RocketMQ: CLUSTERING / BROADCASTING.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_model: Option<String>,
+    /// When true, backlog probe failed — UI must not treat `msg_backlog` as healthy zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlog_unavailable: Option<bool>,
+}
+
+/// One Kafka topic-partition's committed and log-end offsets for a consumer group.
+/// Optional offsets distinguish unavailable data from a healthy zero lag.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaConsumerGroupPartitionLag {
+    pub topic: String,
+    pub partition: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_offset: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_offset: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<i64>,
+}
+
+/// Cluster-wide Kafka consumer group summary with its partition lag details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaConsumerGroupSummary {
+    pub group_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub simple_group: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u32>,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_lag: Option<i64>,
+    #[serde(default)]
+    pub lag_available: bool,
+    #[serde(default)]
+    pub partitions: Vec<KafkaConsumerGroupPartitionLag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaConsumerGroupSnapshot {
+    #[serde(default)]
+    pub groups: Vec<KafkaConsumerGroupSummary>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -431,8 +545,59 @@ pub enum ResetPosition {
     Latest,
     /// A specific point in time (milliseconds since epoch).
     Timestamp { timestamp_ms: i64 },
+    /// An absolute Kafka offset for one partition.
+    PartitionOffset { partition: i32, offset: i64 },
     /// A specific message id.
     MessageId { ledger_id: i64, entry_id: i64 },
+}
+
+#[cfg(test)]
+mod reset_position_tests {
+    use super::ResetPosition;
+
+    #[test]
+    fn partition_offset_uses_the_frontend_camel_case_wire_shape() {
+        let position = ResetPosition::PartitionOffset { partition: 3, offset: 27 };
+        let value = serde_json::to_value(&position).expect("serialize reset position");
+        assert_eq!(value, serde_json::json!({ "kind": "partitionOffset", "partition": 3, "offset": 27 }));
+        let decoded: ResetPosition = serde_json::from_value(value).expect("deserialize reset position");
+        assert!(matches!(decoded, ResetPosition::PartitionOffset { partition: 3, offset: 27 }));
+    }
+}
+
+#[cfg(test)]
+mod kafka_consumer_group_snapshot_tests {
+    use super::KafkaConsumerGroupSnapshot;
+
+    #[test]
+    fn preserves_unavailable_offsets_as_none() {
+        let snapshot: KafkaConsumerGroupSnapshot = serde_json::from_value(serde_json::json!({
+            "groups": [{
+                "groupId": "orders-service",
+                "state": "STABLE",
+                "simpleGroup": false,
+                "memberCount": 1,
+                "topics": ["orders"],
+                "totalLag": null,
+                "lagAvailable": false,
+                "partitions": [{
+                    "topic": "orders",
+                    "partition": 0,
+                    "currentOffset": 8,
+                    "endOffset": null,
+                    "lag": null
+                }],
+                "error": "End offsets unavailable for 1 partition(s)"
+            }]
+        }))
+        .expect("deserialize Kafka consumer group snapshot");
+
+        assert_eq!(snapshot.groups[0].total_lag, None);
+        assert!(!snapshot.groups[0].lag_available);
+        assert_eq!(snapshot.groups[0].partitions[0].current_offset, Some(8));
+        assert_eq!(snapshot.groups[0].partitions[0].end_offset, None);
+        assert_eq!(snapshot.groups[0].partitions[0].lag, None);
+    }
 }
 
 /// How many messages to skip on a subscription.
@@ -443,11 +608,76 @@ pub enum SkipCount {
     Count { count: u32 },
 }
 
+/// Per-queue/partition consume progress (RocketMQ Dashboard consume-detail / Kafka lag rows).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionBacklog {
+    pub partition: i32,
+    /// Consumer committed offset (`consumerOffset` / `currentOffset`).
+    pub current_offset: i64,
+    /// Broker max offset (`brokerOffset` / `endOffset`).
+    pub end_offset: i64,
+    pub lag: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_name: Option<String>,
+    /// Last consume message store timestamp (ms). `0` means unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_timestamp: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_client: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BacklogStats {
     pub msg_backlog: i64,
     pub backlog_size: i64,
+    /// Optional queue-level progress; empty for adapters that only expose totals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partitions: Vec<PartitionBacklog>,
+}
+
+/// Parse agent `mq_get_consumer_lag` JSON (`totalLag` + `partitions[]`) into [`BacklogStats`].
+pub fn backlog_stats_from_consumer_lag(value: &serde_json::Value) -> BacklogStats {
+    let msg_backlog = value.get("totalLag").and_then(|v| v.as_i64()).unwrap_or(0);
+    let partitions = value
+        .get("partitions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|row| {
+                    let partition = row.get("partition").and_then(|v| v.as_i64()).map(|v| v as i32)?;
+                    let current_offset = row.get("currentOffset").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let end_offset = row.get("endOffset").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let lag =
+                        row.get("lag").and_then(|v| v.as_i64()).unwrap_or_else(|| (end_offset - current_offset).max(0));
+                    let broker_name = row
+                        .get("brokerName")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let last_timestamp = row.get("lastTimestamp").and_then(|v| v.as_i64());
+                    let consumer_client = row
+                        .get("consumerClient")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    Some(PartitionBacklog {
+                        partition,
+                        current_offset,
+                        end_offset,
+                        lag,
+                        broker_name,
+                        last_timestamp,
+                        consumer_client,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    BacklogStats { msg_backlog, backlog_size: 0, partitions }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -474,13 +704,45 @@ pub struct PeekedMessage {
     pub payload_text: Option<String>,
 }
 
-/// Optional hints for reading messages. Pulsar ignores these today; Kafka uses
-/// them to optionally narrow a non-committing peek to one partition / offset.
-/// When omitted, Kafka peeks across all partitions from each partition's earliest
-/// readable offset (still capped by `count`).
+/// A message browse response. `incomplete` is set when the adapter could only
+/// return a partial snapshot before its configured deadline or scan limit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeekMessagesResult {
+    #[serde(default)]
+    pub messages: Vec<PeekedMessage>,
+    #[serde(default)]
+    pub incomplete: bool,
+}
+
+impl PeekMessagesResult {
+    pub fn complete(messages: Vec<PeekedMessage>) -> Self {
+        Self { messages, incomplete: false }
+    }
+}
+
+/// Kafka's explicit starting position for a non-committing message peek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeekStartPosition {
+    Latest,
+    Earliest,
+    Offset,
+}
+
+/// Optional hints for reading messages. Non-Kafka adapters ignore
+/// `start_position` and retain their existing partition/offset handling.
+/// For Kafka, an omitted position keeps legacy behavior: it starts at the
+/// earliest available message unless an older caller supplies `offset`.
+/// `start_position: Offset` requires a non-negative offset. When no partition
+/// is supplied, Kafka reads forward from that offset in every topic partition.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeekMessagesOptions {
+    /// Kafka's explicit read starting point. This remains optional so callers
+    /// that predate it retain their original earliest/offset behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_position: Option<PeekStartPosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -639,6 +901,218 @@ pub struct MqRawResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Exchange / Binding (RabbitMQ)
+// ---------------------------------------------------------------------------
+
+/// A RabbitMQ exchange. Namespaces map to virtual hosts, so the exchange's
+/// vhost is normally carried by the `NamespaceRef` passed alongside it; in
+/// "all vhosts" listings the per-item vhost is reported via `namespace`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqExchangeInfo {
+    pub name: String,
+    /// `direct` | `fanout` | `topic` | `headers`.
+    #[serde(rename = "type")]
+    pub exchange_type: String,
+    #[serde(default)]
+    pub durable: bool,
+    #[serde(default)]
+    pub auto_delete: bool,
+    /// Internal exchange (`amq.*`); cannot be deleted and is hidden by default in the UI.
+    #[serde(default)]
+    pub internal: bool,
+    /// Virtual host this exchange belongs to, set on all-vhosts listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+/// A RabbitMQ binding between an exchange (source) and a queue or another
+/// exchange (destination).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqBindingInfo {
+    /// Source exchange name.
+    pub source: String,
+    /// Destination queue or exchange name.
+    pub destination: String,
+    /// `queue` | `exchange`.
+    pub destination_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<HashMap<String, serde_json::Value>>,
+    /// Virtual host this binding belongs to, set on all-vhosts listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Client connections / channels (RabbitMQ)
+// ---------------------------------------------------------------------------
+
+/// A RabbitMQ client connection as reported by the management API. Virtual
+/// host scoping is normally carried by the `NamespaceRef` passed alongside
+/// it; in "all vhosts" listings the per-item vhost is reported via
+/// `namespace`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqClientConnectionInfo {
+    /// Server-side connection name (`host:port -> host:port`).
+    pub name: String,
+    /// Authenticated username.
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub peer_host: String,
+    #[serde(default)]
+    pub peer_port: i32,
+    /// `running` | `blocked` | `blocking` | ...
+    #[serde(default)]
+    pub state: String,
+    /// Number of channels open on this connection.
+    #[serde(default)]
+    pub channels: u32,
+    /// Receive rate (bytes/s), when the management API reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_rate: Option<f64>,
+    /// Send rate (bytes/s), when the management API reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_rate: Option<f64>,
+    /// Connection establishment time (epoch milliseconds), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_at: Option<i64>,
+    /// Virtual host this connection is attached to, set on all-vhosts listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+/// A RabbitMQ channel as reported by the management API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqChannelInfo {
+    /// Channel name (`<connection name> (<channel number>)`).
+    pub name: String,
+    /// Name of the connection this channel belongs to, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_name: Option<String>,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_unacked: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_count: Option<u32>,
+    /// Virtual host this channel belongs to, set on all-vhosts listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Users & virtual-host permissions (RabbitMQ)
+// ---------------------------------------------------------------------------
+
+/// A RabbitMQ user account as reported by the management API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqUserInfo {
+    pub name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// A RabbitMQ user × virtual host permission triple: the `configure` / `write`
+/// / `read` regexes scoped to one virtual host.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqVhostPermission {
+    pub user: String,
+    pub vhost: String,
+    pub configure: String,
+    pub write: String,
+    pub read: String,
+}
+
+// ---------------------------------------------------------------------------
+// Policies & cluster monitoring (RabbitMQ)
+// ---------------------------------------------------------------------------
+
+/// A RabbitMQ policy as reported by the management API. Unlike exchanges and
+/// bindings, policies always carry their virtual host explicitly (`vhost`),
+/// including on single-vhost listings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqPolicyInfo {
+    pub name: String,
+    #[serde(default)]
+    pub vhost: String,
+    /// Regex matching the queues/exchanges this policy applies to.
+    #[serde(default)]
+    pub pattern: String,
+    /// `queues` | `exchanges` | `all`.
+    #[serde(default, rename = "applyTo")]
+    pub apply_to: String,
+    #[serde(default)]
+    pub priority: i32,
+    /// Policy key/value pairs (`max-length`, `message-ttl`, ...).
+    #[serde(default)]
+    pub definition: HashMap<String, serde_json::Value>,
+}
+
+/// Broker-wide queue totals and message rates from the RabbitMQ management
+/// API `overview` endpoint. All fields are optional because the agent omits
+/// values the broker does not report.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqOverviewInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_ready: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_unacked: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_queues: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_exchanges: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_connections: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_channels: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_consumers: Option<i64>,
+}
+
+/// One RabbitMQ cluster node as reported by the management API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqNodeInfo {
+    pub name: String,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_used: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_used: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_total: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sockets_used: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sockets_total: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_ms: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // Send message (produce)
 // ---------------------------------------------------------------------------
 
@@ -666,6 +1140,16 @@ pub struct SendMessageRequest {
     /// is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<i32>,
+    /// RabbitMQ: target exchange. When omitted, the agent publishes to the
+    /// default exchange with the queue name as routing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange: Option<String>,
+    /// RabbitMQ: routing key used together with `exchange`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<String>,
+    /// RabbitMQ: namespace hint that maps to the target virtual host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// Result of a successful message production.
@@ -696,5 +1180,330 @@ mod tests {
         let pos: ResetPosition = serde_json::from_str(r#"{"kind":"messageId","ledgerId":5,"entryId":9}"#)
             .expect("message-id reset position");
         assert!(matches!(pos, ResetPosition::MessageId { ledger_id: 5, entry_id: 9 }));
+    }
+
+    #[test]
+    fn exchange_info_round_trips_agent_camel_case() {
+        let exchange: super::MqExchangeInfo = serde_json::from_str(
+            r#"{"name":"dbx-events","type":"topic","durable":true,"autoDelete":false,"internal":false}"#,
+        )
+        .expect("exchange info");
+        assert_eq!(exchange.name, "dbx-events");
+        assert_eq!(exchange.exchange_type, "topic");
+        assert!(exchange.durable);
+        assert!(!exchange.auto_delete);
+        assert!(!exchange.internal);
+
+        let json = serde_json::to_value(&exchange).expect("serialize exchange info");
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("topic"));
+        assert_eq!(json.get("autoDelete").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn binding_info_skips_absent_routing_key_and_arguments() {
+        let binding: super::MqBindingInfo = serde_json::from_str(
+            r#"{"source":"dbx-events","destination":"dbx-queue","destinationType":"queue","routingKey":"orders.*"}"#,
+        )
+        .expect("binding info");
+        assert_eq!(binding.source, "dbx-events");
+        assert_eq!(binding.destination_type, "queue");
+        assert_eq!(binding.routing_key.as_deref(), Some("orders.*"));
+        assert!(binding.arguments.is_none());
+
+        let json = serde_json::to_value(&binding).expect("serialize binding info");
+        assert!(json.get("arguments").is_none());
+
+        let bare: super::MqBindingInfo =
+            serde_json::from_str(r#"{"source":"dbx-a","destination":"dbx-b","destinationType":"exchange"}"#)
+                .expect("binding without routing key");
+        let json = serde_json::to_value(&bare).expect("serialize bare binding");
+        assert!(json.get("routingKey").is_none());
+        assert!(json.get("arguments").is_none());
+    }
+
+    #[test]
+    fn send_message_request_defaults_new_rabbitmq_fields() {
+        let req: super::SendMessageRequest =
+            serde_json::from_str(r#"{"topic":"dbx-queue","payloadBase64":"aGVsbG8="}"#).expect("send request");
+        assert!(req.exchange.is_none());
+        assert!(req.routing_key.is_none());
+        assert!(req.namespace.is_none());
+    }
+
+    #[test]
+    fn client_connection_info_round_trips_agent_camel_case() {
+        let conn: super::MqClientConnectionInfo = serde_json::from_str(
+            r#"{"name":"192.168.1.10:52344 -> 192.168.1.126:5672","user":"jjsd","peerHost":"192.168.1.10","peerPort":52344,"state":"running","channels":3,"recvRate":12.5,"sendRate":34.0,"connectedAt":1710000000000}"#,
+        )
+        .expect("client connection info");
+        assert_eq!(conn.name, "192.168.1.10:52344 -> 192.168.1.126:5672");
+        assert_eq!(conn.user, "jjsd");
+        assert_eq!(conn.peer_host, "192.168.1.10");
+        assert_eq!(conn.peer_port, 52344);
+        assert_eq!(conn.state, "running");
+        assert_eq!(conn.channels, 3);
+        assert_eq!(conn.recv_rate, Some(12.5));
+        assert_eq!(conn.send_rate, Some(34.0));
+        assert_eq!(conn.connected_at, Some(1710000000000));
+
+        let json = serde_json::to_value(&conn).expect("serialize client connection info");
+        assert_eq!(json.get("peerHost").and_then(|v| v.as_str()), Some("192.168.1.10"));
+        assert_eq!(json.get("peerPort").and_then(|v| v.as_i64()), Some(52344));
+        assert_eq!(json.get("connectedAt").and_then(|v| v.as_i64()), Some(1710000000000));
+    }
+
+    #[test]
+    fn client_connection_info_skips_absent_optional_fields() {
+        let conn: super::MqClientConnectionInfo = serde_json::from_str(
+            r#"{"name":"a:1 -> b:5672","user":"guest","peerHost":"a","peerPort":1,"state":"running","channels":0}"#,
+        )
+        .expect("client connection info without rates");
+        assert!(conn.recv_rate.is_none());
+        assert!(conn.send_rate.is_none());
+        assert!(conn.connected_at.is_none());
+
+        let json = serde_json::to_value(&conn).expect("serialize client connection info");
+        assert!(json.get("recvRate").is_none());
+        assert!(json.get("sendRate").is_none());
+        assert!(json.get("connectedAt").is_none());
+    }
+
+    #[test]
+    fn user_info_round_trips_agent_camel_case() {
+        let user: super::MqUserInfo =
+            serde_json::from_str(r#"{"name":"dbx-app","tags":["management","policymaker"]}"#).expect("user info");
+        assert_eq!(user.name, "dbx-app");
+        assert_eq!(user.tags, vec!["management".to_string(), "policymaker".to_string()]);
+
+        // Users without tags default to an empty list.
+        let bare: super::MqUserInfo = serde_json::from_str(r#"{"name":"dbx-svc"}"#).expect("user without tags");
+        assert!(bare.tags.is_empty());
+
+        let json = serde_json::to_value(&user).expect("serialize user info");
+        assert_eq!(json.get("name").and_then(|v| v.as_str()), Some("dbx-app"));
+        assert_eq!(json.get("tags").and_then(|v| v.as_array()).map(|a| a.len()), Some(2));
+    }
+
+    #[test]
+    fn vhost_permission_round_trips_agent_fields() {
+        let perm: super::MqVhostPermission = serde_json::from_str(
+            r#"{"user":"dbx-app","vhost":"orders","configure":".*","write":"dbx-.*","read":".*"}"#,
+        )
+        .expect("vhost permission");
+        assert_eq!(perm.user, "dbx-app");
+        assert_eq!(perm.vhost, "orders");
+        assert_eq!(perm.configure, ".*");
+        assert_eq!(perm.write, "dbx-.*");
+        assert_eq!(perm.read, ".*");
+
+        let json = serde_json::to_value(&perm).expect("serialize vhost permission");
+        assert_eq!(json.get("vhost").and_then(|v| v.as_str()), Some("orders"));
+        assert_eq!(json.get("write").and_then(|v| v.as_str()), Some("dbx-.*"));
+    }
+
+    #[test]
+    fn capabilities_default_user_permissions_off() {
+        // The older capability fields are not `serde(default)`, so a payload
+        // from an adapter predating the new flag is simulated by serializing a
+        // full struct and stripping the new key: it must deserialize with the
+        // flag off.
+        let caps = super::MqCapabilities { supports_tenants: true, ..Default::default() };
+        let mut json = serde_json::to_value(caps).expect("serialize capabilities");
+        assert_eq!(json.get("supportsUserPermissions").and_then(|v| v.as_bool()), Some(false));
+        json.as_object_mut().expect("capabilities object").remove("supportsUserPermissions");
+
+        let caps: super::MqCapabilities = serde_json::from_value(json).expect("deserialize without the new field");
+        assert!(!caps.supports_user_permissions);
+        assert!(caps.supports_tenants);
+    }
+
+    #[test]
+    fn channel_info_round_trips_agent_camel_case() {
+        let channel: super::MqChannelInfo = serde_json::from_str(
+            r#"{"name":"a:1 -> b:5672 (1)","connectionName":"a:1 -> b:5672","state":"running","prefetch":20,"messagesUnacked":7,"consumerCount":2}"#,
+        )
+        .expect("channel info");
+        assert_eq!(channel.name, "a:1 -> b:5672 (1)");
+        assert_eq!(channel.connection_name.as_deref(), Some("a:1 -> b:5672"));
+        assert_eq!(channel.state, "running");
+        assert_eq!(channel.prefetch, Some(20));
+        assert_eq!(channel.messages_unacked, Some(7));
+        assert_eq!(channel.consumer_count, Some(2));
+
+        let json = serde_json::to_value(&channel).expect("serialize channel info");
+        assert_eq!(json.get("connectionName").and_then(|v| v.as_str()), Some("a:1 -> b:5672"));
+        assert_eq!(json.get("messagesUnacked").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(json.get("consumerCount").and_then(|v| v.as_u64()), Some(2));
+
+        let bare: super::MqChannelInfo =
+            serde_json::from_str(r#"{"name":"a:1 -> b:5672 (2)","state":"running"}"#).expect("bare channel info");
+        let json = serde_json::to_value(&bare).expect("serialize bare channel info");
+        assert!(json.get("connectionName").is_none());
+        assert!(json.get("prefetch").is_none());
+        assert!(json.get("messagesUnacked").is_none());
+        assert!(json.get("consumerCount").is_none());
+    }
+
+    #[test]
+    fn policy_info_round_trips_agent_fields() {
+        let policy: super::MqPolicyInfo = serde_json::from_str(
+            r#"{"name":"dbx-ttl","vhost":"orders","pattern":"^dbx-","applyTo":"queues","priority":5,"definition":{"message-ttl":60000,"max-length":1000}}"#,
+        )
+        .expect("policy info");
+        assert_eq!(policy.name, "dbx-ttl");
+        assert_eq!(policy.vhost, "orders");
+        assert_eq!(policy.pattern, "^dbx-");
+        assert_eq!(policy.apply_to, "queues");
+        assert_eq!(policy.priority, 5);
+        assert_eq!(policy.definition.get("message-ttl").and_then(|v| v.as_i64()), Some(60000));
+
+        let json = serde_json::to_value(&policy).expect("serialize policy info");
+        assert_eq!(json.get("applyTo").and_then(|v| v.as_str()), Some("queues"));
+        assert_eq!(json.get("vhost").and_then(|v| v.as_str()), Some("orders"));
+    }
+
+    #[test]
+    fn policy_info_defaults_absent_apply_to_and_priority() {
+        let policy: super::MqPolicyInfo =
+            serde_json::from_str(r#"{"name":"dbx-ha","vhost":"/","pattern":".*","definition":{"ha-mode":"all"}}"#)
+                .expect("policy without applyTo/priority");
+        assert!(policy.apply_to.is_empty());
+        assert_eq!(policy.priority, 0);
+        assert_eq!(policy.definition.get("ha-mode").and_then(|v| v.as_str()), Some("all"));
+    }
+
+    #[test]
+    fn overview_info_skips_absent_optional_fields() {
+        let overview: super::MqOverviewInfo = serde_json::from_str(
+            r#"{"messagesReady":12,"messagesUnacked":3,"publishRate":1.5,"deliverRate":2.0,"ackRate":2.0,"totalQueues":4,"totalExchanges":7,"totalConnections":2,"totalChannels":5,"totalConsumers":6}"#,
+        )
+        .expect("overview info");
+        assert_eq!(overview.messages_ready, Some(12));
+        assert_eq!(overview.publish_rate, Some(1.5));
+        assert_eq!(overview.total_consumers, Some(6));
+
+        let json = serde_json::to_value(&overview).expect("serialize overview info");
+        assert_eq!(json.get("messagesReady").and_then(|v| v.as_i64()), Some(12));
+        assert_eq!(json.get("ackRate").and_then(|v| v.as_f64()), Some(2.0));
+
+        let bare: super::MqOverviewInfo = serde_json::from_str(r#"{}"#).expect("empty overview");
+        assert!(bare.messages_ready.is_none());
+        let json = serde_json::to_value(&bare).expect("serialize empty overview");
+        assert!(json.get("messagesReady").is_none());
+        assert!(json.get("totalQueues").is_none());
+    }
+
+    #[test]
+    fn node_info_round_trips_agent_camel_case() {
+        let node: super::MqNodeInfo = serde_json::from_str(
+            r#"{"name":"rabbit@node1","running":true,"memUsed":1024,"memLimit":2048,"diskFree":4096,"fdUsed":10,"fdTotal":100,"socketsUsed":3,"socketsTotal":50,"uptimeMs":1710000000000}"#,
+        )
+        .expect("node info");
+        assert_eq!(node.name, "rabbit@node1");
+        assert!(node.running);
+        assert_eq!(node.mem_used, Some(1024));
+        assert_eq!(node.fd_total, Some(100));
+        assert_eq!(node.uptime_ms, Some(1710000000000));
+
+        let json = serde_json::to_value(&node).expect("serialize node info");
+        assert_eq!(json.get("memUsed").and_then(|v| v.as_i64()), Some(1024));
+        assert_eq!(json.get("socketsTotal").and_then(|v| v.as_i64()), Some(50));
+
+        let bare: super::MqNodeInfo =
+            serde_json::from_str(r#"{"name":"rabbit@node2","running":false}"#).expect("bare node info");
+        assert!(!bare.running);
+        let json = serde_json::to_value(&bare).expect("serialize bare node info");
+        assert!(json.get("memUsed").is_none());
+        assert!(json.get("uptimeMs").is_none());
+    }
+
+    #[test]
+    fn capabilities_default_policies_and_cluster_monitoring_off() {
+        // Adapters predating the new flags omit them; deserialization must
+        // default both to off.
+        let caps = super::MqCapabilities { supports_tenants: true, ..Default::default() };
+        let mut json = serde_json::to_value(caps).expect("serialize capabilities");
+        json.as_object_mut().expect("capabilities object").remove("supportsPolicies");
+        json.as_object_mut().expect("capabilities object").remove("supportsClusterMonitoring");
+
+        let caps: super::MqCapabilities = serde_json::from_value(json).expect("deserialize without the new fields");
+        assert!(!caps.supports_policies);
+        assert!(!caps.supports_cluster_monitoring);
+        assert!(caps.supports_tenants);
+    }
+
+    #[test]
+    fn peek_options_omit_optional_fields_and_serialize_start_position() {
+        let legacy: super::PeekMessagesOptions =
+            serde_json::from_str(r#"{"partition":2}"#).expect("legacy peek options");
+        assert_eq!(legacy.start_position, None);
+        assert_eq!(legacy.partition, Some(2));
+        assert_eq!(legacy.offset, None);
+
+        let latest: super::PeekMessagesOptions =
+            serde_json::from_str(r#"{"startPosition":"latest"}"#).expect("latest peek options");
+        assert_eq!(latest.start_position, Some(super::PeekStartPosition::Latest));
+        let json = serde_json::to_value(latest).expect("serialize latest peek options");
+        assert_eq!(json.get("startPosition").and_then(|value| value.as_str()), Some("latest"));
+    }
+
+    #[test]
+    fn peek_result_serializes_completion_status_and_accepts_legacy_responses() {
+        let complete = super::PeekMessagesResult::complete(Vec::new());
+        let json = serde_json::to_value(&complete).expect("serialize complete peek result");
+        assert_eq!(json, serde_json::json!({ "messages": [], "incomplete": false }));
+
+        let legacy: super::PeekMessagesResult =
+            serde_json::from_value(serde_json::json!({ "messages": [] })).expect("deserialize legacy peek result");
+        assert!(!legacy.incomplete);
+        assert!(legacy.messages.is_empty());
+    }
+
+    #[test]
+    fn backlog_stats_from_consumer_lag_maps_dashboard_fields() {
+        let lag = serde_json::json!({
+            "totalLag": 10,
+            "partitions": [
+                {
+                    "partition": 0,
+                    "currentOffset": 90,
+                    "endOffset": 100,
+                    "lag": 10,
+                    "brokerName": "broker-a",
+                    "lastTimestamp": 1725000000000_i64,
+                    "consumerClient": "172.18.2.212@7#1"
+                },
+                {
+                    "partition": 1,
+                    "currentOffset": 50,
+                    "endOffset": 50,
+                    "lag": 0,
+                    "brokerName": "",
+                    "lastTimestamp": 0,
+                    "consumerClient": ""
+                }
+            ]
+        });
+        let stats = super::backlog_stats_from_consumer_lag(&lag);
+        assert_eq!(stats.msg_backlog, 10);
+        assert_eq!(stats.partitions.len(), 2);
+        assert_eq!(stats.partitions[0].broker_name.as_deref(), Some("broker-a"));
+        assert_eq!(stats.partitions[0].consumer_client.as_deref(), Some("172.18.2.212@7#1"));
+        assert_eq!(stats.partitions[0].last_timestamp, Some(1725000000000));
+        // Empty strings are normalized to None so UI can show "-".
+        assert!(stats.partitions[1].broker_name.is_none());
+        assert!(stats.partitions[1].consumer_client.is_none());
+        assert_eq!(stats.partitions[1].last_timestamp, Some(0));
+
+        let json = serde_json::to_value(&stats).expect("serialize backlog stats");
+        assert_eq!(json.get("msgBacklog").and_then(|v| v.as_i64()), Some(10));
+        assert!(json.get("partitions").and_then(|v| v.as_array()).is_some());
+
+        // Legacy callers that only had totals still deserialize with empty partitions.
+        let legacy: super::BacklogStats =
+            serde_json::from_value(serde_json::json!({ "msgBacklog": 3, "backlogSize": 0 }))
+                .expect("legacy backlog stats");
+        assert_eq!(legacy.msg_backlog, 3);
+        assert!(legacy.partitions.is_empty());
     }
 }

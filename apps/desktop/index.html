@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="stylesheet" href="/connection-dialog-legacy.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DBX</title>
     <style>
@@ -22,10 +23,12 @@
       (() => {
         const root = document.documentElement;
         let mode = null;
+        let cornerStyle = null;
 
         // localStorage can throw when WebView storage is unavailable; keep the existing light fallback.
         try {
           mode = localStorage.getItem("dbx-theme");
+          cornerStyle = localStorage.getItem("dbx-corner-style");
         } catch {}
 
         const followsSystem = mode === "system" || mode === "soft-system";
@@ -40,7 +43,27 @@
         }
 
         root.classList.toggle("dark", dark);
+        root.dataset.cornerStyle = cornerStyle === "none" || cornerStyle === "small" ? cornerStyle : "large";
         root.style.colorScheme = dark ? "dark" : "light";
+      })();
+    </script>
+    <script data-dbx-startup-input-guard>
+      (() => {
+        const readyEvent = "dbx:startup-ready";
+        const preventStartupEscape = (event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        };
+
+        window.addEventListener("keydown", preventStartupEscape, true);
+        window.addEventListener(
+          readyEvent,
+          () => {
+            window.removeEventListener("keydown", preventStartupEscape, true);
+          },
+          { once: true },
+        );
       })();
     </script>
   </head>

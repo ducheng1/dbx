@@ -34,6 +34,7 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Kwdb
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
+            | DatabaseType::Uxdb
             | DatabaseType::Vastbase
             | DatabaseType::Yashandb
             | DatabaseType::Oscar
@@ -52,13 +53,21 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Trino
             | DatabaseType::PrestoSql
             | DatabaseType::Hive
+            | DatabaseType::Kyuubi
+            | DatabaseType::Impala
             | DatabaseType::Spark
             | DatabaseType::Db2
+            | DatabaseType::Informix
             | DatabaseType::Tdengine
             | DatabaseType::Xugu
             | DatabaseType::Sqlite
             | DatabaseType::DuckDb
             | DatabaseType::Iris
+            // Spanner supports named schemas; the PostgreSQL dialect defaults to `public`.
+            // GoogleSQL's default schema is the empty string, which the blank-schema filters
+            // in `qualified_table_name` / `table_data_qualified_table_name` drop along with
+            // the dot separator (`` `s`.`t` `` with an empty `s` is a Spanner syntax error).
+            | DatabaseType::Spanner
     )
 }
 

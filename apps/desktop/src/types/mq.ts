@@ -1,6 +1,6 @@
 // Message queue admin types, matching dbx-core/src/mq/types.rs
 
-export type MqSystemKind = "pulsar" | "kafka" | "rocketmq";
+export type MqSystemKind = "pulsar" | "kafka" | "rocketmq" | "rabbitmq";
 
 export interface MqCapabilities {
   supportsTenants: boolean;
@@ -24,6 +24,14 @@ export interface MqCapabilities {
   supportsMessageQuery?: boolean;
   supportsDlq?: boolean;
   supportsMessageTrace?: boolean;
+  supportsExchanges?: boolean;
+  supportsClientConnections?: boolean;
+  /** RabbitMQ: user & virtual-host permission management. */
+  supportsUserPermissions?: boolean;
+  /** RabbitMQ: virtual-host policy management. */
+  supportsPolicies?: boolean;
+  /** RabbitMQ: cluster overview & node monitoring via the management API. */
+  supportsClusterMonitoring?: boolean;
 }
 
 export interface MqClusterInfo {
@@ -146,6 +154,32 @@ export interface TopicInfo {
   persistent: boolean;
   internal?: boolean;
   messageType?: RocketMqTopicMessageType | string;
+  /** RabbitMQ: owning virtual host, present when listing across all vhosts. */
+  namespace?: string;
+  /** RabbitMQ total queue messages, including ready and unacknowledged messages. */
+  messageCount?: number;
+  /** RabbitMQ messages ready for delivery. */
+  messagesReady?: number;
+  /** RabbitMQ messages delivered but not yet acknowledged. */
+  messagesUnacked?: number;
+  /** RabbitMQ queue: auto-delete flag. */
+  autoDelete?: boolean;
+  /** RabbitMQ queue: exclusive flag. */
+  exclusive?: boolean;
+  /** RabbitMQ queue: state (running / idle / flow / blocked ...). */
+  state?: string;
+  /** RabbitMQ queue: type (classic / quorum / stream), from the management API `type` field or x-queue-type. */
+  queueType?: string;
+  /** RabbitMQ queue: x-arguments preserving the original JSON value types. */
+  arguments?: Record<string, unknown>;
+  /** RabbitMQ queue: consumer count. */
+  consumerCount?: number;
+  /** RabbitMQ queue: publish rate (msg/s) when the management API sampled message_stats. */
+  publishRate?: number;
+  /** RabbitMQ queue: deliver/get rate (msg/s). */
+  deliverRate?: number;
+  /** RabbitMQ queue: ack rate (msg/s). */
+  ackRate?: number;
 }
 
 export interface ListTopicsOpts {
@@ -163,6 +197,8 @@ export interface TopicStats {
   msgOutCounter: number;
   subscriptionCount: number;
   producerCount: number;
+  /** RabbitMQ: true when the management API exposed no message_stats sample, so msgRateIn/Out must be rendered as "no data" rather than a real rate of 0. */
+  ratesUnavailable?: boolean;
   raw?: unknown;
 }
 
@@ -182,6 +218,32 @@ export interface SubscriptionInfo {
   consumerGroupType?: string;
   /** RocketMQ consumer group message model: CLUSTERING / BROADCASTING. */
   messageModel?: string;
+  /** When true, backlog probe failed — do not render msgBacklog as healthy zero. */
+  backlogUnavailable?: boolean;
+}
+
+export interface KafkaConsumerGroupPartitionLag {
+  topic: string;
+  partition: number;
+  currentOffset?: number;
+  endOffset?: number;
+  lag?: number;
+}
+
+export interface KafkaConsumerGroupSummary {
+  groupId: string;
+  state: string;
+  simpleGroup: boolean;
+  memberCount?: number;
+  topics: string[];
+  totalLag?: number;
+  lagAvailable: boolean;
+  partitions: KafkaConsumerGroupPartitionLag[];
+  error?: string;
+}
+
+export interface KafkaConsumerGroupSnapshot {
+  groups: KafkaConsumerGroupSummary[];
 }
 
 export interface RocketMqConsumerGroupConfig {
@@ -214,13 +276,29 @@ export interface ProducerInfo {
   clientVersion: string;
 }
 
-export type ResetPosition = { kind: "earliest" } | { kind: "latest" } | { kind: "timestamp"; timestampMs: number } | { kind: "messageId"; ledgerId: number; entryId: number };
+export type ResetPosition = { kind: "earliest" } | { kind: "latest" } | { kind: "timestamp"; timestampMs: number } | { kind: "partitionOffset"; partition: number; offset: number } | { kind: "messageId"; ledgerId: number; entryId: number };
 
 export type SkipCount = { kind: "all" } | { kind: "count"; count: number };
+
+/** Per-queue consume progress (RocketMQ Dashboard consume-detail / Kafka lag rows). */
+export interface PartitionBacklog {
+  partition: number;
+  /** Consumer committed offset (`consumerOffset`). */
+  currentOffset: number;
+  /** Broker max offset (`brokerOffset`). */
+  endOffset: number;
+  lag: number;
+  brokerName?: string;
+  /** Last consume message store timestamp (ms). `0` means unavailable. */
+  lastTimestamp?: number;
+  consumerClient?: string;
+}
 
 export interface BacklogStats {
   msgBacklog: number;
   backlogSize: number;
+  /** Optional queue-level progress; omitted or empty when adapter only exposes totals. */
+  partitions?: PartitionBacklog[];
 }
 
 export interface ClusterInfo {
@@ -253,7 +331,15 @@ export interface PeekedMessage {
   payloadText?: string;
 }
 
+export interface PeekMessagesResult {
+  messages: PeekedMessage[];
+  /** True when the broker could not finish the requested snapshot before its limit. */
+  incomplete: boolean;
+}
+
 export interface PeekMessagesOptions {
+  /** Kafka only. Omitted starts at earliest unless a legacy caller supplies offset. */
+  startPosition?: "latest" | "earliest" | "offset";
   partition?: number;
   offset?: number;
 }
@@ -293,6 +379,158 @@ export type AuthAction = "produce" | "consume" | "functions" | "sources" | "sink
 
 export type PermissionMap = Record<string, AuthAction[]>;
 
+// Exchange / Binding (RabbitMQ)
+export type MqExchangeType = "direct" | "fanout" | "topic" | "headers";
+
+export interface MqExchangeInfo {
+  name: string;
+  type: MqExchangeType | string;
+  durable: boolean;
+  autoDelete: boolean;
+  internal: boolean;
+  /** RabbitMQ: owning virtual host, present when listing across all vhosts. */
+  namespace?: string;
+}
+
+export interface MqExchangeCreateRequest {
+  name: string;
+  type: MqExchangeType | string;
+  durable?: boolean;
+  autoDelete?: boolean;
+}
+
+export type MqBindingDestinationType = "queue" | "exchange";
+
+export interface MqBindingInfo {
+  source: string;
+  destination: string;
+  destinationType: MqBindingDestinationType | string;
+  routingKey?: string;
+  arguments?: Record<string, unknown>;
+  /** RabbitMQ: owning virtual host, present when listing across all vhosts. */
+  namespace?: string;
+}
+
+export interface MqBindingListFilter {
+  exchange?: string;
+  queue?: string;
+}
+
+// Client connections / channels (RabbitMQ)
+export interface MqClientConnectionInfo {
+  /** Server-side connection name (`host:port -> host:port`). */
+  name: string;
+  user: string;
+  peerHost: string;
+  peerPort: number;
+  state: string;
+  /** Number of channels open on this connection. */
+  channels: number;
+  /** Receive rate (bytes/s), when the management API reports it. */
+  recvRate?: number;
+  /** Send rate (bytes/s), when the management API reports it. */
+  sendRate?: number;
+  /** Connection establishment time (epoch milliseconds), when reported. */
+  connectedAt?: number;
+  /** RabbitMQ: virtual host the connection is bound to, present when listing across all vhosts. */
+  namespace?: string;
+}
+
+export interface MqChannelInfo {
+  /** Channel name (`<connection name> (<channel number>)`). */
+  name: string;
+  /** Name of the connection this channel belongs to, when reported. */
+  connectionName?: string;
+  state: string;
+  prefetch?: number;
+  messagesUnacked?: number;
+  consumerCount?: number;
+  /** RabbitMQ: virtual host the channel belongs to, present when listing across all vhosts. */
+  namespace?: string;
+}
+
+// Users & vhost permissions (RabbitMQ)
+export interface MqUserInfo {
+  name: string;
+  tags: string[];
+}
+
+export interface MqVhostPermission {
+  user: string;
+  /** RabbitMQ virtual host the permission applies to. */
+  vhost: string;
+  configure: string;
+  write: string;
+  read: string;
+}
+
+export interface MqUserPermissionListFilter {
+  virtualHost?: string;
+  user?: string;
+  /** List across all virtual hosts (every row carries its own vhost). */
+  allVhosts?: boolean;
+}
+
+export interface MqUserPermissionPatterns {
+  configure?: string;
+  write?: string;
+  read?: string;
+}
+
+// Policies (RabbitMQ)
+export interface MqPolicyInfo {
+  name: string;
+  /** RabbitMQ virtual host the policy lives in. */
+  vhost: string;
+  pattern: string;
+  applyTo: string;
+  priority: number;
+  definition: Record<string, unknown>;
+}
+
+export interface MqPolicyListFilter {
+  virtualHost?: string;
+  /** List across all virtual hosts (every policy carries its own vhost). */
+  allVhosts?: boolean;
+}
+
+export interface MqPolicyUpsertRequest {
+  name: string;
+  pattern: string;
+  /** Defaults to "queues" on the server. */
+  applyTo?: string;
+  /** Defaults to 0 on the server. */
+  priority?: number;
+  definition: Record<string, unknown>;
+}
+
+// Cluster overview & nodes (RabbitMQ)
+export interface MqOverviewInfo {
+  messagesReady?: number;
+  messagesUnacked?: number;
+  publishRate?: number;
+  deliverRate?: number;
+  ackRate?: number;
+  totalQueues?: number;
+  totalExchanges?: number;
+  totalConnections?: number;
+  totalChannels?: number;
+  totalConsumers?: number;
+}
+
+export interface MqNodeInfo {
+  name: string;
+  running: boolean;
+  memUsed?: number;
+  memLimit?: number;
+  diskFree?: number;
+  fdUsed?: number;
+  fdTotal?: number;
+  socketsUsed?: number;
+  socketsTotal?: number;
+  uptimeMs?: number;
+}
+
 // Raw request
 export interface MqRawRequest {
   method: string;
@@ -315,6 +553,12 @@ export interface SendMessageRequest {
   payloadText?: string;
   headers: Record<string, string>;
   partition?: number;
+  /** RabbitMQ: target exchange; empty means the default exchange. */
+  exchange?: string;
+  /** RabbitMQ: routing key used when publishing to an exchange. */
+  routingKey?: string;
+  /** RabbitMQ: virtual host the exchange/queue lives in. */
+  namespace?: string;
 }
 
 export interface SendMessageResponse {

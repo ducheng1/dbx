@@ -7,10 +7,13 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatSqlForDisplay, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
-import { buildEditableObjectSource, buildExecutableObjectSourceStatements, executeObjectSourceSave } from "@/lib/table/objectSourceEditor";
+import { buildEditableObjectSource, buildExecutableObjectSourceStatements, executeObjectSourceSave, formatObjectSourceSaveError, resolveObjectSourceEditDraft } from "@/lib/table/objectSourceEditor";
+import { loadObjectSourceWithRoutineFallback } from "@/lib/table/objectSourceLoad";
+import { xuguRoutineMetadataFromDefinition, type XuguRoutineMetadata } from "@/lib/table/routineParameters";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import * as api from "@/lib/backend/api";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
+import RoutineMetadataPanel from "@/components/objects/RoutineMetadataPanel.vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { DatabaseType, ObjectSourceKind } from "@/types/database";
@@ -22,6 +25,7 @@ const props = withDefaults(
     database: string;
     schema?: string;
     name: string;
+    relationName?: string;
     signature?: string;
     objectType: ObjectSourceKind;
     databaseType?: DatabaseType;
@@ -53,13 +57,17 @@ const editing = ref(false);
 const sourceEditable = ref(true);
 const error = ref("");
 const saveError = ref("");
+const routineMetadata = ref<XuguRoutineMetadata | null>(null);
+/** May differ from props.objectType after PROCEDURE/FUNCTION/PACKAGE fallback resolution. */
+const resolvedObjectType = ref<ObjectSourceKind>(props.objectType);
 let loadSerial = 0;
 
 const canEdit = computed(() => sourceEditable.value && props.objectType !== "SEQUENCE");
 const title = computed(() => `${editing.value ? t("contextMenu.editView") : t("contextMenu.viewSource")} - ${props.name}`);
+const hasRoutineMetadata = computed(() => !!routineMetadata.value && (routineMetadata.value.parameters.length > 0 || !!routineMetadata.value.returnType));
 
 watch(
-  () => [props.open, props.connectionId, props.database, props.schema, props.name, props.signature, props.objectType, props.initialEditing] as const,
+  () => [props.open, props.connectionId, props.database, props.schema, props.name, props.relationName, props.signature, props.objectType, props.initialEditing] as const,
   () => {
     if (props.open) void loadSource();
   },
@@ -73,27 +81,30 @@ async function loadSource(nextEditing = props.initialEditing && canEdit.value) {
   draft.value = "";
   error.value = "";
   saveError.value = "";
+  routineMetadata.value = null;
   sourceEditable.value = true;
   editing.value = false;
   loading.value = true;
   try {
     if (!props.databaseType) throw new Error("Connection type is unavailable.");
     const schema = props.schema || props.database;
-    const result = await api.getObjectSource(props.connectionId, props.database, schema, props.name, props.objectType, props.signature);
+    const { source: result, objectType: resolvedType } = await loadObjectSourceWithRoutineFallback(api.getObjectSource, props.connectionId, props.database, schema, props.name, props.objectType, props.signature, props.relationName);
     const editableAllowed = result.editable !== false;
     const editable = await buildEditableObjectSource({
       databaseType: props.databaseType,
-      objectType: props.objectType,
+      objectType: resolvedType,
       schema,
       name: props.name,
       source: result.source,
     });
     if (serial !== loadSerial) return;
+    resolvedObjectType.value = resolvedType;
+    routineMetadata.value = props.databaseType === "xugu" && (resolvedType === "PROCEDURE" || resolvedType === "FUNCTION") ? xuguRoutineMetadataFromDefinition(result.source) : null;
     sourceEditable.value = editableAllowed;
     const formatted = await formatSqlForDisplay(editable, props.formatDialect ?? props.dialect, settingsStore.editorSettings.sqlFormatter);
     editableText.value = editable;
     content.value = formatted;
-    draft.value = nextEditing && canEdit.value ? editable : "";
+    draft.value = nextEditing && canEdit.value ? resolveObjectSourceEditDraft(props.databaseType, resolvedType, formatted, editable) : "";
     editing.value = nextEditing && canEdit.value;
     if (nextEditing && !canEdit.value) {
       toast(t("objects.sourceReadOnly"), 3000);
@@ -120,7 +131,7 @@ function editSource() {
     if (!canEdit.value) toast(t("objects.sourceReadOnly"), 3000);
     return;
   }
-  draft.value = editableText.value;
+  draft.value = resolveObjectSourceEditDraft(props.databaseType, resolvedObjectType.value, content.value, editableText.value);
   saveError.value = "";
   editing.value = true;
 }
@@ -144,7 +155,7 @@ async function saveSource() {
   try {
     const statements = await buildExecutableObjectSourceStatements({
       databaseType,
-      objectType: props.objectType,
+      objectType: resolvedObjectType.value,
       schema,
       name: props.name,
       source: draft.value,
@@ -168,8 +179,8 @@ async function saveSource() {
     toast(t("objects.sourceSaved"));
     emit("saved");
     await loadSource(false);
-  } catch (e: any) {
-    saveError.value = e?.message || String(e);
+  } catch (e: unknown) {
+    saveError.value = formatObjectSourceSaveError(e, databaseType, props.objectType, t("objects.postgresViewColumnChangeHint"));
   } finally {
     saving.value = false;
   }
@@ -182,7 +193,7 @@ function closeDialog() {
 
 <template>
   <Dialog :open="props.open" @update:open="(value) => emit('update:open', value)">
-    <DialogContent class="h-[min(760px,calc(100dvh-2rem))] grid-rows-[auto_minmax(0,1fr)_auto] sm:max-w-[900px]">
+    <DialogContent class="h-[min(760px,calc(var(--dbx-viewport-height)-2rem))] grid-rows-[auto_minmax(0,1fr)_auto] sm:max-w-[900px]">
       <DialogHeader>
         <DialogTitle>{{ title }}</DialogTitle>
       </DialogHeader>
@@ -212,26 +223,28 @@ function closeDialog() {
           hide-execution-controls
           @save="saveSource"
         />
-        <div v-if="saveError" class="shrink-0 border-t px-3 py-2 text-xs text-destructive">
+        <div v-if="saveError" class="shrink-0 whitespace-pre-wrap break-words border-t px-3 py-2 text-xs text-destructive">
           {{ saveError }}
         </div>
       </div>
-      <QueryEditor
-        v-else
-        :key="`${props.connectionId}:${props.database}:${props.schema || ''}:${props.name}:${props.objectType}`"
-        :model-value="content"
-        class="object-source-dialog-editor min-h-0 overflow-hidden rounded border"
-        :connection-id="props.connectionId"
-        :database="props.database"
-        :schema="props.schema || props.database"
-        :database-type="props.databaseType"
-        :dialect="props.dialect"
-        :format-dialect="props.formatDialect"
-        force-word-wrap
-        read-only
-        hide-execution-controls
-        data-object-source-preview
-      />
+      <div v-else class="flex min-h-0 flex-col gap-3 overflow-hidden">
+        <RoutineMetadataPanel v-if="hasRoutineMetadata && routineMetadata" :parameters="routineMetadata.parameters" :return-type="routineMetadata.returnType" />
+        <QueryEditor
+          :key="`${props.connectionId}:${props.database}:${props.schema || ''}:${props.name}:${props.objectType}`"
+          :model-value="content"
+          class="object-source-dialog-editor min-h-0 flex-1 overflow-hidden rounded border"
+          :connection-id="props.connectionId"
+          :database="props.database"
+          :schema="props.schema || props.database"
+          :database-type="props.databaseType"
+          :dialect="props.dialect"
+          :format-dialect="props.formatDialect"
+          force-word-wrap
+          read-only
+          hide-execution-controls
+          data-object-source-preview
+        />
+      </div>
 
       <DialogFooter>
         <Button variant="outline" @click="closeDialog">{{ t("common.close") }}</Button>

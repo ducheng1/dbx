@@ -5,6 +5,7 @@ import { useI18n } from "vue-i18n";
 import type { AuthAction, MqIssuedToken, MqSystemKind, MqTokenRecord, PermissionMap, PolicyScope, TopicInfo } from "@/types/mq";
 import { mqGrantPermission, mqIssueToken, mqListPermissions, mqListTokenRecords, mqRevokePermission } from "@/lib/backend/api";
 import { formatMqTokenIssueError, type MqTokenIssueErrorView } from "@/lib/mq/mqTokenErrors";
+import { useMqMutationGuard } from "@/composables/useMqMutationGuard";
 
 interface Props {
   connectionId: string;
@@ -17,6 +18,7 @@ interface Props {
 
 const props = defineProps<Props>();
 const { t } = useI18n();
+const { confirmMqWrite } = useMqMutationGuard(() => props.connectionId);
 
 const actionOptions: AuthAction[] = ["produce", "consume", "functions", "sources", "sinks", "packages"];
 
@@ -78,13 +80,13 @@ const permissionRows = computed(() => {
   return Object.entries(permissions.value).map(([role, actions]) => ({ role, actions }));
 });
 
-function guardWritable() {
+async function guardWritable(operation: string): Promise<boolean> {
   if (props.readOnly) {
     error.value = readOnlyMessage.value;
     notice.value = undefined;
     return false;
   }
-  return true;
+  return confirmMqWrite(operation);
 }
 
 function formatActionLabel(action: AuthAction): string {
@@ -120,7 +122,7 @@ async function loadPermissions() {
 }
 
 async function grantPermission() {
-  if (!guardWritable()) return;
+  if (!(await guardWritable(t("mqPermissions.grant")))) return;
   const current = scope.value;
   const role = roleName.value.trim();
   roleNameError.value = "";
@@ -163,7 +165,7 @@ async function grantPermission() {
 }
 
 async function revokePermission(role: string) {
-  if (!guardWritable()) return;
+  if (!(await guardWritable(t("mqPermissions.revoke")))) return;
   const current = scope.value;
   if (!current) {
     error.value = t("mqPermissions.selectNamespaceOrTopic");
@@ -225,6 +227,10 @@ async function loadTokenRecords() {
 async function issueToken() {
   if (props.readOnly) {
     tokenError.value = readOnlyMessage.value;
+    tokenIssueError.value = undefined;
+    return;
+  }
+  if (!(await confirmMqWrite(t("mqPermissions.generateToken")))) {
     tokenIssueError.value = undefined;
     return;
   }
@@ -475,6 +481,8 @@ watch(
 </template>
 
 <style scoped>
+@import "./shared/mqPanel.css";
+
 .permissions-panel {
   height: 100%;
   display: flex;
@@ -511,7 +519,7 @@ watch(
 .permissions-table {
   padding: 14px;
   border: 1px solid var(--color-border);
-  border-radius: 8px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background-secondary);
 }
 
@@ -545,7 +553,7 @@ input[type="number"] {
   width: 100%;
   padding: 7px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   background: var(--color-background);
   color: var(--color-text);
   box-sizing: border-box;
@@ -573,7 +581,7 @@ input.invalid {
 .actions-group.invalid {
   padding: 8px;
   border: 1px solid var(--color-error);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-error-bg);
 }
 
@@ -640,7 +648,7 @@ th {
 
 .tag {
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   background: var(--color-primary-alpha);
   color: var(--color-primary);
   font-size: 12px;
@@ -658,7 +666,7 @@ th {
 .readonly-hint {
   padding: 12px 16px;
   margin-bottom: 12px;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   font-size: 13px;
 }
 
@@ -677,30 +685,6 @@ th {
   color: var(--color-warning);
 }
 
-.btn-primary,
-.btn-secondary,
-.btn-sm,
-.btn-danger {
-  padding: 6px 12px;
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-background);
-  color: var(--color-text);
-  cursor: pointer;
-  font-size: 13px;
-}
-
-.btn-primary {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: white;
-}
-
-.btn-danger {
-  color: var(--color-error);
-  border-color: var(--color-error);
-}
-
 .dialog-overlay {
   position: fixed;
   inset: 0;
@@ -716,7 +700,7 @@ th {
   max-height: 86vh;
   display: flex;
   flex-direction: column;
-  border-radius: 8px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
 }
@@ -734,15 +718,6 @@ th {
   margin: 0;
   font-size: 16px;
   font-weight: 600;
-}
-
-.btn-close {
-  border: none;
-  background: none;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  font-size: 22px;
-  line-height: 1;
 }
 
 .dialog-body {
@@ -763,7 +738,7 @@ th {
   padding: 12px;
   margin-bottom: 16px;
   border: 1px solid var(--color-warning);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-warning-alpha);
 }
 
@@ -774,7 +749,7 @@ th {
   margin-bottom: 16px;
   border: 1px solid var(--color-warning);
   border-left-width: 4px;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-warning-alpha);
   color: var(--color-text);
   font-size: 13px;
@@ -803,7 +778,7 @@ th {
   min-height: 96px;
   padding: 8px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   background: var(--color-background);
   color: var(--color-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;

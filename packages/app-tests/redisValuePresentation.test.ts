@@ -10,8 +10,12 @@ import {
   formatRedisStringValue,
   getRedisMemberSelectionKey,
   highlightRedisJsonDetail,
+  isJsonDerivedView,
+  jsonToXmlText,
+  jsonToYamlText,
   parseRedisJsonDetail,
   preferredRedisValueFormat,
+  redisClipboardSafeText,
   redisMemberCopyText,
   redisValueCopyText,
 } from "../../apps/desktop/src/lib/redis/redisValuePresentation.ts";
@@ -38,6 +42,16 @@ test("keeps plain Redis member strings unchanged", () => {
   assert.equal(detail.rawLabel, "ASCII");
   assert.equal(detail.text, "plain long member value");
   assert.deepEqual(detail.availableFormats, ["utf8", "ascii", "binary", "hex", "base64"]);
+});
+
+test("keeps normal text whitespace and unicode unchanged for Redis clipboard output", () => {
+  assert.equal(redisClipboardSafeText("line 1\nline 2\t中文"), "line 1\nline 2\t中文");
+});
+
+test("escapes clipboard-unsafe controls in Redis member copies without truncating the suffix", () => {
+  const serialized = 'o:\\28:"JobMessage":1:{s:7:"payload";s:11:"before\x00after";}';
+
+  assert.equal(redisMemberCopyText(blobFromText(serialized)), 'o:\\28:"JobMessage":1:{s:7:"payload";s:11:"before\\x00after";}');
 });
 
 test("formats JSON string values without changing plain strings", () => {
@@ -99,13 +113,14 @@ test("string/blob formats stay text-oriented and binary-first where needed", () 
   assert.equal(binaryDetail.binaryText, "10101100111011010000000000000101");
 });
 
-test("detects Java-serialized payloads as a dedicated view", () => {
+test("detects Java-serialized payloads as a codec, not a view tab", () => {
   const javaSerializedString = formatRedisMemberDetail({
     raw_base64: "rO0ABXQACHNvbWV0ZXh0",
     encoding: "binary" as const,
   });
-  assert.deepEqual(javaSerializedString.availableFormats, ["javaserialize", "binary", "hex", "base64"]);
-  assert.equal(javaSerializedString.defaultFormat, "javaserialize");
+  assert.deepEqual(javaSerializedString.availableFormats, ["hex", "binary", "base64"]);
+  assert.equal(javaSerializedString.defaultFormat, "hex");
+  assert.equal(javaSerializedString.defaultCodec, "none");
   assert.equal(javaSerializedString.javaSerialized?.formattedText, '"sometext"');
 
   const javaSerializedMap = formatRedisMemberDetail({
@@ -121,10 +136,7 @@ test("detects Java-serialized payloads as a dedicated view", () => {
 
   const plainText = formatRedisMemberDetail(blobFromText("Ada"));
   assert.equal(canRenderRedisValueFormat(plainText, "json"), false);
-  assert.equal(canRenderRedisValueFormat(plainText, "javaserialize"), false);
   assert.equal(canRenderRedisValueFormat(plainText, "utf8"), true);
-
-  assert.equal(canRenderRedisValueFormat(javaSerializedMap, "javaserialize"), true);
 });
 
 test("normalizes self-referential Java maps without recursing forever", () => {
@@ -152,7 +164,7 @@ test("only payload views opt into JSON text formatting", () => {
 
   const payloadDetail = formatRedisMemberDetail(blobFromText('{"name":"Ada"}'), { allowJsonText: true });
   assert.equal(payloadDetail.rawLabel, "ASCII");
-  assert.deepEqual(payloadDetail.availableFormats, ["utf8", "ascii", "binary", "json", "hex", "base64"]);
+  assert.deepEqual(payloadDetail.availableFormats, ["utf8", "ascii", "binary", "json", "unicodejson", "yaml", "xml", "hex", "base64"]);
   assert.equal(payloadDetail.defaultFormat, "utf8");
   assert.equal(payloadDetail.json?.formattedText, '{\n  "name": "Ada"\n}');
 });
@@ -223,6 +235,22 @@ test("copies collection values as readable content instead of blob transport obj
   assert.equal(redisValueCopyText(value), '[\n  {\n    "field": "name",\n    "value": "Ada"\n  }\n]');
 });
 
+test("keeps whole-key JSON copies JSON-escaped when members contain NUL", () => {
+  const value = {
+    key_display: "users",
+    key_raw: "users",
+    ttl: -1,
+    redis_type: "list",
+    data: {
+      kind: "list" as const,
+      items: [{ value: blobFromText("before\x00after") }],
+      total: 1,
+    },
+  };
+
+  assert.equal(redisValueCopyText(value), '[\n  "before\\u0000after"\n]');
+});
+
 test("copies stream entries without collapsing repeated field names", () => {
   const value = {
     key_display: "events",
@@ -274,4 +302,19 @@ test("clamps Redis member detail sheet width to viewport and usable bounds", () 
   assert.equal(clampRedisMemberDetailSheetWidth(640, 1200), 640);
   assert.equal(clampRedisMemberDetailSheetWidth(1200, 1400), 900);
   assert.equal(clampRedisMemberDetailSheetWidth(900, 500), 468);
+});
+
+test("exposes JSON-derived unicode/yaml/xml views only for JSON values", () => {
+  const jsonDetail = formatRedisMemberDetail(blobFromText('{"id":1}'), { allowJsonText: true });
+  const plainDetail = formatRedisMemberDetail("plain");
+
+  assert.equal(isJsonDerivedView("yaml"), true);
+  assert.equal(isJsonDerivedView("utf8"), false);
+  assert.equal(canRenderRedisValueFormat(jsonDetail, "yaml"), true);
+  assert.equal(canRenderRedisValueFormat(plainDetail, "yaml"), false);
+});
+
+test("renders JSON values as YAML and XML text", () => {
+  assert.equal(jsonToYamlText({ id: 1, tags: ["a", "b"] }), "id: 1\ntags:\n  - a\n  - b\n");
+  assert.equal(jsonToXmlText({ id: 1 }), '<?xml version="1.0" encoding="UTF-8"?>\n<root>\n  <id>1</id>\n</root>');
 });

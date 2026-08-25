@@ -11,13 +11,18 @@ const SchemaDiffDialog = defineAsyncComponent(() => import("@/components/diff/Sc
 const DataCompareDialog = defineAsyncComponent(() => import("@/components/diff/DataCompareDialog.vue"));
 const SqlFileExecutionDialog = defineAsyncComponent(() => import("@/components/sql-file/SqlFileExecutionDialog.vue"));
 const SchemaDiagramDialog = defineAsyncComponent(() => import("@/components/diagram/SchemaDiagramDialog.vue"));
+const DatabaseDocsDialog = defineAsyncComponent(() => import("@/components/docs/DatabaseDocsDialog.vue"));
 const TableImportDialog = defineAsyncComponent(() => import("@/components/import/TableImportDialog.vue"));
 const FieldLineageDialog = defineAsyncComponent(() => import("@/components/lineage/FieldLineageDialog.vue"));
 const ConfigPassphraseDialog = defineAsyncComponent(() => import("@/components/config/ConfigPassphraseDialog.vue"));
+const ConfigConnectionSelectDialog = defineAsyncComponent(() => import("@/components/config/ConfigConnectionSelectDialog.vue"));
 const DatabaseSearchDialog = defineAsyncComponent(() => import("@/components/search/DatabaseSearchDialog.vue"));
+const SshHostKeyPromptDialog = defineAsyncComponent(() => import("@/components/ssh/SshHostKeyPromptDialog.vue"));
+const ConnectionPasswordPromptDialog = defineAsyncComponent(() => import("@/components/connection/ConnectionPasswordPromptDialog.vue"));
 const DatabaseExportDialog = defineAsyncComponent(() => import("@/components/export/DatabaseExportDialog.vue"));
 const DataGenerateDialog = defineAsyncComponent(() => import("@/components/generate/DataGenerateDialog.vue"));
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useSqlExecutionDangerStore } from "@/stores/sqlExecutionDangerStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { useDialogSources } from "@/composables/useDialogSources";
 import type { ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
@@ -33,6 +38,7 @@ const props = defineProps<{
   showDangerDialog: boolean;
   dangerSql: string;
   suppressDangerConfirm: boolean;
+  activeDatabaseType?: DatabaseType;
   showSqlParameterDialog: boolean;
   sqlParameterSourceSql: string;
   sqlParameterNames: SqlParameterDescriptor[];
@@ -86,6 +92,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
 const productionSafetyStore = useProductionSafetyStore();
+const sqlExecutionDangerStore = useSqlExecutionDangerStore();
 const dialogs = useDialogSources();
 const productionConfirmationDetails = computed(() => {
   const request = productionSafetyStore.pending;
@@ -95,6 +102,15 @@ const productionConfirmationDetails = computed(() => {
     database: request.productionDatabases?.join(", ") || request.database || "-",
     source: request.source || "-",
   });
+});
+const multiDbDangerDetails = computed(() => {
+  const request = sqlExecutionDangerStore.pending;
+  if (!request) return "";
+  return [request.targetLabel || request.connectionName, request.database].filter(Boolean).join("\n");
+});
+const multiDbDangerMessage = computed(() => {
+  const request = sqlExecutionDangerStore.pending;
+  return request?.kind === "redis" ? t("dangerDialog.redisCommandMessage") : t("dangerDialog.message");
 });
 
 const editConfig = computed(() => {
@@ -144,7 +160,7 @@ watch(
     v-if="showDangerDialog"
     :open="showDangerDialog"
     :sql="dangerSql"
-    :show-suppress-toggle="true"
+    :show-suppress-toggle="activeDatabaseType !== 'redis'"
     :suppress-future-prompts="suppressDangerConfirm"
     @update:open="emit('update:showDangerDialog', $event)"
     @update:suppress-future-prompts="emit('update:suppressDangerConfirm', $event)"
@@ -162,6 +178,19 @@ watch(
     @update:open="(open) => !open && productionSafetyStore.cancel()"
     @confirm="productionSafetyStore.confirm()"
   />
+  <DangerConfirmDialog
+    v-if="sqlExecutionDangerStore.pending"
+    :open="true"
+    :title="t('multiDbExecute.dangerTitle')"
+    :message="multiDbDangerMessage"
+    :details-text="multiDbDangerDetails"
+    :sql="sqlExecutionDangerStore.pending.sql"
+    :confirm-label="t('multiDbExecute.dangerConfirm')"
+    :show-suppress-toggle="false"
+    :close-on-confirm="false"
+    @update:open="(open) => !open && sqlExecutionDangerStore.cancel()"
+    @confirm="sqlExecutionDangerStore.confirm()"
+  />
   <SqlParameterDialog
     v-if="showSqlParameterDialog"
     :open="showSqlParameterDialog"
@@ -172,7 +201,17 @@ watch(
     @update:open="emit('update:showSqlParameterDialog', $event)"
     @execute="emit('sqlParametersConfirm', $event)"
   />
-  <DataTransferDialog v-model:open="dialogs.showTransferDialog.value" :prefill-connection-id="dialogs.transferPrefillConnectionId.value" :prefill-database="dialogs.transferPrefillDatabase.value" />
+  <DataTransferDialog
+    v-model:open="dialogs.showTransferDialog.value"
+    :prefill-connection-id="dialogs.transferPrefillConnectionId.value"
+    :prefill-database="dialogs.transferPrefillDatabase.value"
+    :prefill-catalog="dialogs.transferPrefillCatalog.value"
+    :prefill-schema="dialogs.transferPrefillSchema.value"
+    :prefill-tables="dialogs.transferPrefillTables.value"
+    :prefill-target-connection-id="dialogs.transferPrefillTargetConnectionId.value"
+    :prefill-target-database="dialogs.transferPrefillTargetDatabase.value"
+    :prefill-target-schema="dialogs.transferPrefillTargetSchema.value"
+  />
   <SchemaDiffDialog v-if="dialogs.showSchemaDiffDialog.value" v-model:open="dialogs.showSchemaDiffDialog.value" :prefill-connection-id="dialogs.schemaDiffPrefillConnectionId.value" :prefill-database="dialogs.schemaDiffPrefillDatabase.value" :prefill-schema="dialogs.schemaDiffPrefillSchema.value" />
   <DataCompareDialog
     v-if="dialogs.showDataCompareDialog.value"
@@ -192,6 +231,7 @@ watch(
     :focus-table-name="dialogs.diagramFocusTableName.value"
     @open-target="emit('openDiagramTarget', $event)"
   />
+  <DatabaseDocsDialog v-if="dialogs.showDocsDialog.value" v-model:open="dialogs.showDocsDialog.value" :prefill-connection-id="dialogs.docsPrefillConnectionId.value" :prefill-database="dialogs.docsPrefillDatabase.value" :prefill-schema="dialogs.docsPrefillSchema.value" />
   <TableImportDialog
     v-if="dialogs.showTableImportDialog.value"
     v-model:open="dialogs.showTableImportDialog.value"
@@ -236,13 +276,37 @@ watch(
     :prefill-tables="dialogs.databaseExportPrefillTables.value"
     :prefill-all-databases="dialogs.databaseExportAllDatabases.value"
   />
+  <ConfigConnectionSelectDialog
+    v-if="dialogs.showConfigConnectionSelectDialog.value"
+    :open="dialogs.showConfigConnectionSelectDialog.value"
+    :mode="dialogs.configConnectionSelectMode.value"
+    :busy="dialogs.applyingImportSelection.value"
+    :connections="dialogs.configConnectionSelectList.value"
+    @update:open="dialogs.onConfigConnectionSelectOpenChange"
+    @confirm="dialogs.onConfigConnectionSelectConfirm"
+  />
   <ConfigPassphraseDialog
     v-if="dialogs.showConfigPassphraseDialog.value"
-    v-model:open="dialogs.showConfigPassphraseDialog.value"
+    :open="dialogs.showConfigPassphraseDialog.value"
     :mode="dialogs.configPassphraseMode.value"
     :external-error="dialogs.configPassphraseError.value"
+    :busy="dialogs.configExportBusy.value"
+    @update:open="dialogs.onConfigPassphraseOpenChange"
+    @request-unencrypted="dialogs.onRequestUnencryptedExport"
     @confirm="dialogs.configPassphraseMode.value === 'export' ? dialogs.onExportConfirm($event) : dialogs.onImportConfirm($event)"
   />
+  <Dialog v-if="dialogs.showConfigUnencryptedExportConfirm.value" :open="dialogs.showConfigUnencryptedExportConfirm.value" @update:open="dialogs.onConfigUnencryptedExportOpenChange">
+    <DialogContent class="sm:max-w-[440px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("configExport.unencryptedWarningTitle") }}</DialogTitle>
+      </DialogHeader>
+      <p class="text-sm text-muted-foreground">{{ t("configExport.unencryptedWarningDescription") }}</p>
+      <DialogFooter>
+        <Button type="button" variant="outline" :disabled="dialogs.configExportBusy.value" @click="dialogs.onConfigUnencryptedExportCancel()">{{ t("dangerDialog.cancel") }}</Button>
+        <Button type="button" variant="destructive" :disabled="dialogs.configExportBusy.value" @click="dialogs.onConfigUnencryptedExportConfirm()">{{ t("configExport.confirmUnencryptedExport") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
   <Dialog v-model:open="dialogs.showImportLayoutConfirm.value">
     <DialogContent class="sm:max-w-[400px]">
       <DialogHeader>
@@ -261,4 +325,6 @@ watch(
       </DialogFooter>
     </DialogContent>
   </Dialog>
+  <SshHostKeyPromptDialog />
+  <ConnectionPasswordPromptDialog />
 </template>

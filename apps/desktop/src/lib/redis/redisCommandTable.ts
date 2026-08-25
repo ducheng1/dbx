@@ -115,11 +115,13 @@ const RAW_COMMANDS: Record<string, Spec> = {
   KEYS: [2, "generic", "blocked"],
   MIGRATE: [-6, "generic", "blocked"],
   MOVE: [3, "generic", "confirm"],
-  OBJECT_ENCODING: [3, "generic"],
-  OBJECT_FREQ: [3, "generic"],
-  OBJECT_IDLETIME: [3, "generic"],
-  OBJECT_REFCOUNT: [3, "generic"],
-  OBJECT_HELP: [2, "generic"],
+  // Redis exposes OBJECT operations as space-delimited subcommands; keep these
+  // keys aligned with COMMAND metadata so shared parsing and completion work.
+  "OBJECT ENCODING": [3, "generic"],
+  "OBJECT FREQ": [3, "generic"],
+  "OBJECT IDLETIME": [3, "generic"],
+  "OBJECT REFCOUNT": [3, "generic"],
+  "OBJECT HELP": [2, "generic"],
   PERSIST: [2, "generic", "confirm"],
   PEXPIRE: [-3, "generic", "confirm"],
   PEXPIREAT: [-3, "generic", "confirm"],
@@ -164,6 +166,8 @@ const RAW_COMMANDS: Record<string, Spec> = {
 
   // ---- Hash ----
   HDEL: [-3, "hash", "confirm"],
+  HEXPIRE: [-6, "hash", "confirm"],
+  HEXPIREAT: [-6, "hash", "confirm"],
   HEXISTS: [3, "hash"],
   HGET: [3, "hash"],
   HGETALL: [2, "hash"],
@@ -178,6 +182,11 @@ const RAW_COMMANDS: Record<string, Spec> = {
   HSET: [-4, "hash", "confirm"],
   HSETNX: [4, "hash", "confirm"],
   HSTRLEN: [3, "hash"],
+  HPERSIST: [-5, "hash", "confirm"],
+  HPEXPIRE: [-6, "hash", "confirm"],
+  HPEXPIREAT: [-6, "hash", "confirm"],
+  HPTTL: [-5, "hash"],
+  HTTL: [-5, "hash"],
   HVALS: [2, "hash"],
 
   // ---- Set ----

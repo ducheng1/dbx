@@ -2,11 +2,87 @@ import { describe, expect, it } from "vitest";
 import { connectionNamespaceCreationTarget, databaseNodeNamespaceCreationTarget } from "@/lib/database/databaseNamespaceCreation";
 import { editableDatabasePropertyGroups, editableSchemaPropertyGroups } from "@/lib/database/databasePropertyEditing";
 import { buildGetDatabaseCommentSql } from "@/lib/database/dbAdminSql";
-import { isSchemaAware, supportsSqlInListPaste, supportsTransaction } from "@/lib/database/databaseFeatureSupport";
+import {
+  defaultAutoCommitForDbType,
+  isSchemaAware,
+  supportsConnectionScopedQueryExecution,
+  supportsConnectionDatabaseBrowser,
+  supportsDatabaseNameCompletion,
+  supportsDatabaseSchemaQualifier,
+  supportsQueryTargetDatabaseListing,
+  supportsQueryEditorBlockComments,
+  supportsSqlInListPaste,
+  supportsTableImport,
+  supportsTableVacuum,
+  supportsTransaction,
+  usesConnectionOnlyQueryTarget,
+  usesTreeSchemaMode,
+  schemaNodeHasLoadableName,
+} from "@/lib/database/databaseFeatureSupport";
 
 describe("schema awareness", () => {
   it("keeps SQLite database aliases separate from schema-capable databases", () => {
     expect(isSchemaAware("sqlite")).toBe(false);
+  });
+
+  it("puts Cloud Spanner in both schema sets because they gate different surfaces", () => {
+    // Spanner 2024+ has named schemas and they are queryable, so both have to be true. The two sets
+    // are not interchangeable: SCHEMA_AWARE_TYPES reaches the schema pickers in dialogs, while
+    // TREE_SCHEMA_TYPES is what makes a database node load schemas instead of tables. With only the
+    // former, `sales` showed up in the schema-diff dropdown but was unreachable in the object tree.
+    expect(isSchemaAware("spanner")).toBe(true);
+    expect(usesTreeSchemaMode("spanner")).toBe(true);
+  });
+
+  it("treats Cloud Spanner's blank schema as a loadable node name", () => {
+    // The GoogleSQL default schema node carries "", so a truthiness check would render an
+    // expandable node that never loads its tables. Other types keep the truthiness test, which is
+    // what filters the undefined schema on nodes that have no schema level at all.
+    expect(schemaNodeHasLoadableName("spanner", "")).toBe(true);
+    expect(schemaNodeHasLoadableName("spanner", "sales")).toBe(true);
+    expect(schemaNodeHasLoadableName("spanner", undefined)).toBe(false);
+    expect(schemaNodeHasLoadableName("postgres", "")).toBe(false);
+    expect(schemaNodeHasLoadableName("postgres", "public")).toBe(true);
+  });
+});
+
+describe("connection database browser", () => {
+  it("follows object browser support without enabling unsupported connection types", () => {
+    expect(supportsConnectionDatabaseBrowser("postgres")).toBe(true);
+    expect(supportsConnectionDatabaseBrowser("redis")).toBe(false);
+  });
+});
+
+describe("connection-scoped query targets", () => {
+  it("keeps connection-only target types separate from unregistered namespace targets", () => {
+    expect(usesConnectionOnlyQueryTarget("etcd")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("zookeeper")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("elasticsearch")).toBe(true);
+    expect(supportsConnectionScopedQueryExecution("elasticsearch")).toBe(true);
+    expect(supportsQueryTargetDatabaseListing("elasticsearch")).toBe(false);
+    expect(usesConnectionOnlyQueryTarget("qdrant")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("milvus")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("weaviate")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("chromadb")).toBe(true);
+    expect(supportsQueryTargetDatabaseListing("etcd")).toBe(false);
+  });
+});
+
+describe("database and schema qualifiers", () => {
+  it.each(["sqlserver", "trino", "prestosql"] as const)("supports three-part object names for %s", (databaseType) => {
+    expect(supportsDatabaseSchemaQualifier(databaseType)).toBe(true);
+  });
+
+  it.each(["mysql", "postgres", "oracle", "snowflake"] as const)("does not widen unverified three-part completion for %s", (databaseType) => {
+    expect(supportsDatabaseSchemaQualifier(databaseType)).toBe(false);
+  });
+
+  it.each(["mysql", "sqlite", "sqlserver"] as const)("suggests database names for %s", (databaseType) => {
+    expect(supportsDatabaseNameCompletion(databaseType)).toBe(true);
+  });
+
+  it.each(["postgres", "oracle", "snowflake", "trino", "prestosql"] as const)("does not add database name completion for %s", (databaseType) => {
+    expect(supportsDatabaseNameCompletion(databaseType)).toBe(false);
   });
 });
 
@@ -14,9 +90,12 @@ describe("supportsTransaction", () => {
   it("returns true for supported database types", () => {
     expect(supportsTransaction("postgres")).toBe(true);
     expect(supportsTransaction("mysql")).toBe(true);
+    expect(supportsTransaction("oracle")).toBe(true);
+    expect(supportsTransaction("jdbc")).toBe(true);
   });
 
   it("returns false for unsupported database types", () => {
+    expect(supportsTransaction("oceanbase-oracle")).toBe(false);
     expect(supportsTransaction("redis")).toBe(false);
     expect(supportsTransaction("mongodb")).toBe(false);
     expect(supportsTransaction("duckdb")).toBe(false);
@@ -26,7 +105,6 @@ describe("supportsTransaction", () => {
     expect(supportsTransaction("sqlite")).toBe(false);
     expect(supportsTransaction("clickhouse")).toBe(false);
     expect(supportsTransaction("sqlserver")).toBe(false);
-    expect(supportsTransaction("oracle")).toBe(false);
     expect(supportsTransaction("dameng")).toBe(false);
     expect(supportsTransaction("rqlite")).toBe(false);
     expect(supportsTransaction("agent")).toBe(false);
@@ -34,6 +112,17 @@ describe("supportsTransaction", () => {
 
   it("returns false for undefined or empty input", () => {
     expect(supportsTransaction(undefined)).toBe(false);
+  });
+});
+
+describe("defaultAutoCommitForDbType", () => {
+  it("defaults query tabs to auto-commit", () => {
+    expect(defaultAutoCommitForDbType("oceanbase-oracle")).toBe(true);
+    expect(defaultAutoCommitForDbType("oracle")).toBe(true);
+    expect(defaultAutoCommitForDbType("mysql")).toBe(true);
+    expect(defaultAutoCommitForDbType("postgres")).toBe(true);
+    expect(defaultAutoCommitForDbType("dameng")).toBe(true);
+    expect(defaultAutoCommitForDbType(undefined)).toBe(true);
   });
 });
 
@@ -55,6 +144,8 @@ describe("supportsSqlInListPaste", () => {
     expect(supportsSqlInListPaste("redis")).toBe(false);
     expect(supportsSqlInListPaste("mongodb")).toBe(false);
     expect(supportsSqlInListPaste("elasticsearch")).toBe(false);
+    expect(supportsSqlInListPaste("easysearch")).toBe(false);
+    expect(supportsSqlInListPaste("meilisearch")).toBe(false);
     expect(supportsSqlInListPaste("qdrant")).toBe(false);
     expect(supportsSqlInListPaste("milvus")).toBe(false);
     expect(supportsSqlInListPaste("weaviate")).toBe(false);
@@ -67,6 +158,41 @@ describe("supportsSqlInListPaste", () => {
 
   it("excludes Neo4j because Cypher uses list syntax instead of SQL IN tuples", () => {
     expect(supportsSqlInListPaste("neo4j")).toBe(false);
+  });
+});
+
+describe("supportsQueryEditorBlockComments", () => {
+  it("allows block comments in generic and SQL editors", () => {
+    expect(supportsQueryEditorBlockComments(undefined)).toBe(true);
+    expect(supportsQueryEditorBlockComments("mysql")).toBe(true);
+    expect(supportsQueryEditorBlockComments("postgres")).toBe(true);
+    expect(supportsQueryEditorBlockComments("sqlserver")).toBe(true);
+  });
+
+  it("hides block comments in non-SQL editors", () => {
+    expect(supportsQueryEditorBlockComments("redis")).toBe(false);
+    expect(supportsQueryEditorBlockComments("mongodb")).toBe(false);
+    expect(supportsQueryEditorBlockComments("elasticsearch")).toBe(false);
+  });
+});
+
+describe("supportsTableVacuum", () => {
+  it("enables VACUUM for the supported PostgreSQL family", () => {
+    for (const databaseType of ["postgres", "gaussdb", "opengauss", "kingbase", "vastbase", "highgo", "uxdb", "kwdb"] as const) {
+      expect(supportsTableVacuum(databaseType)).toBe(true);
+    }
+  });
+
+  it("does not enable VACUUM for unrelated database types", () => {
+    for (const databaseType of ["mysql", "sqlite", "redshift", "oracle", "jdbc"] as const) {
+      expect(supportsTableVacuum(databaseType)).toBe(false);
+    }
+  });
+});
+
+describe("supportsTableImport", () => {
+  it("enables OceanBase Oracle table import", () => {
+    expect(supportsTableImport("oceanbase-oracle")).toBe(true);
   });
 });
 
@@ -88,6 +214,7 @@ describe("database property editing", () => {
     expect(editableDatabasePropertyGroups({ db_type: "mysql", read_only: true }, { type: "database", database: "app" })).toEqual([]);
     expect(editableDatabasePropertyGroups({ db_type: "sqlite" }, { type: "database", database: "main" })).toEqual([]);
     expect(editableDatabasePropertyGroups({ db_type: "sqlserver" }, { type: "database", database: "master" })).toEqual([]);
+    expect(editableDatabasePropertyGroups({ db_type: "hbase" }, { type: "database", database: "default" })).toEqual([]);
     expect(editableDatabasePropertyGroups({ db_type: "postgres" }, { type: "connection" })).toEqual([]);
     expect(editableSchemaPropertyGroups({ db_type: "postgres", read_only: true }, { type: "schema", database: "postgres", schema: "public" })).toEqual([]);
     expect(editableSchemaPropertyGroups({ db_type: "postgres" }, { type: "database", database: "postgres" })).toEqual([]);
@@ -114,6 +241,7 @@ describe("database namespace creation", () => {
     expect(connectionNamespaceCreationTarget({ db_type: "sqlite" })).toBe("attach");
     expect(connectionNamespaceCreationTarget({ db_type: "mongodb" })).toBe("special");
     expect(connectionNamespaceCreationTarget({ db_type: "mongodb", driver_profile: "mongodb-legacy" })).toBeNull();
+    expect(connectionNamespaceCreationTarget({ db_type: "mongodb", driver_profile: "legacy" })).toBeNull();
   });
 
   it("hides persistent SQLite attachment for memory and SQLCipher connections", () => {
@@ -127,6 +255,7 @@ describe("database namespace creation", () => {
     expect(connectionNamespaceCreationTarget({ db_type: "sqlite", read_only: true })).toBeNull();
     expect(connectionNamespaceCreationTarget({ db_type: "jdbc" })).toBeNull();
     expect(connectionNamespaceCreationTarget({ db_type: "oracle" })).toBeNull();
+    expect(connectionNamespaceCreationTarget({ db_type: "hbase" })).toBeNull();
   });
 
   it("allows schema creation only on writable database nodes with schema targets", () => {

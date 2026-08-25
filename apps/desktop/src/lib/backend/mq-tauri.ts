@@ -13,6 +13,7 @@ import type {
   ListTopicsOpts,
   TopicStats,
   SubscriptionInfo,
+  KafkaConsumerGroupSnapshot,
   ResetPosition,
   SkipCount,
   ConsumerInfo,
@@ -30,17 +31,117 @@ import type {
   MqIssuedToken,
   BacklogStats,
   RocketMqConsumerGroupConfig,
-  PeekedMessage,
+  PeekMessagesResult,
   PeekMessagesOptions,
   MqRawRequest,
   MqRawResponse,
   SendMessageRequest,
   SendMessageResponse,
+  MqExchangeInfo,
+  MqExchangeCreateRequest,
+  MqBindingInfo,
+  MqBindingListFilter,
+  MqClientConnectionInfo,
+  MqChannelInfo,
+  MqUserInfo,
+  MqVhostPermission,
+  MqUserPermissionListFilter,
+  MqUserPermissionPatterns,
+  MqPolicyInfo,
+  MqPolicyListFilter,
+  MqPolicyUpsertRequest,
+  MqOverviewInfo,
+  MqNodeInfo,
 } from "@/types/mq";
 
 // Connectivity
 export async function mqTestConnection(connectionId: string): Promise<MqClusterInfo> {
   return invoke("mq_test_connection", { connectionId });
+}
+
+// Exchanges / Bindings (RabbitMQ)
+export async function mqListExchanges(connectionId: string, ns: NamespaceRef): Promise<MqExchangeInfo[]> {
+  return invoke("mq_list_exchanges", { connectionId, ns });
+}
+
+export async function mqCreateExchange(connectionId: string, ns: NamespaceRef, exchange: MqExchangeCreateRequest): Promise<void> {
+  return invoke("mq_create_exchange", { connectionId, ns, name: exchange.name, exchangeType: exchange.type, durable: exchange.durable, autoDelete: exchange.autoDelete });
+}
+
+export async function mqDeleteExchange(connectionId: string, ns: NamespaceRef, name: string): Promise<void> {
+  return invoke("mq_delete_exchange", { connectionId, ns, name });
+}
+
+export async function mqListBindings(connectionId: string, ns: NamespaceRef, filter?: MqBindingListFilter): Promise<MqBindingInfo[]> {
+  return invoke("mq_list_bindings", { connectionId, ns, exchange: filter?.exchange, queue: filter?.queue });
+}
+
+export async function mqBind(connectionId: string, ns: NamespaceRef, binding: MqBindingInfo): Promise<void> {
+  return invoke("mq_bind", { connectionId, ns, binding });
+}
+
+export async function mqUnbind(connectionId: string, ns: NamespaceRef, binding: MqBindingInfo): Promise<void> {
+  return invoke("mq_unbind", { connectionId, ns, binding });
+}
+
+// Client connections / channels (RabbitMQ)
+export async function mqListClientConnections(connectionId: string, ns: NamespaceRef): Promise<MqClientConnectionInfo[]> {
+  return invoke("mq_list_client_connections", { connectionId, ns });
+}
+
+export async function mqListClientChannels(connectionId: string, ns: NamespaceRef, connection?: string): Promise<MqChannelInfo[]> {
+  return invoke("mq_list_client_channels", { connectionId, ns, connection });
+}
+
+export async function mqCloseClientConnection(connectionId: string, ns: NamespaceRef, name: string): Promise<void> {
+  return invoke("mq_close_client_connection", { connectionId, ns, name });
+}
+
+// Users & vhost permissions (RabbitMQ)
+export async function mqListUsers(connectionId: string): Promise<MqUserInfo[]> {
+  return invoke("mq_list_users", { connectionId });
+}
+
+export async function mqCreateUser(connectionId: string, name: string, password: string, tags?: string[]): Promise<void> {
+  return invoke("mq_create_user", { connectionId, name, password, tags });
+}
+
+export async function mqDeleteUser(connectionId: string, name: string): Promise<void> {
+  return invoke("mq_delete_user", { connectionId, name });
+}
+
+export async function mqListUserPermissions(connectionId: string, filter?: MqUserPermissionListFilter): Promise<MqVhostPermission[]> {
+  return invoke("mq_list_user_permissions", { connectionId, virtualHost: filter?.virtualHost, user: filter?.user, allVhosts: filter?.allVhosts });
+}
+
+export async function mqGrantUserPermission(connectionId: string, user: string, virtualHost: string, patterns?: MqUserPermissionPatterns): Promise<void> {
+  return invoke("mq_grant_user_permission", { connectionId, user, virtualHost, configure: patterns?.configure, write: patterns?.write, read: patterns?.read });
+}
+
+export async function mqRevokeUserPermission(connectionId: string, user: string, virtualHost: string): Promise<void> {
+  return invoke("mq_revoke_user_permission", { connectionId, user, virtualHost });
+}
+
+// Policies (RabbitMQ)
+export async function mqListPolicies(connectionId: string, filter?: MqPolicyListFilter): Promise<MqPolicyInfo[]> {
+  return invoke("mq_list_policies", { connectionId, virtualHost: filter?.virtualHost, allVhosts: filter?.allVhosts });
+}
+
+export async function mqSetPolicy(connectionId: string, virtualHost: string, policy: MqPolicyUpsertRequest): Promise<void> {
+  return invoke("mq_set_policy", { connectionId, virtualHost, name: policy.name, pattern: policy.pattern, applyTo: policy.applyTo, priority: policy.priority, definition: policy.definition });
+}
+
+export async function mqDeletePolicy(connectionId: string, virtualHost: string, name: string): Promise<void> {
+  return invoke("mq_delete_policy", { connectionId, virtualHost, name });
+}
+
+// Cluster overview & nodes (RabbitMQ)
+export async function mqGetOverview(connectionId: string): Promise<MqOverviewInfo> {
+  return invoke("mq_get_overview", { connectionId });
+}
+
+export async function mqListNodes(connectionId: string): Promise<MqNodeInfo[]> {
+  return invoke("mq_list_nodes", { connectionId });
 }
 
 // Tenants
@@ -111,6 +212,14 @@ export async function mqListSubscriptions(connectionId: string, topic: TopicRef)
   return invoke("mq_list_subscriptions", { connectionId, topic });
 }
 
+export async function mqEnrichSubscriptions(connectionId: string, topic: TopicRef): Promise<SubscriptionInfo[]> {
+  return invoke("mq_enrich_subscriptions", { connectionId, topic });
+}
+
+export async function mqGetKafkaConsumerGroupSnapshot(connectionId: string): Promise<KafkaConsumerGroupSnapshot> {
+  return invoke("mq_get_kafka_consumer_group_snapshot", { connectionId });
+}
+
 export async function mqCreateSubscription(connectionId: string, topic: TopicRef, sub: string, pos: ResetPosition): Promise<void> {
   return invoke("mq_create_subscription", { connectionId, topic, sub, pos });
 }
@@ -131,7 +240,7 @@ export async function mqClearBacklog(connectionId: string, topic: TopicRef, sub:
   return invoke("mq_clear_backlog", { connectionId, topic, sub });
 }
 
-export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number, options?: PeekMessagesOptions): Promise<PeekedMessage[]> {
+export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number, options?: PeekMessagesOptions): Promise<PeekMessagesResult> {
   return invoke("mq_peek_messages", { connectionId, topic, sub, count, options });
 }
 

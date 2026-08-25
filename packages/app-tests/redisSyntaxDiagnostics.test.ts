@@ -90,6 +90,24 @@ test("subcommands resolve via MAIN SUB key", () => {
   assert.equal(diags.length, 0);
 });
 
+test("accepts all Redis OBJECT subcommands", () => {
+  for (const command of ["OBJECT ENCODING key", "OBJECT FREQ key", "OBJECT IDLETIME key", "OBJECT REFCOUNT key", "OBJECT HELP"]) {
+    assert.deepEqual(messages(command), [], `${command} should be valid`);
+  }
+});
+
+test("validates OBJECT subcommand arity and rejects unknown subcommands", () => {
+  for (const command of ["OBJECT ENCODING", "OBJECT FREQ", "OBJECT IDLETIME", "OBJECT REFCOUNT", "OBJECT HELP extra"]) {
+    const diags = buildRedisSyntaxDiagnostics(command);
+    assert.equal(diags.length, 1, `${command} should have one diagnostic`);
+    assert.match(diags[0].message, /Wrong number of arguments for 'OBJECT'/);
+  }
+
+  const unknown = buildRedisSyntaxDiagnostics("OBJECT UNKNOWN key");
+  assert.equal(unknown.length, 1);
+  assert.match(unknown[0].message, /Unknown command 'OBJECT'/);
+});
+
 test("treats command names case-insensitively", () => {
   assert.deepEqual(messages("get foo"), []);
   const setDiag = buildRedisSyntaxDiagnostics("Set a b");
@@ -142,5 +160,20 @@ test("tokenizeRedisLine handles backslash escapes", () => {
   assert.deepEqual(
     argv.map((t) => t.value),
     ["SET", "k", "a b"],
+  );
+});
+
+test("tokenizeRedisLine follows Redis escapes and quotes anywhere in an argument", () => {
+  const { argv } = tokenizeRedisLine('SET pre" has space"post line\\nnext;');
+  assert.deepEqual(
+    argv.map((token) => token.value),
+    ["SET", "pre has spacepost", "line\nnext"],
+  );
+});
+
+test("tokenizeRedisLine preserves empty quoted arguments", () => {
+  assert.deepEqual(
+    tokenizeRedisLine('SET "" ""').argv.map((token) => token.value),
+    ["SET", "", ""],
   );
 });

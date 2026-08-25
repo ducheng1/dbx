@@ -62,8 +62,11 @@ where
     }
 
     pub fn emit(&mut self, progress: SqlFileProgress) {
-        if sql_file_progress_is_immediate(progress.status) {
-            // Preserve ordering and final counters before terminal or failure events.
+        if sql_file_progress_is_immediate(progress.status) || progress.file_index.is_some() {
+            // Preserve ordering and final counters before terminal or failure
+            // events.  File-boundary events (file_index is Some) are also
+            // emitted immediately so rapid multi-file runs don't lose per-file
+            // summaries through throttling.
             self.flush_pending();
             (self.emit)(progress);
             return;
@@ -355,50 +358,106 @@ pub async fn execute_sql_file_path(
     file_path: &Path,
     token: CancellationToken,
     started_at: Instant,
+    emit: impl FnMut(SqlFileProgress),
+) -> Result<(), String> {
+    execute_sql_file_paths(state, request, &[file_path], token, started_at, emit).await
+}
+
+/// Executes multiple SQL files as one import operation. MySQL-family imports
+/// deliberately reuse one pinned connection across every file, so session
+/// state such as `USE`, temporary tables, variables, and transactions remains
+/// available to the next file in the batch.
+pub async fn execute_sql_file_paths(
+    state: &AppState,
+    request: &SqlFileRequest,
+    file_paths: &[&Path],
+    token: CancellationToken,
+    started_at: Instant,
     mut emit: impl FnMut(SqlFileProgress),
 ) -> Result<(), String> {
+    if file_paths.is_empty() {
+        let error = "No SQL files selected".to_string();
+        emit(sql_file_error_progress(&request.execution_id, started_at, error.clone()));
+        return Err(error);
+    }
+
     let import_target = sql_file_import_target(state, &request.connection_id).await;
     let options =
         import_target.as_ref().map(|target| SqlParsingOptions::for_database_type(target.db_type)).unwrap_or_default();
-    let mut splitter = StreamingSqlFileSplitter::new(import_target.as_ref().map(|target| target.db_type), options);
-    let mut mysql_executor = MySqlSqlFileExecutor::build(state, request, import_target.as_ref()).await?;
+    let database_type = import_target.as_ref().map(|target| target.db_type);
     let mut progress = SqlFileExecutionProgress::new();
-    let mut pending_statements = Vec::with_capacity(SQL_FILE_STATEMENT_BATCH_SIZE);
-    let mut decoder = match SqlFileStreamDecoder::open(file_path).await {
-        Ok(decoder) => decoder,
+    let mut mysql_executor = match MySqlSqlFileExecutor::build(state, request, import_target.as_ref()).await {
+        Ok(executor) => executor,
         Err(error) => {
-            emit(sql_file_error_progress(&request.execution_id, started_at, error.clone()));
+            emit(sql_file_execution_error_progress(&request.execution_id, started_at, &progress, error.clone()));
             return Err(error);
         }
     };
+    let file_count = file_paths.len();
+    let mut prev_statement_index = 0usize;
+    let mut prev_success_count = 0usize;
+    let mut prev_failure_count = 0usize;
+    let mut prev_affected_rows = 0u64;
+    for (file_index, file_path) in file_paths.iter().enumerate() {
+        let file_name = file_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
-    loop {
-        let chunk = match decoder.next_chunk().await {
-            Ok(chunk) => chunk,
+        // Emit a file-boundary progress event so the frontend knows which file is
+        // currently executing and can display a "File N/M" indicator.
+        if file_count > 1 {
+            emit(SqlFileProgress {
+                execution_id: request.execution_id.clone(),
+                status: SqlFileStatus::Running,
+                statement_index: progress.statement_index,
+                success_count: progress.success_count,
+                failure_count: progress.failure_count,
+                affected_rows: progress.affected_rows,
+                elapsed_ms: started_at.elapsed().as_millis(),
+                statement_summary: String::new(),
+                error: None,
+                file_index: Some(file_index),
+                file_name: Some(file_name.clone()),
+            });
+        }
+
+        let mut splitter = StreamingSqlFileSplitter::new(database_type, options);
+        let mut pending_statements = Vec::with_capacity(SQL_FILE_STATEMENT_BATCH_SIZE);
+        let mut decoder = match SqlFileStreamDecoder::open(file_path).await {
+            Ok(decoder) => decoder,
             Err(error) => {
-                emit(sql_file_progress(
-                    &request.execution_id,
-                    SqlFileStatus::Error,
-                    progress.statement_index,
-                    progress.success_count,
-                    progress.failure_count,
-                    progress.affected_rows,
-                    started_at,
-                    "",
-                    Some(error.clone()),
-                ));
+                emit(sql_file_execution_error_progress(&request.execution_id, started_at, &progress, error.clone()));
                 return Err(error);
             }
         };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        if token.is_cancelled() {
-            emit_sql_file_terminal_progress(request, &token, started_at, &progress, &mut emit);
-            return Ok(());
-        }
-        pending_statements.extend(splitter.push_chunk(&chunk));
-        if pending_statements.len() >= SQL_FILE_STATEMENT_BATCH_SIZE {
+
+        loop {
+            let chunk = match decoder.next_chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    emit(sql_file_progress(
+                        &request.execution_id,
+                        SqlFileStatus::Error,
+                        progress.statement_index,
+                        progress.success_count,
+                        progress.failure_count,
+                        progress.affected_rows,
+                        started_at,
+                        "",
+                        Some(error.clone()),
+                    ));
+                    return Err(error);
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if token.is_cancelled() {
+                emit_sql_file_terminal_progress(request, &token, started_at, &progress, &mut emit);
+                return Ok(());
+            }
+            pending_statements.extend(splitter.push_chunk(&chunk));
+            if pending_statements.len() < SQL_FILE_STATEMENT_BATCH_SIZE {
+                continue;
+            }
             execute_sql_file_statement_batch(
                 state,
                 request,
@@ -412,21 +471,43 @@ pub async fn execute_sql_file_path(
             )
             .await?;
         }
-    }
 
-    pending_statements.extend(splitter.finish());
-    execute_sql_file_statement_batch(
-        state,
-        request,
-        &token,
-        started_at,
-        &mut pending_statements,
-        import_target.as_ref(),
-        mysql_executor.as_mut(),
-        &mut progress,
-        &mut emit,
-    )
-    .await?;
+        pending_statements.extend(splitter.finish());
+        execute_sql_file_statement_batch(
+            state,
+            request,
+            &token,
+            started_at,
+            &mut pending_statements,
+            import_target.as_ref(),
+            mysql_executor.as_mut(),
+            &mut progress,
+            &mut emit,
+        )
+        .await?;
+
+        // After each file, emit a per-file summary with diff-based counters so
+        // the frontend can build a per-file breakdown table.
+        if file_count > 1 {
+            emit(SqlFileProgress {
+                execution_id: request.execution_id.clone(),
+                status: SqlFileStatus::StatementDone,
+                statement_index: progress.statement_index - prev_statement_index,
+                success_count: progress.success_count - prev_success_count,
+                failure_count: progress.failure_count - prev_failure_count,
+                affected_rows: progress.affected_rows - prev_affected_rows,
+                elapsed_ms: started_at.elapsed().as_millis(),
+                statement_summary: String::new(),
+                error: None,
+                file_index: Some(file_index),
+                file_name: Some(file_name),
+            });
+            prev_statement_index = progress.statement_index;
+            prev_success_count = progress.success_count;
+            prev_failure_count = progress.failure_count;
+            prev_affected_rows = progress.affected_rows;
+        }
+    }
     emit_sql_file_terminal_progress(request, &token, started_at, &progress, &mut emit);
     Ok(())
 }
@@ -722,11 +803,32 @@ pub fn sql_file_progress(
         elapsed_ms: started_at.elapsed().as_millis(),
         statement_summary: statement_summary.to_string(),
         error,
+        file_index: None,
+        file_name: None,
     }
 }
 
 pub fn sql_file_error_progress(execution_id: &str, started_at: Instant, error: String) -> SqlFileProgress {
     sql_file_progress(execution_id, SqlFileStatus::Error, 0, 0, 0, 0, started_at, "", Some(error))
+}
+
+fn sql_file_execution_error_progress(
+    execution_id: &str,
+    started_at: Instant,
+    progress: &SqlFileExecutionProgress,
+    error: String,
+) -> SqlFileProgress {
+    sql_file_progress(
+        execution_id,
+        SqlFileStatus::Error,
+        progress.statement_index,
+        progress.success_count,
+        progress.failure_count,
+        progress.affected_rows,
+        started_at,
+        "",
+        Some(error),
+    )
 }
 
 async fn sql_file_import_target(state: &AppState, connection_id: &str) -> Option<SqlFileImportTarget> {
@@ -736,7 +838,13 @@ async fn sql_file_import_target(state: &AppState, connection_id: &str) -> Option
         .map(|config| SqlFileImportTarget { db_type: config.db_type, driver_profile: config.driver_profile.clone() })
 }
 
-pub fn mysql_like_sql_file_can_execute_without_selected_database(file_content: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MysqlLikeSqlFileBootstrapAnalysis {
+    pub can_execute_without_selected_database: bool,
+    pub establishes_database_context: bool,
+}
+
+pub fn mysql_like_sql_file_bootstrap_analysis(file_content: &str) -> MysqlLikeSqlFileBootstrapAnalysis {
     let options = SqlParsingOptions::mysql_compatible();
     let mut splitter = SqlStatementSplitter::with_options(options);
     let mut statements = splitter.push_chunk(file_content);
@@ -759,7 +867,10 @@ pub fn mysql_like_sql_file_can_execute_without_selected_database(file_content: &
         // run before the script establishes its own database context.
         saw_statement = true;
         let Some((keyword, remainder)) = leading_sql_keyword(statement) else {
-            return false;
+            return MysqlLikeSqlFileBootstrapAnalysis {
+                can_execute_without_selected_database: false,
+                establishes_database_context: has_database_context,
+            };
         };
 
         if keyword.eq_ignore_ascii_case("SET") {
@@ -785,11 +896,21 @@ pub fn mysql_like_sql_file_can_execute_without_selected_database(file_content: &
         }
 
         if !has_database_context {
-            return false;
+            return MysqlLikeSqlFileBootstrapAnalysis {
+                can_execute_without_selected_database: false,
+                establishes_database_context: false,
+            };
         }
     }
 
-    saw_statement
+    MysqlLikeSqlFileBootstrapAnalysis {
+        can_execute_without_selected_database: saw_statement,
+        establishes_database_context: has_database_context,
+    }
+}
+
+pub fn mysql_like_sql_file_can_execute_without_selected_database(file_content: &str) -> bool {
+    mysql_like_sql_file_bootstrap_analysis(file_content).can_execute_without_selected_database
 }
 
 fn mysql_use_database_target(sql: &str) -> Option<String> {
@@ -1346,6 +1467,21 @@ mod tests {
             elapsed_ms: statement_index as u128,
             statement_summary: format!("statement {statement_index}"),
             error: None,
+            file_index: None,
+            file_name: None,
+        }
+    }
+
+    fn test_file_progress(
+        status: SqlFileStatus,
+        statement_index: usize,
+        file_index: usize,
+        file_name: &str,
+    ) -> SqlFileProgress {
+        SqlFileProgress {
+            file_index: Some(file_index),
+            file_name: Some(file_name.to_string()),
+            ..test_progress(status, statement_index)
         }
     }
 
@@ -1524,6 +1660,22 @@ mod tests {
     }
 
     #[test]
+    fn postgres_pg_dump_guards_are_removed_from_import_plan() {
+        let statements = split_sql_file_import_statements(
+            "-- PostgreSQL database dump\n\n\\restrict Guard123\n\nSET statement_timeout = 0;\nSELECT 1;\n\n-- PostgreSQL database dump complete\n\n\\unrestrict Guard123",
+            Some(DatabaseType::Postgres),
+        );
+        let planned = optimize_sql_file_import_statements(&statements, Some(DatabaseType::Postgres), None);
+
+        assert_eq!(planned.len(), 3);
+        assert_eq!(planned[0].kind, SqlFileImportStatementKind::Execute);
+        assert!(!planned[0].sql.contains("\\restrict"));
+        assert!(planned[0].sql.contains("SET statement_timeout = 0"));
+        assert_eq!(planned[1].sql, "SELECT 1");
+        assert_eq!(planned[2].kind, SqlFileImportStatementKind::Skip);
+    }
+
+    #[test]
     fn stop_on_error_returns_err_with_terminal_error_progress() {
         let decision = statement_error_decision(
             "exec-1",
@@ -1636,6 +1788,46 @@ mod tests {
     }
 
     #[test]
+    fn mysql_like_sql_file_bootstrap_analysis_tracks_context_for_following_files() {
+        assert_eq!(
+            mysql_like_sql_file_bootstrap_analysis("SHOW DATABASES;"),
+            MysqlLikeSqlFileBootstrapAnalysis {
+                can_execute_without_selected_database: true,
+                establishes_database_context: false,
+            }
+        );
+        assert_eq!(
+            mysql_like_sql_file_bootstrap_analysis("CREATE DATABASE app_db;\nUSE app_db;\nCREATE TABLE users(id INT);"),
+            MysqlLikeSqlFileBootstrapAnalysis {
+                can_execute_without_selected_database: true,
+                establishes_database_context: true,
+            }
+        );
+        assert_eq!(
+            mysql_like_sql_file_bootstrap_analysis("CREATE TABLE users(id INT);"),
+            MysqlLikeSqlFileBootstrapAnalysis {
+                can_execute_without_selected_database: false,
+                establishes_database_context: false,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_error_progress_preserves_cumulative_counters() {
+        let progress =
+            SqlFileExecutionProgress { statement_index: 4, success_count: 3, failure_count: 1, affected_rows: 9 };
+
+        let terminal =
+            sql_file_execution_error_progress("exec-1", Instant::now(), &progress, "file missing".to_string());
+
+        assert_eq!(terminal.status, SqlFileStatus::Error);
+        assert_eq!(terminal.statement_index, 4);
+        assert_eq!(terminal.success_count, 3);
+        assert_eq!(terminal.failure_count, 1);
+        assert_eq!(terminal.affected_rows, 9);
+    }
+
+    #[test]
     fn parses_mysql_use_database_targets() {
         assert_eq!(mysql_use_database_target("USE app_db"), Some("app_db".to_string()));
         assert_eq!(mysql_use_database_target(" use `app-db` ; "), Some("app-db".to_string()));
@@ -1650,5 +1842,52 @@ mod tests {
         assert_eq!(mysql_use_database_target("SELECT 1"), None);
         assert_eq!(mysql_use_database_target("USE"), None);
         assert_eq!(mysql_use_database_target("USE app_db SELECT 1"), None);
+    }
+
+    #[test]
+    fn file_boundary_events_bypass_throttling_and_retain_order() {
+        // Regression: rapid multi-file runs must not lose per-file boundary
+        // events through the progress emitter's 100 ms throttle window.
+        let base = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut emitted = Vec::new();
+        {
+            let mut emitter =
+                SqlFileProgressEmitter::with_clock(|progress| emitted.push(progress), || base + elapsed.get());
+
+            // Simulate two small files executing within the same throttle window.
+            for statement_index in 1..=3 {
+                emitter.emit(test_progress(SqlFileStatus::StatementDone, statement_index));
+            }
+            // File 0 start + done.
+            emitter.emit(test_file_progress(SqlFileStatus::Running, 3, 0, "a.sql"));
+            emitter.emit(test_file_progress(SqlFileStatus::StatementDone, 3, 0, "a.sql"));
+
+            for statement_index in 4..=6 {
+                emitter.emit(test_progress(SqlFileStatus::StatementDone, statement_index));
+            }
+            // File 1 start + done — still within the same throttle window.
+            emitter.emit(test_file_progress(SqlFileStatus::Running, 6, 1, "b.sql"));
+            emitter.emit(test_file_progress(SqlFileStatus::StatementDone, 6, 1, "b.sql"));
+
+            emitter.emit(test_progress(SqlFileStatus::Done, 6));
+        }
+
+        let file_boundary_events: Vec<_> = emitted
+            .iter()
+            .filter(|p| p.file_index.is_some())
+            .map(|p| (p.status, p.file_index, p.file_name.clone()))
+            .collect();
+        assert_eq!(
+            file_boundary_events,
+            vec![
+                (SqlFileStatus::Running, Some(0), Some("a.sql".to_string())),
+                (SqlFileStatus::StatementDone, Some(0), Some("a.sql".to_string())),
+                (SqlFileStatus::Running, Some(1), Some("b.sql".to_string())),
+                (SqlFileStatus::StatementDone, Some(1), Some("b.sql".to_string())),
+            ],
+            "file-boundary events must be emitted immediately, in order, without being dropped by throttling"
+        );
+        assert_eq!(emitted.last().unwrap().status, SqlFileStatus::Done);
     }
 }

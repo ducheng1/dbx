@@ -1,5 +1,5 @@
 use crate::agent_events::AgentEvent;
-use crate::ai::{AiConfig, AiEffortLevel, AiModelInfo, AiTestConnectionResult};
+use crate::ai::{AiCapabilitySource, AiConfig, AiEffortCapability, AiEffortLevel, AiModelInfo, AiTestConnectionResult};
 use crate::ai_cli_agent::{
     build_cli_agent_prompt, cli_command, dbx_mcp_enabled_tools, dbx_mcp_scope_env, model_infos, parse_cli_jsonl_event,
     run_cli_jsonl_agent, CliAgentCommandSpec, CliAgentJsonlDialect, CliAgentProcessSpec, CliAgentRunOptions,
@@ -31,6 +31,13 @@ impl ClaudeCodeIsolatedCwd {
             format!("[claudeCodeRunFailed] Failed to create isolated Claude Code directory: {error}")
         })?;
         Ok(Self { path })
+    }
+
+    fn write_mcp_config(&self, config: &str) -> Result<PathBuf, String> {
+        let path = self.path.join("mcp.json");
+        std::fs::write(&path, config)
+            .map_err(|error| format!("[claudeCodeRunFailed] Failed to write temporary MCP configuration: {error}"))?;
+        Ok(path)
     }
 }
 
@@ -243,6 +250,14 @@ pub fn build_claude_code_command(
     _prompt: &str,
     options: &ClaudeCodeRunOptions,
 ) -> ClaudeCodeCommandSpec {
+    build_claude_code_command_with_mcp_arg(config, options, claude_code_mcp_config(options))
+}
+
+fn build_claude_code_command_with_mcp_arg(
+    config: &AiConfig,
+    options: &ClaudeCodeRunOptions,
+    mcp_config_arg: String,
+) -> ClaudeCodeCommandSpec {
     let enabled_tools = claude_code_enabled_tools(options.agent_mode);
     let mut args = vec![
         "--print".to_string(),
@@ -255,7 +270,7 @@ pub fn build_claude_code_command(
         "--permission-mode".to_string(),
         "dontAsk".to_string(),
         "--mcp-config".to_string(),
-        claude_code_mcp_config(options),
+        mcp_config_arg,
         "--strict-mcp-config".to_string(),
     ];
     append_claude_code_isolation_args(&mut args);
@@ -269,9 +284,13 @@ pub fn build_claude_code_command(
         args.push("--model".to_string());
         args.push(model.to_string());
     }
-    if let Some(effort) = config.reasoning_level.as_claude_code_effort() {
+    let effort = match config.runtime_effort.as_ref() {
+        Some(effort) => effort.cli_value(),
+        None => config.reasoning_level.as_claude_code_effort().map(ToString::to_string),
+    };
+    if let Some(effort) = effort {
         args.push("--effort".to_string());
-        args.push(effort.to_string());
+        args.push(effort);
     }
 
     ClaudeCodeCommandSpec { program: claude_code_program(config), args }
@@ -372,7 +391,17 @@ fn parse_claude_code_models(stdout: &str) -> Option<Vec<AiModelInfo>> {
                 .filter(|name| !name.is_empty())
                 .map(ToString::to_string);
             let mut info = AiModelInfo::new(id, display_name);
-            info.supported_effort_levels = parse_claude_code_effort_levels(model);
+            let effort_levels = parse_claude_code_effort_level_strings(model);
+            info.supported_effort_levels =
+                effort_levels.iter().filter_map(|level| level.parse::<AiEffortLevel>().ok()).collect();
+            info.effort_capability =
+                if model.get("supportsEffort").or_else(|| model.get("supports_effort")).and_then(Value::as_bool)
+                    == Some(false)
+                {
+                    Some(AiEffortCapability::Unsupported)
+                } else {
+                    crate::ai_effort::dynamic_enum_capability(effort_levels, AiCapabilitySource::LocalCli)
+                };
             result.push(info);
         }
 
@@ -388,7 +417,7 @@ fn parse_claude_code_models(stdout: &str) -> Option<Vec<AiModelInfo>> {
     None
 }
 
-fn parse_claude_code_effort_levels(model: &Value) -> Vec<AiEffortLevel> {
+fn parse_claude_code_effort_level_strings(model: &Value) -> Vec<String> {
     if model.get("supportsEffort").or_else(|| model.get("supports_effort")).and_then(Value::as_bool) == Some(false) {
         return Vec::new();
     }
@@ -402,8 +431,10 @@ fn parse_claude_code_effort_levels(model: &Value) -> Vec<AiEffortLevel> {
     levels
         .iter()
         .filter_map(Value::as_str)
-        .filter_map(|level| level.parse::<AiEffortLevel>().ok())
-        .filter(|level| seen.insert(*level))
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+        .filter(|level| seen.insert((*level).to_string()))
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -438,12 +469,11 @@ pub async fn test_claude_code_connection(config: &AiConfig) -> Result<AiTestConn
 
 fn classify_claude_code_spawn_error(message: &str) -> String {
     if message.contains("No such file") || message.contains("not found") {
-        "[claudeCodeNotInstalled] Claude Code CLI was not found. Install Claude Code or set the Claude Code CLI path in DBX AI settings."
-            .to_string()
+        format!("[claudeCodeNotInstalled] {message}")
     } else if is_command_line_too_long_error(message) {
-        "[claudeCodeCommandLineTooLong] Claude Code CLI command line is too long.".to_string()
+        format!("[claudeCodeCommandLineTooLong] {message}")
     } else {
-        format!("[claudeCodeRunFailed] Failed to start Claude Code CLI: {message}")
+        format!("[claudeCodeRunFailed] {message}")
     }
 }
 
@@ -457,16 +487,19 @@ fn is_command_line_too_long_error(message: &str) -> bool {
 
 fn classify_claude_code_run_error(stderr: &str) -> String {
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains("not authenticated") || lower.contains("login") || lower.contains("auth") {
-        format!(
-            "[claudeCodeNotAuthenticated] Claude Code CLI is not authenticated. Run `claude auth login` and try again. {stderr}"
-        )
+    if lower.contains("invalid mcp configuration") || lower.contains("mcp config file not found") {
+        format!("[claudeCodeMcpConfigInvalid] {stderr}")
+    } else if lower.contains("not authenticated")
+        || lower.contains("authentication required")
+        || lower.contains("please login")
+    {
+        format!("[claudeCodeNotAuthenticated] {stderr}")
     } else if lower.contains("dbx-mcp-server") || lower.contains("enoent") {
-        format!("[dbxMcpMissing] DBX MCP server was not found. Install @dbx-app/mcp-server and try again. {stderr}")
+        format!("[dbxMcpMissing] {stderr}")
     } else if lower.contains("mcp") && (lower.contains("dbx") || lower.contains("server")) {
-        format!("[claudeCodeMcpStartupFailed] Claude Code could not start the DBX MCP server. {stderr}")
+        format!("[claudeCodeMcpStartupFailed] {stderr}")
     } else {
-        format!("[claudeCodeRunFailed] Claude Code CLI failed. {stderr}")
+        format!("[claudeCodeRunFailed] {stderr}")
     }
 }
 
@@ -482,14 +515,17 @@ pub async fn run_claude_code_agent(
     on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<String, String> {
     let program = validate_claude_code_program(config)?;
-    let mut command = build_claude_code_command(config, prompt, &options);
+    let isolated_cwd = ClaudeCodeIsolatedCwd::create()?;
+    let mcp_config_path = isolated_cwd.write_mcp_config(&claude_code_mcp_config(&options))?;
+    let mut command =
+        build_claude_code_command_with_mcp_arg(config, &options, mcp_config_path.to_string_lossy().to_string());
     command.program = program;
     let env = claude_code_process_env(config, &command)?;
-    let isolated_cwd = ClaudeCodeIsolatedCwd::create()?;
     let result = run_cli_jsonl_agent(
         CliAgentProcessSpec {
             command,
             env,
+            env_remove: Vec::new(),
             current_dir: Some(isolated_cwd.path.clone()),
             stdin: Some(prompt.to_string()),
             dialect: CliAgentJsonlDialect::ClaudeCodePrint,
@@ -506,13 +542,17 @@ pub async fn run_claude_code_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_claude_code_command, claude_code_cli_env, claude_code_enabled_tools, parse_claude_code_jsonl_event,
-        parse_claude_code_models, validate_claude_code_program, ClaudeCodeRunOptions, DEFAULT_CLAUDE_CODE_MODELS,
+        build_claude_code_command, classify_claude_code_run_error, claude_code_cli_env, claude_code_enabled_tools,
+        parse_claude_code_jsonl_event, parse_claude_code_models, validate_claude_code_program, ClaudeCodeRunOptions,
+        DEFAULT_CLAUDE_CODE_MODELS,
     };
     #[cfg(unix)]
     use super::{list_claude_code_models, run_claude_code_agent};
     use crate::agent_events::AgentEvent;
-    use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiEffortLevel, AiModelInfo, AiProvider, AiReasoningLevel};
+    use crate::ai::{
+        AiApiStyle, AiAuthMethod, AiConfig, AiEffortCapability, AiEffortLevel, AiEffortSelection, AiProvider,
+        AiReasoningLevel,
+    };
     use crate::ai_cli_agent::{model_infos, CliAgentCommandSpec};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -532,11 +572,25 @@ mod tests {
             proxy_url: String::new(),
             enable_thinking: true,
             reasoning_level: AiReasoningLevel::Default,
+            runtime_effort: None,
             context_window: None,
+            max_retries: None,
             codex_cli_path: None,
             codex_cli_env: Default::default(),
             claude_code_cli_path: None,
             claude_code_cli_env: Default::default(),
+            pi_agent_cli_path: None,
+            pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
+            qoder_cli_path: None,
+            qoder_cli_env: Default::default(),
         }
     }
 
@@ -545,9 +599,11 @@ mod tests {
             connection_id: "conn-1".to_string(),
             connection_name: "local".to_string(),
             database: "demo".to_string(),
+            schema: None,
             agent_mode: true,
             allow_writes: false,
             allow_dangerous: false,
+            confirmed_write_sql: None,
             mcp_server_command: None,
         }
     }
@@ -584,10 +640,13 @@ mod tests {
             &executable,
             r#"#!/bin/sh
 user_settings=false
+mcp_config=""
 previous=""
 for arg in "$@"; do
   if [ "$previous" = "--setting-sources" ] && [ "$arg" = "user" ]; then
     user_settings=true
+  elif [ "$previous" = "--mcp-config" ]; then
+    mcp_config="$arg"
   fi
   previous="$arg"
 done
@@ -603,6 +662,10 @@ case " $* " in
     printf '%s\n' '{"type":"control_response","response":{"response":{"models":[{"value":"claude-user-model","displayName":"User Model"}]}}}'
     ;;
   *)
+    if [ ! -f "$mcp_config" ] || ! grep -q '"mcpServers"' "$mcp_config"; then
+      printf '%s\n' 'invalid MCP configuration' >&2
+      exit 10
+    fi
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"isolated execution"}]}}'
     printf '%s\n' '{"type":"result","subtype":"success"}'
     ;;
@@ -665,7 +728,7 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn execution_uses_user_settings_from_an_isolated_directory() {
+    async fn execution_uses_user_settings_and_temporary_mcp_config_from_an_isolated_directory() {
         let (config, project_dir, hook_marker) = isolated_cli_test_config();
 
         let output = run_claude_code_agent(&config, "hello", run_options(), &Notify::new(), |_| {}).await.unwrap();
@@ -709,6 +772,21 @@ esac
     }
 
     #[test]
+    fn runtime_effort_takes_priority_over_legacy_reasoning_level() {
+        let mut config = claude_code_config("sonnet");
+        config.reasoning_level = AiReasoningLevel::Xhigh;
+        config.runtime_effort = Some(AiEffortSelection::ProviderDefault);
+
+        let spec = build_claude_code_command(&config, "hello", &run_options());
+        assert!(!spec.args.contains(&"--effort".to_string()));
+
+        config.runtime_effort = Some(AiEffortSelection::Enum("future".to_string()));
+        let spec = build_claude_code_command(&config, "hello", &run_options());
+        let effort_pos = spec.args.iter().position(|arg| arg == "--effort").unwrap();
+        assert_eq!(spec.args[effort_pos + 1], "future");
+    }
+
+    #[test]
     fn default_model_list_matches_supported_aliases() {
         assert_eq!(model_infos(DEFAULT_CLAUDE_CODE_MODELS), model_infos(&["default", "sonnet", "opus", "fable"]));
     }
@@ -727,21 +805,21 @@ esac
         let models = parse_claude_code_models(stdout).unwrap();
 
         assert_eq!(
-            models,
-            vec![
-                AiModelInfo::new("default", Some("Default".to_string())),
-                AiModelInfo {
-                    id: "claude-sonnet-4-6".to_string(),
-                    display_name: Some("Sonnet 4.6".to_string()),
-                    supported_effort_levels: vec![
-                        AiEffortLevel::Low,
-                        AiEffortLevel::Medium,
-                        AiEffortLevel::High,
-                        AiEffortLevel::Max
-                    ],
-                },
-                AiModelInfo::new("claude-opus-4-8", Some("Opus 4.8".to_string())),
-            ]
+            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            ["default", "claude-sonnet-4-6", "claude-opus-4-8"]
+        );
+        let sonnet = &models[1];
+        assert_eq!(sonnet.display_name.as_deref(), Some("Sonnet 4.6"));
+        assert_eq!(
+            sonnet.supported_effort_levels,
+            [AiEffortLevel::Low, AiEffortLevel::Medium, AiEffortLevel::High, AiEffortLevel::Max]
+        );
+        let AiEffortCapability::Enum { options, .. } = sonnet.effort_capability.as_ref().unwrap() else {
+            panic!("expected effort enum");
+        };
+        assert_eq!(
+            options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>(),
+            ["low", "medium", "high", "max", "future"]
         );
     }
 
@@ -760,6 +838,26 @@ esac
         let stdout = r#"{"type":"control_response","response":{"subtype":"success","response":{"commands":[]}}}"#;
 
         assert!(parse_claude_code_models(stdout).is_none());
+    }
+
+    #[test]
+    fn invalid_mcp_config_is_not_reported_as_a_missing_server_package() {
+        let error = classify_claude_code_run_error(
+            r#"Invalid MCP configuration: MCP config file not found: C:\Temp\{mcpServers:{dbx:{args:[C:\node_modules\@dbx-app\mcp-server\bin\dbx-mcp-server.js]}}}"#,
+        );
+
+        assert!(error.starts_with("[claudeCodeMcpConfigInvalid]"));
+        assert!(!error.contains("[dbxMcpMissing]"));
+    }
+
+    #[test]
+    fn invalid_mcp_config_path_containing_auth_is_not_reported_as_authentication_failure() {
+        let error = classify_claude_code_run_error(
+            r#"Invalid MCP configuration: MCP config file not found: C:\Users\auth-test\AppData\Local\Temp\dbx\mcp.json"#,
+        );
+
+        assert!(error.starts_with("[claudeCodeMcpConfigInvalid]"));
+        assert!(!error.contains("[claudeCodeNotAuthenticated]"));
     }
 
     #[test]

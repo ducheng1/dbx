@@ -143,6 +143,11 @@ impl PulsarApiProfile {
                 supports_message_query: false,
                 supports_dlq: false,
                 supports_message_trace: false,
+                supports_exchanges: false,
+                supports_client_connections: false,
+                supports_user_permissions: false,
+                supports_policies: false,
+                supports_cluster_monitoring: false,
             },
         }
     }
@@ -348,6 +353,7 @@ impl PulsarApiProfile {
             msg_out_counter: i64_of("msgOutCounter"),
             subscription_count,
             producer_count,
+            rates_unavailable: false,
             raw: raw.clone(),
         }
     }

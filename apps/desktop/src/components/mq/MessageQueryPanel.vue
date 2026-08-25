@@ -7,6 +7,7 @@ import { formatRocketMqMessagePayload, formatRocketMqTimestamp, parseRocketMqMes
 import { formatError } from "@/lib/backend/errorUtils";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildRocketMqTraceTopicOptions, DEFAULT_ROCKETMQ_TRACE_TOPIC, resolveRocketMqMessageType } from "@/lib/mq/rocketmqTopicTypes";
+import { useMqMutationGuard } from "@/composables/useMqMutationGuard";
 import RocketMqTraceDetailDialog from "./RocketMqTraceDetailDialog.vue";
 import RocketMqTopicSelect from "./shared/RocketMqTopicSelect.vue";
 import RocketMqMessageDetailDialog from "./shared/RocketMqMessageDetailDialog.vue";
@@ -25,6 +26,7 @@ interface Props {
 
 const props = defineProps<Props>();
 const { t } = useI18n();
+const { confirmMqWrite } = useMqMutationGuard(() => props.connectionId);
 
 const topicSelectRef = ref<InstanceType<typeof RocketMqTopicSelect>>();
 const availableTopics = ref<TopicInfo[]>([]);
@@ -151,27 +153,33 @@ async function runQuery() {
       } else {
         const group = consumerGroup.value.trim() || "__dbx_rocketmq_dlq__";
         const peeked = await mqPeekMessages(props.connectionId, topic, group, 64);
-        queryMessages.value = peeked.map((msg) => rocketMqDisplayFromPeeked(msg, topic.topic));
+        const messages = Array.isArray(peeked) ? peeked : peeked.messages;
+        queryMessages.value = messages.map((msg) => rocketMqDisplayFromPeeked(msg, topic.topic));
       }
     } else if (activeQueryMode.value === "msgId") {
       const id = queryMsgId.value.trim();
       if (!id) throw new Error(t("mqMessages.msgIdRequired"));
       const result = await mqViewMessage(props.connectionId, topic, id);
       queryMessages.value = parseRocketMqMessagesFromResult(result);
+    } else if (activeQueryMode.value === "key") {
+      const key = queryKey.value.trim();
+      if (!key) throw new Error(t("mqMessages.queryKeyRequired"));
+      // Dashboard key query only needs topic + key; broker returns up to 64 recent matches.
+      // Do not validate hidden Topic-mode time fields — Key uses a fixed 0..now window.
+      const result = await mqQueryMessagesByKey(props.connectionId, topic, key, 0, Date.now(), 64);
+      queryMessages.value = parseRocketMqMessagesFromResult(result);
     } else {
-      const begin = queryBeginTime.value ? Date.parse(queryBeginTime.value) : 0;
-      const end = queryEndTime.value ? Date.parse(queryEndTime.value) : Date.now();
-      const maxNum = Math.max(1, Math.min(200, Number(queryMaxNum.value) || 32));
-      if (activeQueryMode.value === "key") {
-        const key = queryKey.value.trim();
-        if (!key) throw new Error(t("mqMessages.queryKeyRequired"));
-        // Dashboard key query only needs topic + key; broker returns up to 64 recent matches.
-        const result = await mqQueryMessagesByKey(props.connectionId, topic, key, 0, Date.now(), 64);
-        queryMessages.value = parseRocketMqMessagesFromResult(result);
-      } else {
-        const result = await mqQueryMessagesByTopic(props.connectionId, topic, begin, end, maxNum);
-        queryMessages.value = parseRocketMqMessagesFromResult(result);
+      const begin = queryBeginTime.value ? Date.parse(queryBeginTime.value) : Date.parse(defaultTimeRange().begin);
+      const end = queryEndTime.value ? Date.parse(queryEndTime.value) : Date.parse(defaultTimeRange().end);
+      if (!Number.isFinite(begin) || !Number.isFinite(end)) {
+        throw new Error(t("mqMessages.invalidTimeRange"));
       }
+      if (begin >= end) {
+        throw new Error(t("mqMessages.endTimeMustBeAfterBegin"));
+      }
+      const maxNum = Math.max(1, Math.min(200, Number(queryMaxNum.value) || 32));
+      const result = await mqQueryMessagesByTopic(props.connectionId, topic, begin, end, maxNum);
+      queryMessages.value = parseRocketMqMessagesFromResult(result);
     }
   } catch (e: unknown) {
     queryError.value = formatError(e);
@@ -252,6 +260,7 @@ async function resendMessage() {
     resendError.value = t("mqMessages.readOnlyCannotSend");
     return;
   }
+  if (!(await confirmMqWrite(t("mqMessages.resendMessage")))) return;
   const topic = resendTopic.value;
   const payloadText = detailPayload.value.trim();
   if (!topic) {
@@ -268,7 +277,7 @@ async function resendMessage() {
   resendSuccess.value = undefined;
   try {
     const message = selectedMessage.value;
-    const headers: Record<string, string> = { ...(message?.headers ?? {}) };
+    const headers: Record<string, string> = { ...message?.headers };
     if (isRocketMqCluster.value && message?.tag?.trim()) {
       headers.TAGS = message.tag.trim();
     }
@@ -401,20 +410,22 @@ watch(topicName, () => {
           <input v-model="queryKey" type="text" :placeholder="t('mqMessages.queryKeyPlaceholder')" :disabled="queryLoading" />
         </label>
 
-        <label v-else-if="activeQueryMode === 'topic'" class="filter-field">
-          <span>{{ t("mqMessages.beginTime") }}</span>
-          <input v-model="queryBeginTime" type="datetime-local" :disabled="queryLoading" />
-        </label>
+        <template v-else-if="activeQueryMode === 'topic'">
+          <label class="filter-field">
+            <span>{{ t("mqMessages.beginTime") }}</span>
+            <input v-model="queryBeginTime" type="datetime-local" :disabled="queryLoading" />
+          </label>
 
-        <label v-else-if="activeQueryMode === 'topic'" class="filter-field">
-          <span>{{ t("mqMessages.endTime") }}</span>
-          <input v-model="queryEndTime" type="datetime-local" :disabled="queryLoading" />
-        </label>
+          <label class="filter-field">
+            <span>{{ t("mqMessages.endTime") }}</span>
+            <input v-model="queryEndTime" type="datetime-local" :disabled="queryLoading" />
+          </label>
 
-        <label v-else-if="activeQueryMode === 'topic'" class="filter-field filter-narrow">
-          <span>{{ t("mqMessages.maxNum") }}</span>
-          <input v-model.number="queryMaxNum" type="number" min="1" max="200" :disabled="queryLoading" />
-        </label>
+          <label class="filter-field filter-narrow">
+            <span>{{ t("mqMessages.maxNum") }}</span>
+            <input v-model.number="queryMaxNum" type="number" min="1" max="200" :disabled="queryLoading" />
+          </label>
+        </template>
 
         <div class="filter-actions">
           <button type="button" class="btn-primary" :disabled="queryLoading || !selectedTopicRef" @click="runQuery">
@@ -485,6 +496,8 @@ watch(topicName, () => {
 </template>
 
 <style scoped>
+@import "./shared/mqPanel.css";
+
 .message-query-panel {
   height: 100%;
   display: flex;
@@ -579,32 +592,6 @@ watch(topicName, () => {
   min-width: 0;
 }
 
-.btn-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: var(--color-background);
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  font-size: 16px;
-  transition: all 0.15s;
-  flex-shrink: 0;
-}
-
-.btn-icon:hover:not(:disabled) {
-  background: var(--color-background-secondary);
-  color: var(--color-text);
-}
-
-.btn-icon:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
-}
-
 .spin {
   display: inline-block;
   animation: spin-anim 0.8s linear infinite;
@@ -629,7 +616,7 @@ watch(topicName, () => {
   width: 100%;
   padding: 7px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   font-size: 13px;
@@ -657,7 +644,7 @@ watch(topicName, () => {
 
 .panel-error {
   padding: 10px 14px;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-error-bg);
   color: var(--color-error);
   font-size: 13px;
@@ -670,7 +657,7 @@ watch(topicName, () => {
 
 .results-table-wrap {
   border: 1px solid var(--color-border);
-  border-radius: 8px;
+  border-radius: var(--dbx-radius-fixed-6);
   overflow: auto;
 }
 
@@ -703,37 +690,10 @@ watch(topicName, () => {
   word-break: break-all;
 }
 
-.btn-primary,
-.btn-sm {
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: var(--color-background);
-  color: var(--color-text);
-  cursor: pointer;
-  font-size: 13px;
-}
-
-.btn-sm {
-  padding: 4px 10px;
-  font-size: 12px;
-}
-
 .operation-cell {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-}
-
-.btn-sm:hover:not(:disabled) {
-  background: var(--color-background-secondary);
-}
-
-.btn-primary {
-  padding: 7px 16px;
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #fff;
-  font-weight: 500;
 }
 
 .dialog-overlay {
@@ -750,7 +710,7 @@ watch(topicName, () => {
   width: min(720px, calc(100vw - 32px));
   max-height: calc(100vh - 64px);
   overflow: auto;
-  border-radius: 10px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.18);
   display: flex;
@@ -781,15 +741,6 @@ watch(topicName, () => {
   gap: 10px;
   padding: 14px 16px;
   border-top: 1px solid var(--color-border);
-}
-
-.btn-close {
-  border: none;
-  background: none;
-  color: var(--color-text-secondary);
-  font-size: 22px;
-  line-height: 1;
-  cursor: pointer;
 }
 
 .dialog-body {
@@ -829,20 +780,10 @@ watch(topicName, () => {
 
 .panel-success {
   padding: 10px 14px;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: color-mix(in srgb, var(--color-primary) 12%, transparent);
   color: var(--color-primary);
   font-size: 13px;
-}
-
-.btn-secondary {
-  padding: 7px 16px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: var(--color-background);
-  color: var(--color-text);
-  font-size: 13px;
-  cursor: pointer;
 }
 
 .detail-payload {
@@ -851,7 +792,7 @@ watch(topicName, () => {
   max-height: 360px;
   overflow: auto;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background-secondary);
   color: var(--color-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;

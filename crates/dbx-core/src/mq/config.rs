@@ -4,23 +4,41 @@
 //! `ConnectionConfig` rather than adding top-level fields, keeping the 50+
 //! database-type connection model untouched.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::models::connection::ConnectionConfig;
 use crate::mq::auth::MqAuth;
 use crate::mq::types::{MqSystemKind, MqTokenSigningConfig};
 
-/// Runtime TCP endpoint override for MQ admin requests.
+/// Default query timeout when constructing test configs without a ConnectionConfig.
+pub const DEFAULT_MQ_QUERY_TIMEOUT_SECS: u64 = 30;
+/// Default connect timeout when constructing test configs without a ConnectionConfig.
+pub const DEFAULT_MQ_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Runtime TCP endpoint override for an MQ transport.
 ///
-/// The public admin URL remains unchanged so TLS hostname verification, SNI and
-/// the HTTP Host header continue to target the broker name. The HTTP client uses
-/// this endpoint only for the underlying TCP connection, e.g. after an SSH/proxy
-/// tunnel has mapped the broker to a local port.
+/// The logical broker endpoint remains unchanged so TLS hostname verification,
+/// SNI and protocol-level host names continue to target the broker. The client
+/// uses this endpoint only for the underlying TCP connection, e.g. after an
+/// SSH/proxy tunnel has mapped the broker to a local port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MqConnectOverride {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqSocksProxy {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
 }
 
 /// Configuration for an MQ admin connection, decoded from
@@ -48,6 +66,19 @@ pub struct MqAdminConfig {
     /// Runtime-only TCP endpoint override used by transport layers.
     #[serde(skip)]
     pub connect_override: Option<MqConnectOverride>,
+    /// Runtime-only TCP endpoint override for a secondary management endpoint.
+    /// RabbitMQ uses this in addition to the AMQP `connect_override` because
+    /// its Management HTTP API listens on an independently configured port.
+    #[serde(skip)]
+    pub management_connect_override: Option<MqConnectOverride>,
+    #[serde(skip)]
+    pub socks_proxy: Option<MqSocksProxy>,
+    /// Runtime-only: from `ConnectionConfig.query_timeout_secs` (`0` = unlimited).
+    #[serde(skip)]
+    pub query_timeout_secs: u64,
+    /// Runtime-only: from `ConnectionConfig.effective_connect_timeout_secs()`.
+    #[serde(skip)]
+    pub connect_timeout_secs: u64,
     /// System-specific extension fields (e.g. Kafka bootstrap servers).
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub extra: serde_json::Value,
@@ -63,14 +94,46 @@ impl MqAdminConfig {
         let mut parsed: MqAdminConfig = serde_json::from_value(raw.clone())
             .map_err(|e| format!("Failed to parse message queue admin config: {e}"))?;
         parsed.admin_url = parsed.admin_url.trim().to_string();
-        // Kafka and RocketMQ use namesrv/bootstrap from `extra` instead of an admin URL.
+        // Kafka, RocketMQ and RabbitMQ use namesrv/bootstrap/addresses from `extra` instead of an admin URL.
         if parsed.admin_url.is_empty()
             && parsed.system_kind != MqSystemKind::Kafka
             && parsed.system_kind != MqSystemKind::RocketMq
+            && parsed.system_kind != MqSystemKind::RabbitMq
         {
             return Err("Message queue admin URL is empty".to_string());
         }
+        // Advanced connection timeouts live on ConnectionConfig, not external_config.
+        parsed.query_timeout_secs = cfg.effective_query_timeout_secs();
+        parsed.connect_timeout_secs = cfg.effective_connect_timeout_secs();
         Ok(parsed)
+    }
+
+    /// Agent / HTTP RPC wall-clock timeout. `None` disables the client-side timeout.
+    pub fn rpc_timeout(&self) -> Option<Duration> {
+        if self.query_timeout_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.query_timeout_secs.max(1)))
+        }
+    }
+
+    /// Milliseconds for agent `request_timeout_ms`. Unlimited query timeout maps to a
+    /// large but finite admin request budget so Java/Go clients still make progress.
+    pub fn request_timeout_ms(&self) -> u64 {
+        match self.query_timeout_secs {
+            0 => 3_600_000,
+            secs => secs.saturating_mul(1000).max(1_000),
+        }
+    }
+
+    /// Budget for establishing the MQ adapter (agent spawn + handshake/connect).
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_timeout_secs.max(1))
+    }
+
+    /// Milliseconds for agent `connect_timeout_ms` (Advanced connect timeout).
+    pub fn connect_timeout_ms(&self) -> u64 {
+        self.connect_timeout_secs.saturating_mul(1000).max(1_000)
     }
 
     pub fn token_signing_configured(&self) -> bool {
@@ -84,6 +147,21 @@ impl MqAdminConfig {
 
     pub fn with_connect_override(mut self, host: &str, port: u16) -> Self {
         self.connect_override = Some(MqConnectOverride { host: host.to_string(), port });
+        self
+    }
+
+    pub fn with_management_connect_override(mut self, host: &str, port: u16) -> Self {
+        self.management_connect_override = Some(MqConnectOverride { host: host.to_string(), port });
+        self
+    }
+
+    pub fn with_socks_proxy(mut self, host: &str, port: u16, username: &str, password: &str) -> Self {
+        self.socks_proxy = Some(MqSocksProxy {
+            host: host.to_string(),
+            port,
+            username: username.to_string(),
+            password: password.to_string(),
+        });
         self
     }
 }
@@ -101,8 +179,10 @@ mod tests {
 
     fn connection_with_external(value: serde_json::Value) -> ConnectionConfig {
         let mut cfg = ConnectionConfig {
+            docs_notes_path: None,
             id: "c1".to_string(),
             name: "mq".to_string(),
+            note: String::new(),
             db_type: crate::models::connection::DatabaseType::MessageQueue,
             driver_profile: None,
             driver_label: None,
@@ -113,8 +193,10 @@ mod tests {
             username: String::new(),
             password: String::new(),
             database: None,
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
+            show_system_schemas: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -139,6 +221,7 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: String::new(),
             redis_scan_page_size: None,
+            redis_database_aliases: Default::default(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -146,6 +229,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            save_password: true,
             read_only: false,
             is_production: false,
             production_databases: vec![],
@@ -214,6 +298,65 @@ mod tests {
         assert_eq!(mqc.system_kind, MqSystemKind::RocketMq);
         assert_eq!(mqc.admin_url, "");
         assert_eq!(mqc.extra.get("namesrvAddr").and_then(|v| v.as_str()), Some("127.0.0.1:9876"));
+        assert_eq!(mqc.query_timeout_secs, 30);
+        assert_eq!(mqc.connect_timeout_secs, 5);
+        assert_eq!(mqc.request_timeout_ms(), 30_000);
+    }
+
+    #[test]
+    fn copies_advanced_timeouts_from_connection_config() {
+        let mut cfg = connection_with_external(serde_json::json!({
+            "systemKind": "rocketmq",
+            "adminUrl": "",
+            "extra": { "namesrvAddr": "127.0.0.1:9876" }
+        }));
+        cfg.query_timeout_secs = 120;
+        cfg.connect_timeout_secs = 15;
+        let mqc = MqAdminConfig::from_connection(&cfg).expect("parse");
+        assert_eq!(mqc.query_timeout_secs, 120);
+        assert_eq!(mqc.connect_timeout_secs, 15);
+        assert_eq!(mqc.request_timeout_ms(), 120_000);
+        assert_eq!(mqc.connect_timeout_ms(), 15_000);
+        assert_eq!(mqc.rpc_timeout(), Some(std::time::Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn parses_rabbitmq_config_with_empty_admin_url() {
+        let cfg = connection_with_external(serde_json::json!({
+            "systemKind": "rabbitmq",
+            "adminUrl": "",
+            "auth": { "kind": "basic", "username": "guest", "password": "guest" },
+            "extra": {
+                "addresses": "127.0.0.1",
+                "port": 5672,
+                "virtualHost": "/"
+            }
+        }));
+        let mqc = MqAdminConfig::from_connection(&cfg).expect("should parse valid RabbitMQ config");
+        assert_eq!(mqc.system_kind, MqSystemKind::RabbitMq);
+        assert_eq!(mqc.admin_url, "");
+        assert_eq!(mqc.extra.get("addresses").and_then(|v| v.as_str()), Some("127.0.0.1"));
+        assert_eq!(mqc.extra.get("virtualHost").and_then(|v| v.as_str()), Some("/"));
+    }
+
+    #[test]
+    fn parses_rabbitmq_config_with_management_admin_url() {
+        // An explicit management URL stays untouched: it may carry a reverse
+        // proxy path prefix, and no http(s)-only scheme restriction applies.
+        let cfg = connection_with_external(serde_json::json!({
+            "systemKind": "rabbitmq",
+            "adminUrl": "http://rabbit.internal:15672/proxy",
+            "auth": { "kind": "basic", "username": "guest", "password": "guest" },
+            "extra": {
+                "addresses": "127.0.0.1",
+                "port": 5672,
+                "virtualHost": "/"
+            }
+        }));
+        let mqc = MqAdminConfig::from_connection(&cfg).expect("should parse RabbitMQ config with a management URL");
+        assert_eq!(mqc.system_kind, MqSystemKind::RabbitMq);
+        assert_eq!(mqc.admin_url, "http://rabbit.internal:15672/proxy");
+        assert_eq!(mqc.extra.get("addresses").and_then(|v| v.as_str()), Some("127.0.0.1"));
     }
 
     #[test]

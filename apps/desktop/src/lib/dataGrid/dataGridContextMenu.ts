@@ -16,6 +16,7 @@ export type DataGridContextMenuItem = {
   separator?: boolean;
   icon?: Component;
   iconClass?: string;
+  checked?: boolean;
   shortcut?: string;
   variant?: "default" | "destructive";
   visible?: boolean;
@@ -76,9 +77,12 @@ export function createDataGridColumnContextMenuItems(options: {
   canFilter: boolean;
   hasSort: boolean;
   sortMode: "database" | "local";
-  labels: Record<"copyName" | "copyNames" | "details" | "copyAlterSql" | "databaseAscending" | "databaseDescending" | "localAscending" | "localDescending" | "clearSort", string>;
+  frozenColumnCount?: number;
+  contextVisibleColIdx?: number;
+  hasColumnSelection?: boolean;
+  labels: Record<"copyName" | "copyNames" | "details" | "copyAlterSql" | "databaseAscending" | "databaseDescending" | "localAscending" | "localDescending" | "clearSort" | "freezeToColumn" | "freezeSelectedColumns" | "unfreezeColumns", string>;
   icons: Pick<DataGridContextMenuIcons, "copy" | "columnDetails" | "database" | "ascending" | "descending" | "clearSort">;
-  actions: { copyName: () => void; copyNames: () => void; details: () => void; copyAlterSql: () => void; sort: (direction: "asc" | "desc" | null, mode: "database" | "local") => void };
+  actions: { copyName: () => void; copyNames: () => void; details: () => void; copyAlterSql: () => void; sort: (direction: "asc" | "desc" | null, mode: "database" | "local") => void; freezeToColumn: () => void; freezeSelectedColumns: () => void; unfreezeColumns: () => void };
   filterSubmenu: DataGridContextMenuItem;
 }): DataGridContextMenuItem[] {
   const items: DataGridContextMenuItem[] = [];
@@ -88,17 +92,28 @@ export function createDataGridColumnContextMenuItems(options: {
     items.push({ label: options.labels.details, action: options.actions.details, icon: options.icons.columnDetails });
     if (options.canCopyAlterSql) items.push({ label: options.labels.copyAlterSql, action: options.actions.copyAlterSql, icon: options.icons.copy });
   }
-  if (!options.contextColumn) return items;
-  items.push(
-    { label: options.labels.databaseAscending, action: () => options.actions.sort("asc", "database"), icon: options.icons.database },
-    { label: options.labels.databaseDescending, action: () => options.actions.sort("desc", "database"), icon: options.icons.database },
-    { label: "", separator: true },
-    { label: options.labels.localAscending, action: () => options.actions.sort("asc", "local"), icon: options.icons.ascending },
-    { label: options.labels.localDescending, action: () => options.actions.sort("desc", "local"), icon: options.icons.descending },
-  );
-  if (options.hasSort) items.push({ label: options.labels.clearSort, action: () => options.actions.sort(null, options.sortMode), icon: options.icons.clearSort });
-  if (options.canFilter) items.push({ label: "", separator: true }, options.filterSubmenu);
-  items.push({ label: "", separator: true });
+  if (!options.contextColumn && !options.headerColumn) return items;
+  if (options.contextColumn) {
+    items.push(
+      { label: options.labels.databaseAscending, action: () => options.actions.sort("asc", "database"), icon: options.icons.database },
+      { label: options.labels.databaseDescending, action: () => options.actions.sort("desc", "database"), icon: options.icons.database },
+      { label: "", separator: true },
+      { label: options.labels.localAscending, action: () => options.actions.sort("asc", "local"), icon: options.icons.ascending },
+      { label: options.labels.localDescending, action: () => options.actions.sort("desc", "local"), icon: options.icons.descending },
+    );
+    if (options.hasSort) items.push({ label: options.labels.clearSort, action: () => options.actions.sort(null, options.sortMode), icon: options.icons.clearSort });
+    if (options.canFilter) items.push({ label: "", separator: true }, options.filterSubmenu);
+  }
+  if (options.contextVisibleColIdx !== undefined) {
+    items.push({ label: "", separator: true });
+    if ((options.frozenColumnCount ?? 0) > 0) {
+      items.push({ label: options.labels.unfreezeColumns, action: options.actions.unfreezeColumns });
+    }
+    if (options.hasColumnSelection) {
+      items.push({ label: options.labels.freezeSelectedColumns, action: options.actions.freezeSelectedColumns });
+    }
+    items.push({ label: options.labels.freezeToColumn, action: options.actions.freezeToColumn });
+  }
   return items;
 }
 
@@ -113,16 +128,20 @@ export function createDataGridCellContextMenuItems(options: {
   labels: Record<"cellDetails" | "columnDetails" | "rowDetails" | "setNull" | "bulkEdit" | "transpose", string>;
   icons: Pick<DataGridContextMenuIcons, "cellDetails" | "columnDetails" | "rowDetails" | "setNull" | "bulkEdit" | "transpose">;
   actions: Record<"cellDetails" | "columnDetails" | "rowDetails" | "setNull" | "bulkEdit" | "transpose", () => void>;
+  importItem?: DataGridContextMenuItem | null;
   downloadItem?: DataGridContextMenuItem | null;
+  foreignKeyItem?: DataGridContextMenuItem | null;
   copySubmenu: DataGridContextMenuItem;
-  selectionSubmenu: DataGridContextMenuItem;
+  clearSelectionItem?: DataGridContextMenuItem;
   generateSubmenu?: DataGridContextMenuItem;
 }): DataGridContextMenuItem[] {
   const items: DataGridContextMenuItem[] = [];
   if (options.hasCell) {
     if (options.hasColumn) {
       items.push({ label: options.labels.cellDetails, action: options.actions.cellDetails, icon: options.icons.cellDetails });
+      if (options.importItem) items.push(options.importItem);
       if (options.downloadItem) items.push(options.downloadItem);
+      if (options.foreignKeyItem) items.push(options.foreignKeyItem);
       items.push({ label: options.labels.columnDetails, action: options.actions.columnDetails, icon: options.icons.columnDetails });
     }
     items.push({ label: options.labels.rowDetails, action: options.actions.rowDetails, icon: options.icons.rowDetails }, { label: "", separator: true });
@@ -134,7 +153,7 @@ export function createDataGridCellContextMenuItems(options: {
     if (options.generateSubmenu) items.push(options.generateSubmenu);
   }
   if (options.hasCell) items.push({ label: options.labels.transpose, action: options.actions.transpose, icon: options.icons.transpose });
-  if (options.hasSelection) items.push(options.selectionSubmenu);
+  if (options.hasSelection && options.clearSelectionItem) items.push(options.clearSelectionItem);
   return items;
 }
 
@@ -204,15 +223,17 @@ export function createDataGridSortMenuItems(options: { column: string; columnInd
 }
 
 export function createDataGridCompactColumnActionItems(options: {
-  labels: { formatter: string; localFilter: string; serverFilter: string };
-  icons: { formatter: Component; filter: Component; database: Component };
+  labels: { formatter: string; clearFormatter: string; localFilter: string; serverFilter: string };
+  icons: { formatter: Component; clearFormatter: Component; filter: Component; database: Component };
   formatterAvailable: boolean;
+  formatterActive: boolean;
   serverFilterAvailable: boolean;
 }): DataGridColumnMenuItem[] {
   const { labels, icons } = options;
   return [
-    { label: labels.formatter, value: "formatter", icon: icons.formatter, disabled: !options.formatterAvailable },
+    { label: labels.formatter, value: "formatter", icon: icons.formatter, disabled: !options.formatterAvailable, checked: options.formatterActive },
     { label: labels.localFilter, value: "localFilter", icon: icons.filter },
     ...(options.serverFilterAvailable ? [{ label: labels.serverFilter, value: "serverFilter", icon: icons.database }] : []),
+    { label: labels.clearFormatter, value: "clearFormatter", icon: icons.clearFormatter, disabled: !options.formatterActive, separatorBefore: true },
   ];
 }

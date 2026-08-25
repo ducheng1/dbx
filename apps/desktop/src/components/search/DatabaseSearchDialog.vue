@@ -268,7 +268,7 @@ function openResult(item: SearchResultItem) {
 
 <template>
   <Dialog v-model:open="dialogOpen">
-    <DialogScrollContent class="flex max-h-[calc(100dvh-6rem)] min-h-0 max-w-4xl flex-col overflow-hidden gap-0 p-0">
+    <DialogScrollContent class="flex max-h-[calc(var(--dbx-viewport-height)-6rem)] min-h-0 max-w-4xl flex-col overflow-hidden gap-0 p-0">
       <DialogHeader class="shrink-0 border-b px-5 py-4">
         <DialogTitle class="flex items-center gap-2">
           <Search class="h-5 w-5" />
@@ -309,8 +309,8 @@ function openResult(item: SearchResultItem) {
         </div>
 
         <div v-if="running || progressTotal" class="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-          <span>{{ loadingTables ? t("databaseSearch.loadingTables") : progressLabel }}</span>
-          <span>{{ t("databaseSearch.resultCount", { count: results.length }) }}</span>
+          <span class="tabular-nums">{{ loadingTables ? t("databaseSearch.loadingTables") : progressLabel }}</span>
+          <span class="tabular-nums">{{ t("databaseSearch.resultCount", { count: results.length }) }}</span>
           <span v-if="limitedTables" class="text-amber-600">{{ t("databaseSearch.limitedTables", { count: 200 }) }}</span>
         </div>
 

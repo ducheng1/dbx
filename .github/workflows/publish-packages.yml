@@ -6,6 +6,11 @@ on:
       tag:
         description: "Release tag (e.g. v0.3.10)"
         required: true
+      notify:
+        description: "Send release notification"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -395,11 +400,13 @@ jobs:
           # Sync metadata only so promoting a release never re-uploads large CNB assets.
           node .github/scripts/sync-cnb-release.mjs \
             --github-release "$RUNNER_TEMP/github-release/release.json" \
-            --metadata-only
+            --metadata-only \
+            --make-latest
 
   notify-qq:
     name: QQ Notify
     needs: [promote-release]
+    if: ${{ inputs.notify }}
     runs-on: ubuntu-latest
     steps:
       - name: Build message
@@ -445,6 +452,7 @@ jobs:
           PYEOF
 
       - name: Send to QQ group
+        continue-on-error: true
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           HOST: ${{ secrets.DEPLOY_HOST }}
